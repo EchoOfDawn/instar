@@ -156,7 +156,15 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
     expect(wa.body.pairing.sasWords).toHaveLength(12);
     expect(wa.body.pairing.sasWords).toEqual(wb.body.pairing.sasWords);
 
-    // Starting again is idempotent.
+    // Every pairing route checks the Bearer token itself (/threadline/* skips global auth).
+    expect((await request(A.app).post(`/threadline/pairing/${scout.fp}/start`).send({})).status).toBe(401);
+    expect((await request(A.app).get(`/threadline/pairing/${scout.fp}`).send({})).status).toBe(401);
+    expect((await request(A.app).get('/threadline/pairing').send()).status).toBe(401);
+    // Mixed-case fingerprints resolve to the same pairing (FD13).
+    const upper = await authed(request(A.app).get(`/threadline/pairing/${scout.fp.toUpperCase()}`)).send({});
+    expect(upper.body.pairing.state).toBe('pending-verification');
+
+        // Starting again is idempotent.
     const again = await authed(request(A.app).post(`/threadline/pairing/${scout.fp}/start`)).send({});
     expect(again.body.outcome).toBe('already-pending');
   });

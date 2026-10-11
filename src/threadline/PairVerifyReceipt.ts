@@ -198,15 +198,6 @@ export function processPairVerifyReceipt(
       return { processed: false, reason: 'recipient-fingerprint-mismatch' };
     }
 
-    // Freshness (FD4 v2). The SAS no longer changes per handshake, so a receipt must be
-    // newer than the pairing it answers. Allow clock skew; a too-old or future receipt
-    // is dropped with no state change and the sender may retry (it only sets peerAcked).
-    const issuedMs = Date.parse(payload.issuedAt);
-    if (issuedMs > now.getTime() + RECEIPT_CLOCK_SKEW_MS) return { processed: false, reason: 'receipt-from-future' };
-    const recordedMs = profile.pairingRecordedAt ? Date.parse(profile.pairingRecordedAt) : NaN;
-    if (Number.isNaN(recordedMs)) return { processed: false, reason: 'no-pairing' };
-    if (issuedMs < recordedMs - RECEIPT_CLOCK_SKEW_MS) return { processed: false, reason: 'receipt-stale' };
-
     // Ed25519 signature verification against the BOUND identity key (spec §3.4).
     let sigOk = false;
     try {
@@ -218,6 +209,16 @@ export function processPairVerifyReceipt(
       sigOk = false;
     }
     if (!sigOk) return { processed: false, reason: 'signature-invalid' };
+
+    // Freshness (spec §3.4), checked only AFTER the signature so a forged receipt never
+    // reaches the time logic. The SAS no longer changes per handshake, so a receipt must be
+    // newer than the pairing it answers. Allow clock skew; a too-old or future receipt is
+    // dropped with no state change and the sender may retry (it only sets peerAcked).
+    const issuedMs = Date.parse(payload.issuedAt);
+    if (issuedMs > now.getTime() + RECEIPT_CLOCK_SKEW_MS) return { processed: false, reason: 'receipt-from-future' };
+    const recordedMs = profile.pairingRecordedAt ? Date.parse(profile.pairingRecordedAt) : NaN;
+    if (Number.isNaN(recordedMs)) return { processed: false, reason: 'no-pairing' };
+    if (issuedMs < recordedMs - RECEIPT_CLOCK_SKEW_MS) return { processed: false, reason: 'receipt-stale' };
 
     // All checks passed — set the OPTIONAL peerAcked liveness flag. NEVER the
     // mutual-verified flip (that requires a real operator-PIN confirm, §3.3).

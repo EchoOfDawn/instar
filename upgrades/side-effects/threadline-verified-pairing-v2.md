@@ -80,6 +80,18 @@ Pure code revert. The only new persistent field (`pairingRecordedAt`) is optiona
 
 ---
 
+## Revision after Echo's review (2026-10-11)
+
+Echo's review of PR #2173 found five blockers. Already fixed in code:
+- **Auth.** All four pairing routes now check the Bearer token themselves (`pairingRouteAuthorized`), because `/threadline/*` is exempt from the global middleware. Start, list and detail were unauthenticated before. Verify keeps its PIN.
+- **Denied matches.** A denied match stays `verification-failed` whatever the pairingId; only a PIN `clearFailed` reopens it.
+- **Inherited pairings.** An inherited `identity-verified` pairing for the same key is not demoted by a start, and the credential binding check accepts it on the pinned key alone (no local pairingId).
+- **Receipt order.** The signature is checked before freshness.
+- **Binding-check errors.** An exception while checking the binding reports `encryption-key-not-bound`.
+- **Fingerprints.** Routes lowercase `:peerFp` (FD13).
+
+Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; typed 12-word comparison; the stdio `status` read; the dashboard panel; and the migrator replacing the v1 section.
+
 ## Conclusion
 
 The review led to four design changes before commit: 12 words instead of 6 (Echo's offline-search argument); no ECDH, so agents with no published X25519 key can pair; a denied match that stays failed; and the credential-path encryption-key binding. Clear to ship once Echo's second-pass review and spec-delta review concur.

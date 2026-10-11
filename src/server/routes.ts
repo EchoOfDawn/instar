@@ -18356,6 +18356,15 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       ctx.config as { developmentAgent?: boolean },
     );
 
+  // `/threadline/*` is exempt from the global Bearer middleware (middleware.ts: Threadline
+  // protocol endpoints authenticate themselves), so every pairing route checks the agent
+  // Bearer token itself (spec FD7). Returns false after sending 401.
+  const pairingRouteAuthorized = (req: import('express').Request, res: import('express').Response): boolean => {
+    if (bearerMatches(req, ctx.config.authToken)) return true;
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  };
+
   // Build THIS machine's local pairings list (the shape the plain + pool reads share,
   // so a peer's plain reply merges in identically). No SAS words ever.
   const buildLocalPairings = (): Array<Record<string, unknown>> => {
@@ -18461,6 +18470,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    if (!pairingRouteAuthorized(req, res)) return;
     const trustManager = ctx.unifiedTrust?.trustManager;
     if (!trustManager) {
       res.status(503).json({ error: 'trust manager unavailable' });
@@ -18486,12 +18496,13 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    if (!pairingRouteAuthorized(req, res)) return;
     const trustManager = ctx.unifiedTrust?.trustManager;
     if (!trustManager) {
       res.status(503).json({ error: 'trust manager unavailable' });
       return;
     }
-    const peerFp = req.params.peerFp;
+    const peerFp = String(req.params.peerFp || '').toLowerCase(); // FD13
     const profile = trustManager.getProfileByFingerprint(peerFp);
     if (!profile || profile.pairingState === undefined) {
       res.status(404).json({ error: `no pairing for fingerprint "${peerFp}"` });
@@ -18545,6 +18556,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    if (!pairingRouteAuthorized(req, res)) return; // FD7: /threadline/* skips global auth
     const trustManager = ctx.unifiedTrust?.trustManager;
     if (!trustManager) {
       res.status(503).json({ error: 'trust manager unavailable' });
@@ -18618,7 +18630,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'trust manager unavailable' });
       return;
     }
-    const peerFp = req.params.peerFp;
+    const peerFp = String(req.params.peerFp || '').toLowerCase(); // FD13
     const body = req.body ?? {};
     if (typeof body.match !== 'boolean') {
       res.status(400).json({ error: 'match (boolean) is required' });

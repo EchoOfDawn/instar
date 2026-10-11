@@ -733,13 +733,21 @@ export class AgentTrustManager {
     const peerPubHex = args.peerIdentityPub.toString('hex');
 
     const existing = this.getProfileByFingerprint(fp);
+    // A denied match stays denied WHATEVER the pairingId (spec §3.2): only an operator
+    // PIN clear (`clearFailed`, checked at the route) reopens it. A changed pairingId
+    // (our key rotated) must not be a back door to pending.
+    if (existing?.pairingState === 'verification-failed' && !args.clearFailed) {
+      return { outcome: 'refused-failed' };
+    }
+    // An inherited pairing (§3.8) has no local pairingId; it binds on the pinned key.
+    // A start for the same key leaves it identity-verified rather than demoting it.
+    if (existing?.pairingState === 'identity-verified' && existing.peerIdentityPub === peerPubHex) {
+      return { outcome: 'already-verified', pairingId, sasFingerprint };
+    }
     const samePair = !!existing && existing.pairingId === pairingId && existing.peerIdentityPub === peerPubHex;
     if (existing && samePair) {
-      if (existing.pairingState === 'mutual-verified' || existing.pairingState === 'identity-verified') {
+      if (existing.pairingState === 'mutual-verified') {
         return { outcome: 'already-verified', pairingId, sasFingerprint };
-      }
-      if (existing.pairingState === 'verification-failed' && !args.clearFailed) {
-        return { outcome: 'refused-failed' };
       }
       if (existing.pairingState === 'pending-verification' && this.pendingStore.get(fp)) {
         return { outcome: 'already-pending', pairingId, sasFingerprint };

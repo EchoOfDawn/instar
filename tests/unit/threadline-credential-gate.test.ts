@@ -148,6 +148,12 @@ describe('CredentialShareGate — outbound (load-bearing, §3.5/FD9)', () => {
     expect(d.reason).toBe('encryption-key-not-bound');
   });
 
+  it('a binding check that THROWS refuses as encryption-key-not-bound, not peer-not-mutually-verified', () => {
+    setUpPairing(tm, self, peer, { verify: true });
+    const throwing = { hasEncryptedSendPath: () => true, isChannelBoundToPairing: () => { throw new Error('boom'); } };
+    expect(evaluateOutboundCredentialShare(tm, throwing, peer.fp)).toEqual({ allow: false, reason: 'encryption-key-not-bound' });
+  });
+
   it('REFUSES when the path probe cannot check the binding at all (fail-closed)', () => {
     setUpPairing(tm, self, peer, { verify: true });
     const d = evaluateOutboundCredentialShare(tm, { hasEncryptedSendPath: () => true }, peer.fp);

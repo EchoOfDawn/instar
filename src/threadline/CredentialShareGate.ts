@@ -52,7 +52,7 @@ export interface EncryptedPathProbe {
    * matches our current key (FD4 v2). Implemented by ThreadlineClient.isChannelBoundToPairing.
    * Optional so older probes compile; an absent method REFUSES (fail-closed).
    */
-  isChannelBoundToPairing?(recipientFp: string, pinnedIdentityPubHex: string, pairingId: string): boolean;
+  isChannelBoundToPairing?(recipientFp: string, pinnedIdentityPubHex: string, pairingId: string | null): boolean;
 }
 
 // ── Agent-facing READ helper (the guarantee lives at the funnel) ──────
@@ -123,15 +123,21 @@ export function evaluateOutboundCredentialShare(
     // (FD4 v2, issue #2117 gap I). The SAS proves the Ed25519 identity key only; if the
     // X25519 key were whatever the relay handed over, a relay could pass the SAS check
     // and then read the credential.
-    const profile = trustManager.getProfileByFingerprint(recipientFp);
-    if (
-      !profile?.peerIdentityPub ||
-      !profile.pairingId ||
-      typeof encryptedPath.isChannelBoundToPairing !== 'function' ||
-      !encryptedPath.isChannelBoundToPairing(recipientFp, profile.peerIdentityPub, profile.pairingId)
-    ) {
-      return { allow: false, reason: 'encryption-key-not-bound' };
+    let bound = false;
+    try {
+      const profile = trustManager.getProfileByFingerprint(recipientFp);
+      // Inherited (identity-verified, §3.8) pairings have no local pairingId and bind on the
+      // pinned key alone; mutual-verified pairings also check our current key (pairingId).
+      const pairingId = profile?.pairingState === 'identity-verified' ? null : (profile?.pairingId ?? null);
+      bound =
+        !!profile?.peerIdentityPub &&
+        (profile.pairingState === 'identity-verified' || !!pairingId) &&
+        typeof encryptedPath.isChannelBoundToPairing === 'function' &&
+        encryptedPath.isChannelBoundToPairing(recipientFp, profile.peerIdentityPub, pairingId);
+    } catch {
+      bound = false; // a throw while checking the binding names the binding, not the peer (spec §3.5)
     }
+    if (!bound) return { allow: false, reason: 'encryption-key-not-bound' };
 
     return { allow: true };
   } catch {

@@ -550,15 +550,19 @@ export class ThreadlineClient extends EventEmitter {
    *    recorded one, so a rotation of our own key since verification invalidates it.
    * Never throws; any doubt is false (fail-closed, FD9).
    */
-  isChannelBoundToPairing(recipientId: AgentFingerprint, pinnedIdentityPubHex: string, pairingId: string): boolean {
+  isChannelBoundToPairing(recipientId: AgentFingerprint, pinnedIdentityPubHex: string, pairingId: string | null): boolean {
     try {
       const known = this.knownAgents.get(recipientId);
       const own = this.identity?.publicKey;
-      if (!known?.publicKey || !known?.x25519PublicKey || !own || !pinnedIdentityPubHex || !pairingId) return false;
+      if (!known?.publicKey || !own || !pinnedIdentityPubHex) return false;
       const pinned = Buffer.from(pinnedIdentityPubHex, 'hex');
       if (pinned.length !== 32 || !crypto.timingSafeEqual(pinned, known.publicKey)) return false;
-      if (!isX25519BoundToIdentity(pinned, known.x25519PublicKey)) return false;
-      return derivePairingIdV2(own, pinned) === pairingId;
+      // The credential path encrypts to the key DERIVED from the pinned identity key (spec
+      // §3.5), so a relay-supplied X25519 key is irrelevant here; if one is cached and
+      // disagrees, that is a substitution signal and we refuse.
+      if (known.x25519PublicKey && !isX25519BoundToIdentity(pinned, known.x25519PublicKey)) return false;
+      // An inherited pairing (pairingId null) binds on the pinned key alone.
+      return pairingId === null ? true : derivePairingIdV2(own, pinned) === pairingId;
     } catch {
       return false;
     }

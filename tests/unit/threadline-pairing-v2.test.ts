@@ -119,6 +119,17 @@ describe('receipt v2 freshness', () => {
       .toBe(true);
   });
 
+  it('checks the signature BEFORE freshness: a forged stale receipt reports signature-invalid', () => {
+    const { t, self, peer, recordedAt } = setup();
+    const forger = agent();
+    const forged = buildPairVerifyReceipt(forger.priv, {
+      pairingId: t.getProfileByFingerprint(peer.fp)!.pairingId!, ownFp: peer.fp, peerFp: self.fp,
+      sasFingerprint: t.getProfileByFingerprint(peer.fp)!.sasFingerprint!, issuedAt: new Date(recordedAt - 3_600_000).toISOString(),
+    });
+    expect(processPairVerifyReceipt(t, peer.fp, forged, self.fp, new Date(recordedAt + 1000)))
+      .toEqual({ processed: false, reason: 'signature-invalid' });
+  });
+
   it('a signature over a different issuedAt does not verify', () => {
     const { t, self, peer, recordedAt, receipt } = setup();
     const r = receipt(recordedAt) as unknown as Record<string, unknown>;
@@ -151,6 +162,23 @@ describe('startStaticPairing rules', () => {
     expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('verification-failed');
     expect(t.startStaticPairing(peer.fp, { ownIdentityPub: self.pub, peerIdentityPub: peer.pub, ownFp: self.fp, clearFailed: true }).outcome).toBe('started');
     expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('pending-verification');
+  });
+
+  it('a denied match stays denied even when OUR key rotated (a changed pairingId is not a back door)', () => {
+    const t = tm(); const self = agent(), peer = agent();
+    t.startStaticPairing(peer.fp, { ownIdentityPub: self.pub, peerIdentityPub: peer.pub, ownFp: self.fp });
+    t.markVerificationFailed(peer.fp, 'operator-asserted mismatch');
+    const rotated = agent();
+    expect(t.startStaticPairing(peer.fp, { ownIdentityPub: rotated.pub, peerIdentityPub: peer.pub, ownFp: rotated.fp }).outcome).toBe('refused-failed');
+    expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('verification-failed');
+  });
+
+  it('an inherited identity-verified pairing for the same key is not demoted by a start', () => {
+    const t = tm(); const self = agent(), peer = agent();
+    expect(t.inheritReplicatedVerification(peer.fp, { peerIdentityPub: peer.pub.toString('hex'), verifiedAt: new Date().toISOString(), verifiedOnMachine: 'm2' })).toBe(true);
+    expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('identity-verified');
+    expect(t.startStaticPairing(peer.fp, { ownIdentityPub: self.pub, peerIdentityPub: peer.pub, ownFp: self.fp }).outcome).toBe('already-verified');
+    expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('identity-verified');
   });
 
   it('a verified pairing stays verified for the same keys and resets to pending when OUR key rotates', () => {
