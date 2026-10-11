@@ -94,6 +94,8 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 
 - **Agent awareness.** The migration now REPLACES a v1 CLAUDE.md section in place with the v2 text instead of appending a contradicting supplement (idempotent; it skips an agent whose file already names the start route). The template's verify text describes typed confirmation, and the site feature doc is rewritten for v2.
 
+- **Identity-key cache fill (FD4a).** After a start reads the peer key from the relay card, it is merged into the known-agent cache: the identity key only, never an X25519 key. It is refused if it does not match the fingerprint, and never overwrites a different cached key.
+
 Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the stdio `status` read; the dashboard panel.
 
 ## Conclusion

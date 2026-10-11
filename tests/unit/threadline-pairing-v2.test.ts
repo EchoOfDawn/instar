@@ -219,6 +219,15 @@ describe('ThreadlineClient.fetchPeerIdentityKey (relay A2A card fallback)', () =
       expect(await client.fetchPeerIdentityKey(wrong.fp)).toBeNull();
       expect(await client.fetchPeerIdentityKey(agent().fp)).toBeNull(); // 404
       expect(await client.fetchPeerIdentityKey('not-a-fingerprint')).toBeNull();
+
+      // The fetched key is remembered (identity key only, never an X25519 key), refused if it
+      // does not match the fingerprint, and never overwrites a different cached key.
+      expect(client.rememberPeerIdentityKey(real.fp, real.pub)).toBe(true);
+      const cached = client.getKnownAgents().find((a) => a.agentId === real.fp)!;
+      expect(cached.publicKey.equals(real.pub)).toBe(true);
+      expect(cached.x25519PublicKey).toBeUndefined();
+      expect(client.rememberPeerIdentityKey(wrong.fp, real.pub)).toBe(false);
+      expect(client.rememberPeerIdentityKey(real.fp, Buffer.concat([real.pub.subarray(0, 16), Buffer.alloc(16, 7)]))).toBe(false);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }

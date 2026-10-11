@@ -934,6 +934,23 @@ export class ThreadlineClient extends EventEmitter {
   }
 
   /**
+   * Remember a peer's Ed25519 identity key learned while starting a verified pairing
+   * (spec FD4a). MERGES into the known-agent entry; it never sets or replaces an X25519
+   * key, because a derived encryption key would switch ordinary sends to encryption for
+   * peers that may not decrypt. Refuses a key whose first 16 bytes are not the fingerprint,
+   * and never overwrites a DIFFERENT cached identity key (that is a substitution signal for
+   * the operator, not something to resolve silently). Returns whether the key is now cached.
+   */
+  rememberPeerIdentityKey(agentId: AgentFingerprint, identityKey: Buffer, name?: string): boolean {
+    const fp = String(agentId).toLowerCase();
+    if (identityKey.length !== 32 || identityKey.subarray(0, 16).toString('hex') !== fp) return false;
+    const existing = this.knownAgents.get(fp);
+    if (existing?.publicKey) return crypto.timingSafeEqual(existing.publicKey, identityKey);
+    this.knownAgents.set(fp, { ...(existing ?? { agentId: fp, name: name ?? fp }), publicKey: identityKey } as KnownAgent);
+    return true;
+  }
+
+  /**
    * Disconnect from the relay.
    */
   disconnect(): void {

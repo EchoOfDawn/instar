@@ -18587,6 +18587,11 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(409).json({ error: `no identity key found for "${peerFp}" in the known-agent cache or on the relay card` });
       return;
     }
+    // Fill the cache with the identity key (never an X25519 key), so the credential binding
+    // check can see it later (spec FD4a; Echo's review: nothing in src filled it).
+    if (!known?.publicKey && typeof relay.rememberPeerIdentityKey === 'function') {
+      relay.rememberPeerIdentityKey(peerFp, peerKey);
+    }
     const result = trustManager.startStaticPairing(peerFp, {
       ownIdentityPub: ownPub,
       peerIdentityPub: peerKey,
