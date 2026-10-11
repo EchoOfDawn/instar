@@ -18523,7 +18523,10 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     // SAS words: pending-verification ONLY, and ONLY to a valid-PIN operator.
     // We validate the PIN WITHOUT sending a response (the detail read succeeds
     // regardless) — a non-throwing constant-time compare mirroring checkMandatePin.
-    const pin = (req.body ?? {}).pin;
+    // The PIN may arrive in the body or, for browsers (which cannot send a body on a GET),
+    // in the X-Dashboard-Pin header. Same constant-time comparison either way.
+    const headerPin = req.headers['x-dashboard-pin'];
+    const pin = (req.body ?? {}).pin ?? (typeof headerPin === 'string' ? headerPin : undefined);
     const pinValid =
       !!ctx.config.dashboardPin &&
       typeof pin === 'string' &&

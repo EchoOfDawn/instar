@@ -68,7 +68,12 @@ No new static heuristic at a competing-signals decision point. Every new check i
 
 ## 6b. Operator-surface quality
 
-No operator surface file is changed (no dashboard markup). Not applicable.
+The change adds a Verified Pairing panel (`dashboard/pairing.js`, plus a card, styles and a lazy loader in `dashboard/index.html`, on the Threadline tab).
+
+1. **Leads with the primary action?** Yes. A pending pairing's card opens on "Show my words", then the 12 inputs and "Confirm they match". Nothing is collapsed or placed below explanatory prose.
+2. **Zero raw internals as primary content?** Yes. The headline is the agent's name and a plain-language state ("Waiting for you to compare the words", "Words did not match — blocked"). The fingerprint appears only as a shortened "Agent ab12…" support line at the bottom, and names are escaped.
+3. **Destructive actions de-emphasized?** Yes. "They don't match" is a quiet, danger-coloured button below the confirm step. "Clear and start again" is quiet, and its hint asks the operator to find out why the words differed first.
+4. **Plain language and phone width?** Yes. Labels read the way a person would say them. At ≤640px the words show in two columns, the 12 inputs in two columns, and the PIN field and buttons span full width. The PIN is never stored and is cleared after every send. A timed refresh skips while any field holds input, so it never wipes half-typed words.
 
 ## 7. Multi-machine posture
 
@@ -98,7 +103,7 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 
 - **Stale stdio status.** The stdio MCP process holds its own copy of the trust manager, so `status` now reloads it, and the pending-words store, from disk before reading. This is opt-in via `reloadTrustBeforePairingRead`, set only in the stdio entry, because an in-process reload could drop writes still waiting on the save debounce.
 
-Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the dashboard panel.
+Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm.
 
 ## Conclusion
 

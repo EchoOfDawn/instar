@@ -155,6 +155,11 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
     const wb = await authed(request(B.app).get(`/threadline/pairing/${dawn.fp}`)).send({ pin: PIN });
     expect(wa.body.pairing.sasWords).toHaveLength(12);
     expect(wa.body.pairing.sasWords).toEqual(wb.body.pairing.sasWords);
+    // Browsers cannot send a body on a GET, so the dashboard passes the PIN in a header.
+    const viaHeader = await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).set('X-Dashboard-Pin', PIN);
+    expect(viaHeader.body.pairing.sasWords).toEqual(wa.body.pairing.sasWords);
+    const wrongHeader = await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).set('X-Dashboard-Pin', '000000');
+    expect(wrongHeader.body.pairing.sasWords).toBeUndefined();
 
     // Every pairing route checks the Bearer token itself (/threadline/* skips global auth).
     expect((await request(A.app).post(`/threadline/pairing/${scout.fp}/start`).send({})).status).toBe(401);
