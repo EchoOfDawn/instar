@@ -18439,7 +18439,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
   // verification-failed until an operator explicitly clears it (spec §3.2).
   // The peer's identity key comes from the relay client's known-agent cache — never
   // from the request — so a caller cannot choose which key gets bound.
-  router.post('/threadline/pairing/:peerFp/start', (req, res) => {
+  router.post('/threadline/pairing/:peerFp/start', async (req, res) => {
     if (!verifiedPairingRouteEnabled()) {
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
@@ -18464,15 +18464,21 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const clearFailed = (req.body ?? {}).clearFailed === true;
     if (clearFailed && !checkMandatePin(req, res)) return; // clearing a denied match is an operator act
     const known = relay.getKnownAgents().find((a) => a.agentId === peerFp);
-    if (!known?.publicKey) {
-      res.status(409).json({ error: `no identity key known for "${peerFp}" — exchange a Threadline message with the peer first, then start again` });
+    // Not cached (e.g. the peer's messages arrive unsigned): read the key from the relay's
+    // public card. Relay-supplied is acceptable for pairing — a substituted key yields
+    // different words and the human comparison catches it (spec §3.0).
+    const peerKey =
+      known?.publicKey ??
+      (typeof relay.fetchPeerIdentityKey === 'function' ? await relay.fetchPeerIdentityKey(peerFp) : null);
+    if (!peerKey) {
+      res.status(409).json({ error: `no identity key found for "${peerFp}" in the known-agent cache or on the relay card` });
       return;
     }
     const result = trustManager.startStaticPairing(peerFp, {
       ownIdentityPub: ownPub,
-      peerIdentityPub: known.publicKey,
+      peerIdentityPub: peerKey,
       ownFp,
-      displayName: known.name,
+      displayName: known?.name,
       clearFailed,
     });
     switch (result.outcome) {

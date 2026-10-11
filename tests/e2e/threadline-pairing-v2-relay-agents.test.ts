@@ -179,6 +179,30 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
     }
   });
 
+  it('falls back to the relay card when the peer key is not cached, and still checks the fingerprint', async () => {
+    // Scout's relay client has NO cached key for Dawn (e.g. Dawn's messages arrive unsigned).
+    const noCache = relayClientFor(scout, []) as unknown as Record<string, unknown>;
+    let cardFor = dawn.idPub; // what the relay card returns
+    noCache.fetchPeerIdentityKey = async (fp: string) =>
+      cardFor.subarray(0, 16).toString('hex') === fp ? cardFor : null; // mirrors the real fingerprint rule
+    const E = await startServer('scout-card', noCache);
+    try {
+      const r = await authed(request(E.app).post(`/threadline/pairing/${dawn.fp}/start`)).send({});
+      expect(r.status).toBe(200);
+      const w = await authed(request(E.app).get(`/threadline/pairing/${dawn.fp}`)).send({ pin: PIN });
+      const wa = await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).send({ pin: PIN });
+      expect(w.body.pairing.sasWords).toEqual(wa.body.pairing.sasWords);
+
+      cardFor = mallory.idPub; // the card now serves a key that is not this fingerprint's
+      const other = makeAgent('other');
+      const bad = await authed(request(E.app).post(`/threadline/pairing/${other.fp}/start`)).send({});
+      expect(bad.status).toBe(409);
+    } finally {
+      await E.server.stop();
+      SafeFsExecutor.safeRmSync(E.tmpDir, { recursive: true, force: true, operation: 'tests/e2e/threadline-pairing-v2-relay-agents.test.ts:cleanup-card' });
+    }
+  });
+
   it('a cached key that does not match the fingerprint is refused', async () => {
     // The relay presents Mallory's key under Scout's fingerprint.
     const D = await startServer('dawn-bad-cache', relayClientFor(dawn, [{ agent: mallory, as: scout }]));

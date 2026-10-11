@@ -464,6 +464,33 @@ export class ThreadlineClient extends EventEmitter {
   }
 
   /**
+   * Fetch a peer's Ed25519 identity key from the relay's public A2A card
+   * (GET /v1/registry/agent/:fp/a2a-card → x-threadline.publicKey), for verified
+   * pairing v2 when the key is not in the known-agent cache (spec §3.0). The key is
+   * relay-supplied, which is acceptable for pairing: a substituted key yields different
+   * words, and the human comparison catches it. Returns null unless the key is 32 bytes
+   * and its first 16 bytes are exactly `recipientId` (the fingerprint rule). Never throws.
+   */
+  async fetchPeerIdentityKey(recipientId: AgentFingerprint, timeoutMs = 10_000): Promise<Buffer | null> {
+    try {
+      const fp = String(recipientId).toLowerCase();
+      if (!/^[0-9a-f]{32}$/.test(fp)) return null;
+      const wsUrl = new URL(this.config.relayUrl ?? DEFAULT_RELAY_URL);
+      const httpBase = `${wsUrl.protocol === 'ws:' ? 'http:' : 'https:'}//${wsUrl.host}`;
+      const res = await fetch(`${httpBase}/v1/registry/agent/${fp}/a2a-card`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) return null;
+      const card = (await res.json()) as { 'x-threadline'?: { publicKey?: unknown } };
+      const b64 = card?.['x-threadline']?.publicKey;
+      if (typeof b64 !== 'string') return null;
+      const key = Buffer.from(b64, 'base64');
+      if (key.length !== 32 || key.subarray(0, 16).toString('hex') !== fp) return null;
+      return key;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Whether the channel a credential would travel on is bound to the pairing a human
    * verified (spec §3.5 / FD4 v2, issue #2117 gap I). TRUE only when ALL hold:
    *  - the peer's currently-known Ed25519 key is exactly the pinned key the human verified;

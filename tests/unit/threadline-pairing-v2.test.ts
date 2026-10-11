@@ -7,6 +7,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import http from 'node:http';
+import { ThreadlineClient } from '../../src/threadline/client/ThreadlineClient.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -160,5 +162,37 @@ describe('startStaticPairing rules', () => {
     const rotated = agent();
     expect(t.startStaticPairing(peer.fp, { ownIdentityPub: rotated.pub, peerIdentityPub: peer.pub, ownFp: rotated.fp }).outcome).toBe('started');
     expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('pending-verification');
+  });
+});
+
+describe('ThreadlineClient.fetchPeerIdentityKey (relay A2A card fallback)', () => {
+  it('returns the card key only when it matches the fingerprint, and null otherwise', async () => {
+    const real = agent();
+    const wrong = agent();
+    const cards: Record<string, string> = {
+      [real.fp]: real.pub.toString('base64'), // honest card
+      [wrong.fp]: real.pub.toString('base64'), // card serves a key that is NOT this fingerprint's
+    };
+    const server = http.createServer((req, res) => {
+      const m = /^\/v1\/registry\/agent\/([0-9a-f]{32})\/a2a-card$/.exec(req.url ?? '');
+      const key = m ? cards[m[1]] : undefined;
+      if (!key) { res.writeHead(404).end(JSON.stringify({ error: 'Agent not found' })); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ name: 'x', 'x-threadline': { publicKey: key } }));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const client = new ThreadlineClient({
+        name: 'test',
+        relayUrl: `ws://127.0.0.1:${port}/v1/connect`,
+        stateDir: fs.mkdtempSync(path.join(os.tmpdir(), 'tl-card-')),
+      });
+      expect((await client.fetchPeerIdentityKey(real.fp))?.equals(real.pub)).toBe(true);
+      expect(await client.fetchPeerIdentityKey(wrong.fp)).toBeNull();
+      expect(await client.fetchPeerIdentityKey(agent().fp)).toBeNull(); // 404
+      expect(await client.fetchPeerIdentityKey('not-a-fingerprint')).toBeNull();
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   });
 });

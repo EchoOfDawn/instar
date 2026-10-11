@@ -17,6 +17,7 @@ Verified pairing (docs/specs/secure-a2a-verified-pairing.md) had every part exce
 - `processPairVerifyReceipt` — modify — adds `receipt-stale` / `receipt-from-future` drops (no state change).
 - `POST /threadline/pairing/:peerFp/verify` — pass-through — unchanged logic; the attention-item text after a denied match now says how the pairing is cleared.
 - `threadline_pair` MCP tool — modify — adds `start`; text says 12 words.
+- `ThreadlineClient.fetchPeerIdentityKey` — add — when the peer key is not in the known-agent cache (e.g. its messages arrive unsigned), the start route reads it from the relay's public A2A card. The key is accepted only if its first 16 bytes equal the fingerprint. Relay-supplied is acceptable for pairing: a substituted key gives different words, and the human comparison catches it.
 
 ---
 
