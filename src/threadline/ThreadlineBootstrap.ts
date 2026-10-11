@@ -35,6 +35,7 @@ import { IdentityManager, IdentityNotProvisionedError } from './client/IdentityM
 import { IdentityFileInvalidError } from '../identity/IdentityKeyFile.js';
 import { detectMachineName } from '../core/MachineIdentity.js';
 import { decodePlaintextPayload } from './autoAck.js';
+import { detectJoinedMesh } from './client/JoinedMeshDetector.js';
 import {
   handleRelayUnknownSender,
   newFingerprintProfileLevel,
@@ -152,6 +153,26 @@ export interface ThreadlineBootstrapResult {
    */
   relaySuppressedByStandby?: boolean;
   /**
+   * a2a-single-agent-identity §1.1: LIVE — true while this machine is in the
+   * `identity-not-provisioned` posture (a joined machine with no usable agent identity:
+   * the relay connection is not attempted, `agent-info.json` is not rewritten). Flips to
+   * false when the reload lever finds an identity on disk.
+   */
+  identityNotProvisioned: () => boolean;
+  /**
+   * §2.2: the fingerprint the running relay client is CONNECTED as, or null when there is
+   * no live relay connection in this process (standby / daemon-handled / disconnected).
+   */
+  connectedAs: () => string | null;
+  /**
+   * The reload lever (§1.2): re-read this machine's OWN identity from disk, rebuild the
+   * relay client under the new key, re-run the standby + daemon predicate, and connect
+   * only where this process may (a standby stays disconnected by design). Local effect
+   * only; carries no key; installs nothing. Shared by adoption, the CLI route and the
+   * mirror repair.
+   */
+  reloadIdentity: () => Promise<{ fingerprint: string | null; connected: boolean; reason: string }>;
+  /**
    * Live (ACT-1306 a): true while `config.relayOwner` has this machine off the
    * relay because another machine holds the serving lease. Unlike the boot-time
    * fact above, this changes as the lease moves.
@@ -194,6 +215,52 @@ export async function bootstrapThreadline(
   // routing path reads.
   const routingIdentityManager = new IdentityManager(config.stateDir);
   const routingIdentity = routingIdentityManager.get();
+
+  // ── §1.1 identity-not-provisioned posture ───────────────────────
+  // A machine with no usable routing identity whose machine registry refuses a mint
+  // (joined, rows-without-own-id, or unreadable) boots in a NAMED posture: no relay
+  // connection is attempted, `agent-info.json` keeps the last value this machine actually
+  // published (the one memory §1.3 pins adoption on), and the adoption loop (wired in
+  // server.ts) fills the void. A standalone first machine with no identity is NOT this
+  // posture — it mints below, as before.
+  let identityNotProvisioned = false;
+  if (!routingIdentity) {
+    const verdict = detectJoinedMesh(config.stateDir);
+    identityNotProvisioned = !verdict.mintAllowed;
+    if (identityNotProvisioned) {
+      console.warn('Threadline: identity-not-provisioned — this machine is paired but holds no agent identity; the relay is not attempted and the identity is adopted from a sibling (or `instar identity adopt --from <machine>`)');
+    }
+  }
+
+  // ── §1.5 the legacy file is a mirror, repaired at first load ────
+  // When the two key files disagreed, the canonical one won AND the legacy file was
+  // rewritten to match (backup beside it). The listener daemon loads the legacy path as
+  // ITS key, so a daemon alive under the superseded key is SIGTERMed here and the server
+  // re-runs its own daemon decision below, taking the relay itself. A daemon that is not
+  // running is left alone (a relaunched one loads the right key and takes the relay back).
+  let daemonStoppedForMirrorRepair = false;
+  const mirrorRepaired = routingIdentityManager.legacyMirrorRepaired;
+  if (mirrorRepaired) {
+    DegradationReporter.getInstance().report({
+      feature: 'Threadline.identity',
+      primary: 'one agent identity across the canonical and the legacy key file',
+      fallback: `the legacy file was rewritten to mirror the canonical one (fingerprint ${routingIdentity?.fingerprint ?? 'unknown'}); the old file is kept at ${mirrorRepaired.backupPath || '(already matching)'}`,
+      reason: 'the legacy threadline/identity.json held a different identity than identity.json',
+      impact: 'a listener daemon that was running under the old key has been stopped so the server speaks under the canonical key',
+    });
+    const daemonPidPath = path.join(config.stateDir, 'listener-daemon.pid');
+    try {
+      const pid = parseInt(fs.readFileSync(daemonPidPath, 'utf-8').trim(), 10);
+      if (Number.isFinite(pid) && pid > 0) {
+        process.kill(pid, 0);
+        process.kill(pid, 'SIGTERM');
+        daemonStoppedForMirrorRepair = true;
+        console.warn(`Threadline: listener daemon (pid ${pid}) was running under the superseded legacy key — sent SIGTERM; the server takes the relay connection`);
+      }
+    } catch {
+      // No daemon alive (no pid file, dead pid) — nothing to stop.
+    }
+  }
   // An identity file that exists but cannot be used is a degradation, not an
   // empty state: nothing is minted over it (that would change this agent's
   // address), so the agent stays off the relay until the file is restored.
@@ -220,15 +287,21 @@ export async function bootstrapThreadline(
   // identity on disk, or canonical identity.json is passphrase-encrypted and
   // locked at boot), OMIT both — an agent with no resolvable routing identity
   // is simply not relay-discoverable until it has one.
-  discovery.announcePresence({
-    capabilities: ['threadline', 'mcp'],
-    description: config.agentDescription ?? `${config.agentName} Instar agent`,
-    threadlineVersion: '1.0',
-    publicKey: routingIdentity?.publicKey.toString('hex'),
-    fingerprint: routingIdentity?.fingerprint,
-    framework: 'instar',
-    machine: detectMachineName(),
-  });
+  // §1.1: in the identity-not-provisioned posture the file is NOT rewritten — today it would
+  // be written with no `fingerprint`, erasing the last value this machine published, which
+  // is exactly the local memory §1.3 adoption pins on.
+  const announce = (identity: { publicKey: Buffer; fingerprint: string } | null) => {
+    discovery.announcePresence({
+      capabilities: ['threadline', 'mcp'],
+      description: config.agentDescription ?? `${config.agentName} Instar agent`,
+      threadlineVersion: '1.0',
+      publicKey: identity?.publicKey.toString('hex'),
+      fingerprint: identity?.fingerprint,
+      framework: 'instar',
+      machine: detectMachineName(),
+    });
+  };
+  if (!identityNotProvisioned) announce(routingIdentity);
 
   // Start heartbeat for liveness detection
   const stopHeartbeat = discovery.startPresenceHeartbeat();
@@ -261,8 +334,11 @@ export async function bootstrapThreadline(
   //   3. Health file shows recent activity (last 5 min) → defer (daemon may be restarting)
   // This prevents the displacement race where the server briefly connects its own
   // relay client during restart, displacing the daemon.
+  // The decision is a FUNCTION so the reload lever (§1.2) and the mirror repair (§1.5) can
+  // re-run it; the boot-time value is captured once below, as before.
+  const decideDaemonHandlingRelay = (): boolean => {
   let daemonHandlingRelay = false;
-  if (relayEnabled) {
+  if (relayEnabled && !daemonStoppedForMirrorRepair) {
     // Check 1: Config-level opt-in — if the user configured a daemon, always defer
     const listenerConfigPath = path.join(config.stateDir, 'config.json');
     let listenerConfigEnabled = false;
@@ -316,6 +392,9 @@ export async function bootstrapThreadline(
       console.log(`Threadline: listener daemon was recently active — server will NOT connect to relay (daemon may be restarting)`);
     }
   }
+  return daemonHandlingRelay;
+  };
+  const daemonHandlingRelay = decideDaemonHandlingRelay();
 
   let relayClient: ThreadlineClient | undefined;
   let relayRearmTimer: NodeJS.Timeout | null = null;
@@ -514,6 +593,12 @@ export async function bootstrapThreadline(
           if (!relayReleasedForStandby) return;
           relayReleasedForStandby = false;
           config.onRelayStandbyChange?.(false);
+          if (identityNotProvisioned) {
+            // a2a-single-agent-identity §1.1: no usable agent identity → no relay socket to
+            // open; the reload lever connects once adoption lands (and re-checks ownership).
+            console.warn('Threadline: this machine now holds the serving lease but has no agent identity (identity-not-provisioned) — relay connection not attempted');
+            return;
+          }
           console.log('Threadline: this machine now holds the serving lease — taking the relay connection');
           ownedClient.connect().then(
             () => console.log(`Threadline: relay connected (fingerprint: ${ownedClient.fingerprint})`),
@@ -534,7 +619,9 @@ export async function bootstrapThreadline(
       }, checkMs);
       relayOwnerTimer.unref?.();
     }
-    if (ownerAtBoot) try {
+    if (identityNotProvisioned) {
+      console.warn('Threadline: relay connection NOT attempted (identity-not-provisioned); it connects on the tick after the identity is adopted');
+    } else if (ownerAtBoot) try {
       await relayClient.connect();
       console.log(`Threadline: relay connected (fingerprint: ${relayClient.fingerprint})`);
     } catch (err) {
@@ -570,6 +657,47 @@ export async function bootstrapThreadline(
     /** Live: true while live relay ownership has this machine off the relay. */
     isRelayReleasedForStandby: () => relayReleasedForStandby,
     inboundGate,
+    identityNotProvisioned: () => identityNotProvisioned,
+    connectedAs: () => relayClient?.connectedAs ?? null,
+    reloadIdentity: async () => {
+      // Re-read disk through the single reader (the cache is invalidated, not reused).
+      let fingerprint: string | null;
+      let publicKey: Buffer | null = null;
+      if (relayClient) {
+        fingerprint = await relayClient.reloadIdentity({ connect: false });
+        publicKey = relayClient.publicKey;
+      } else {
+        const id = routingIdentityManager.reload();
+        fingerprint = id?.fingerprint ?? null;
+        publicKey = id?.publicKey ?? null;
+      }
+      if (!fingerprint || !publicKey) {
+        // A reload that finds no file re-enters the posture (counted as an adopt→lose cycle
+        // by the adoption loop, which reads the same disk).
+        identityNotProvisioned = !detectJoinedMesh(config.stateDir).mintAllowed;
+        inboundGate?.setOwnFingerprint(undefined);
+        return { fingerprint: null, connected: false, reason: identityNotProvisioned ? 'identity-not-provisioned' : 'no-identity' };
+      }
+      identityNotProvisioned = false;
+      inboundGate?.setOwnFingerprint(fingerprint);
+      announce({ publicKey, fingerprint });
+      if (!relayEnabled) return { fingerprint, connected: false, reason: config.relayStandby ? 'standby' : 'relay-disabled' };
+      // Re-run the standby + daemon predicate BEFORE any connect: a rebuilt machine is
+      // usually a standby, and a connect from it would displace the awake machine.
+      if (decideDaemonHandlingRelay()) return { fingerprint, connected: false, reason: 'daemon-handles-relay' };
+      if (!relayClient) return { fingerprint, connected: false, reason: 'no-relay-client' };
+      // ACT-1306 a: the relay follows the serving lease. A machine that does not hold it
+      // stays off the relay; the owner timer connects it if it takes over.
+      if (!relayOwnerSays()) return { fingerprint, connected: false, reason: 'not-relay-owner' };
+      try {
+        await relayClient.connect();
+        console.log(`Threadline: relay reconnected under the reloaded identity (fingerprint: ${relayClient.fingerprint})`);
+        return { fingerprint, connected: relayClient.connectionState === 'connected', reason: 'connected' };
+      } catch (err) {
+        console.error(`Threadline: relay connect after identity reload failed — ${err instanceof Error ? err.message : err}; the client keeps retrying with backoff`);
+        return { fingerprint, connected: false, reason: 'connect-failed' };
+      }
+    },
     shutdown: async () => {
       stopHeartbeat();
       if (relayOwnerTimer) {

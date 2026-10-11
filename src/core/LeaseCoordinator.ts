@@ -105,6 +105,14 @@ export interface LeaseCoordinatorDeps {
   tunnel?: LeaseTransport;
   /** Machines presumed dead (lastSeen older than failoverThresholdMs). */
   presumedDeadHolders: (opts?: { liveness?: boolean }) => ReadonlySet<string>;
+  /**
+   * a2a-single-agent-identity §1.1 — lease ELIGIBILITY, read live on every acquire tick. A
+   * machine in `identity-not-provisioned` posture answers false: it declines to acquire the
+   * serving lease and RELINQUISHES one it holds (an unprovisioned lease holder would take the
+   * whole fleet off the agent network — it holds the one relay connection and cannot use it).
+   * Absent ⇒ eligible (single-machine installs and every pre-existing caller are unchanged).
+   */
+  isLeaseEligible?: () => boolean;
   /** Live switch getters; absent means enabled. */
   getLivenessEnabled?: () => boolean;
   getUnconfirmedWriteAlertEnabled?: () => boolean;
@@ -542,11 +550,11 @@ export class LeaseCoordinator {
    * (forceLocalExpiry keeps the committed epoch) so a replayed stale lease can't
    * win after we relinquish.
    */
-  relinquish(): void {
+  relinquish(why = 'contested tie-break loser — winner may now advance to N+1'): void {
     this.relinquishGeneration++;
     this.selfIssued = null;
     this.d.store.forceLocalExpiry?.();
-    this.log('relinquished self-lease (contested tie-break loser) — winner may now advance to N+1');
+    this.log(`relinquished self-lease (${why})`);
   }
 
   /**
@@ -576,11 +584,11 @@ export class LeaseCoordinator {
    * higher-epoch normal takeover always strictly dominates it. Idempotent: a no-op
    * (just local relinquish) when we are not the named holder.
    */
-  async relinquishAndBroadcast(): Promise<void> {
+  async relinquishAndBroadcast(why = 'silent-standby release'): Promise<void> {
     const view = this.effectiveView();
     if (!view.lease || view.lease.holder !== this.selfMachineId || view.lease.released) {
       // Not the live holder (or already a tombstone) → just clear local state.
-      this.relinquish();
+      this.relinquish(why);
       return;
     }
     const tombstone = this.fl.signLease(
@@ -590,9 +598,9 @@ export class LeaseCoordinator {
       this.nextNonce(),                   // strictly > our last renewal nonce
       true,                               // released
     );
-    this.relinquish(); // clear our own self-hold first (forceLocalExpiry preserves the epoch floor)
+    this.relinquish(why); // clear our own self-hold first (forceLocalExpiry preserves the epoch floor)
     await this.broadcast(tombstone);
-    this.log(`relinquished + broadcast tombstone for epoch ${view.lease.epoch} (silent-standby release)`);
+    this.log(`relinquished + broadcast tombstone for epoch ${view.lease.epoch} (${why})`);
   }
 
   /**
@@ -779,7 +787,25 @@ export class LeaseCoordinator {
     }
   }
 
+  private identityIneligibleLogged = false;
+
   async acquireIfEligible(): Promise<boolean> {
+    // §1.1 lease rule: an unprovisioned machine that can see a live provisioned sibling does
+    // not acquire, and releases what it holds at this (the next) tick. Read live so adoption lifting the posture needs no restart.
+    if (this.d.isLeaseEligible && !this.d.isLeaseEligible()) {
+      const view = this.effectiveView();
+      if (view.lease && view.lease.holder === this.selfMachineId && !this.fl.isExpired(view.lease, this.now())) {
+        // Signed tombstone, not the bare local relinquish: peers stop deferring to this
+        // machine now instead of waiting out the lease TTL.
+        await this.relinquishAndBroadcast('identity-not-provisioned: a live sibling holds the agent identity');
+      } else if (!this.identityIneligibleLogged) {
+        // Once per ineligible stretch, not once per tick.
+        this.log('acquire skipped: identity-not-provisioned and a live sibling holds the agent identity');
+      }
+      this.identityIneligibleLogged = true;
+      return false;
+    }
+    this.identityIneligibleLogged = false;
     if (this.suspended) {
       // A suspended holder may resume only by re-acquiring cleanly below.
       this.suspended = false;
