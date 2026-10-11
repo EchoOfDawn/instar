@@ -27,7 +27,7 @@ const SAS_WORDS = ['abandon', 'ability', 'able', 'about', 'above', 'absent'];
 
 let dirs: string[] = [];
 
-async function makeCtx() {
+async function makeCtx(opts: { reload?: boolean } = {}) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-mcp-'));
   dirs.push(stateDir);
   const trustManager = new AgentTrustManager({ stateDir });
@@ -53,6 +53,7 @@ async function makeCtx() {
     sendMessage: vi.fn(),
     getThreadHistory: vi.fn(),
     registry: null,
+    reloadTrustBeforePairingRead: opts.reload,
   } as unknown as ThreadlineMCPDeps;
 
   const server = new ThreadlineMCPServer(
@@ -63,7 +64,7 @@ async function makeCtx() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test-client', version: '1.0.0' });
   await Promise.all([client.connect(clientTransport), mcpServer.connect(serverTransport)]);
-  return { trustManager, server, client, close: async () => { await client.close(); await server.stop(); } };
+  return { trustManager, stateDir, server, client, close: async () => { await client.close(); await server.stop(); } };
 }
 
 function parse(result: any) {
@@ -74,6 +75,23 @@ describe('threadline_pair MCP tool (integration)', () => {
   afterEach(() => {
     for (const d of dirs) { try { SafeFsExecutor.safeRmSync(d, { recursive: true, force: true, operation: 'pair-mcp-tool.test.ts:cleanup' }); } catch { /* ignore */ } }
     dirs = [];
+  });
+
+  it('in stdio mode, status sees a pairing the SERVER started after this process loaded (spec §3.6)', async () => {
+    for (const reload of [true, false]) {
+      const ctx = await makeCtx({ reload });
+      try {
+        // A second trust manager on the same state dir stands in for the agent server.
+        const serverSide = new AgentTrustManager({ stateDir: ctx.stateDir });
+        serverSide.recordPendingVerification('f'.repeat(32), {
+          pairingId: 'b'.repeat(32), peerIdentityPub: 'f'.repeat(64), sasWords: SAS_WORDS,
+          sasFingerprint: '0102030405060708', ownFp: OWN_FP, displayName: 'later',
+        });
+        serverSide.flush();
+        const out = parse(await ctx.client.callTool({ name: 'threadline_pair', arguments: { action: 'status' } }));
+        expect(out.count).toBe(reload ? 2 : 1);
+      } finally { await ctx.close(); }
+    }
   });
 
   it('status lists the pending pairing without SAS words', async () => {

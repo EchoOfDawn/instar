@@ -96,7 +96,9 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 
 - **Identity-key cache fill (FD4a).** After a start reads the peer key from the relay card, it is merged into the known-agent cache: the identity key only, never an X25519 key. It is refused if it does not match the fingerprint, and never overwrites a different cached key.
 
-Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the stdio `status` read; the dashboard panel.
+- **Stale stdio status.** The stdio MCP process holds its own copy of the trust manager, so `status` now reloads it, and the pending-words store, from disk before reading. This is opt-in via `reloadTrustBeforePairingRead`, set only in the stdio entry, because an in-process reload could drop writes still waiting on the save debounce.
+
+Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the dashboard panel.
 
 ## Conclusion
 

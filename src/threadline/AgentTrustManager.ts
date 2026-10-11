@@ -1254,6 +1254,7 @@ export class AgentTrustManager {
    */
   reload(): void {
     this.profiles = this.loadProfiles();
+    this.pendingStore.reload();
   }
 
   /**

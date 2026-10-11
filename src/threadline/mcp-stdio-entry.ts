@@ -220,6 +220,8 @@ async function main(): Promise<void> {
       requestSecret: (params) => requestSecretViaHttp(params, serverPort),
       // Verified pairing v2: start a pending static-key pairing on the server (spec §3.2).
       startPairing: (peerFp) => startPairingViaHttp(peerFp, serverPort, agentToken),
+      // This process holds its own trust-manager copy; re-read it before pairing status reads.
+      reloadTrustBeforePairingRead: true,
       registry: registryClient,
       relayClient: createHttpRelayDiscoverer(serverPort, agentToken),
     },

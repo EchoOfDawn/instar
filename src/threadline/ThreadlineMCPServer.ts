@@ -120,6 +120,12 @@ export interface ThreadlineMCPDeps {
    * that cannot reach the local server, in which case `threadline_pair start` reports so.
    */
   startPairing?: (peerFp: string) => Promise<{ success: boolean; status?: number; body?: Record<string, unknown>; error?: string }>;
+  /**
+   * True in the stdio MCP process, whose trust manager is a separate in-memory copy loaded
+   * at startup: pairing reads reload it from disk first so a pairing the server just started
+   * is visible (spec §3.6). Never set in-process, where a reload could drop debounced writes.
+   */
+  reloadTrustBeforePairingRead?: boolean;
 }
 
 export interface SendMessageParams {
@@ -1260,6 +1266,7 @@ export class ThreadlineMCPServer {
           }
 
           case 'status': {
+            if (this.deps.reloadTrustBeforePairingRead) trustManager.reload();
             if (args.fingerprint) {
               const profile = trustManager.getProfileByFingerprint(args.fingerprint);
               if (!profile || profile.pairingState === undefined) {
