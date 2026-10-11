@@ -92,7 +92,9 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 
 - **Typed comparison (FD2a).** Verify takes the OTHER side's 12 words; the server compares all 12 in order. A bare `match:true` is refused, and any difference is a denial. This is an over-block for an operator who only eyeballs: intended, because a careless eyeball check is what a partial-match attack targets.
 
-Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the stdio `status` read; the dashboard panel; and the migrator replacing the v1 section.
+- **Agent awareness.** The migration now REPLACES a v1 CLAUDE.md section in place with the v2 text instead of appending a contradicting supplement (idempotent; it skips an agent whose file already names the start route). The template's verify text describes typed confirmation, and the site feature doc is rewritten for v2.
+
+Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the stdio `status` read; the dashboard panel.
 
 ## Conclusion
 
