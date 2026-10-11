@@ -37274,12 +37274,13 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
             }
           } catch { /* @silent-fallback-ok — identity read is best-effort */ }
         }
-        if (localTarget?.port && !isSelfTarget) {
-          // §3.5 outbound credential-share chokepoint (local-delivery path). A credential
-          // must go to a mutual-verified peer over the encrypted+signed path only — the
-          // plaintext localhost relay-agent path is refused for a credential.
-          const localFp = resolvePeerFingerprint(localTarget) ?? '';
-          if (refuseCredentialShareIfBlocked(localFp)) return;
+        // §3.5: a credential never takes the localhost relay-agent route, which is
+        // plaintext. It is judged here first (same refusal as before), then goes to the
+        // relay leg below, through the pinned encrypted send.
+        if (localTarget?.port && !isSelfTarget && isCredentialShareSend) {
+          if (refuseCredentialShareIfBlocked(resolvePeerFingerprint(localTarget) ?? '')) return;
+        }
+        if (localTarget?.port && !isSelfTarget && !isCredentialShareSend) {
           // Check if the local agent is actually running
           try {
             const healthResp = await fetch(`http://localhost:${localTarget.port}/threadline/health`, {
@@ -37722,8 +37723,20 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
           backupRouteCounters.unmarkedFallthroughAfterPost++;
         }
       }
-      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } =
-        (fallthrough?.marked || (forwardedRequest && req.body?.resend === true))
+      const relayLegResend = Boolean(fallthrough?.marked || (forwardedRequest && req.body?.resend === true));
+      // A credential that passed the gate goes ONLY through the pinned encrypted send
+      // (FD4 v2): encrypted to the verified identity key and the key derived from it,
+      // never to a cached encryption key and never plaintext.
+      const pinnedForCredential = isCredentialShareSend && verifiedPairingEnabled
+        ? ctx.unifiedTrust?.trustManager?.getProfileByFingerprint(resolvedId)?.peerIdentityPub
+        : undefined;
+      if (isCredentialShareSend && verifiedPairingEnabled && (!pinnedForCredential || typeof relayClient.sendCredentialToPinned !== 'function')) {
+        res.status(403).json({ success: false, refused: true, reason: 'credential-requires-encrypted-path', error: 'Credential-share refused: credential-requires-encrypted-path.' });
+        return;
+      }
+      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } = pinnedForCredential
+        ? relayClient.sendCredentialToPinned(resolvedId, pinnedForCredential, message, relayLegThreadId, msgId, relayLegResend || undefined)
+        : relayLegResend
           ? relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId, true)
           : relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId);
       // waitForReply: the reply listener is registered NOW, before any await, so

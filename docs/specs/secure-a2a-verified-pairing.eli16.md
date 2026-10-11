@@ -40,4 +40,4 @@ There are now 12 words instead of 6. Here's why. A dishonest relay that swaps ke
 
 The words aren't secret. Anyone who knows both public keys can work them out. What protects you is that two people compare them over a channel the relay can't touch.
 
-Two more rules came with it. If an operator says the words didn't match, the pairing stays marked as failed until an operator clears it with the PIN. And even after a pairing is verified, an agent won't send a password unless the key it would encrypt with provably belongs to the verified identity.
+Two more rules came with it. If an operator says the words didn't match, the pairing stays marked as failed until an operator clears it with the PIN. And once a pairing is verified, a password is locked with a key worked out from the identity the human checked, never with a key the relay handed over, and never sent in plain text. (The first version asked for a key the relay hands over, and it turned out the agents never actually receive one. A real end-to-end test showed every password between two verified agents was being refused, so this was changed.)

@@ -39,13 +39,15 @@ export interface CredentialShareDecision {
 }
 
 /**
- * Minimal read surface the outbound chokepoint needs to decide whether the
- * encrypted+signed send path is available to a recipient (never plaintext for a
- * credential, spec §3.5). Implemented by ThreadlineClient.hasEncryptedSendPath.
+ * Minimal read surface the outbound chokepoint needs (spec §3.5). Implemented by
+ * ThreadlineClient.
  */
 export interface EncryptedPathProbe {
-  /** True iff this recipient's keys are known so MessageEncryptor.encrypt is used. */
-  hasEncryptedSendPath(recipientFp: string): boolean;
+  /**
+   * True iff the recipient's keys are cached so `sendAuto` would encrypt. No longer
+   * consulted by the gate: a credential travels only the pinned send below.
+   */
+  hasEncryptedSendPath?(recipientFp: string): boolean;
   /**
    * True iff the channel is bound to the verified pairing: the peer's current identity key
    * is the pinned one, its encryption key is derived from it, and the pairingId still
@@ -53,6 +55,13 @@ export interface EncryptedPathProbe {
    * Optional so older probes compile; an absent method REFUSES (fail-closed).
    */
   isChannelBoundToPairing?(recipientFp: string, pinnedIdentityPubHex: string, pairingId: string | null): boolean;
+  /**
+   * The pinned credential send (FD4 v2): encrypts to the verified identity key and the
+   * X25519 key derived from it, never to a cached encryption key. A credential may only
+   * travel this way, so a probe without it REFUSES (fail-closed). Implemented by
+   * ThreadlineClient.sendCredentialToPinned.
+   */
+  sendCredentialToPinned?(recipientFp: string, pinnedIdentityPubHex: string, content: string, threadId?: string, messageId?: string, resend?: boolean): { messageId: string; threadId: string };
 }
 
 // ── Agent-facing READ helper (the guarantee lives at the funnel) ──────
@@ -91,8 +100,8 @@ export function assertCanShareCredential(
  *
  * Refuses unless ALL hold:
  *   1. the recipient peer is `mutual-verified` (peer-not-mutually-verified), AND
- *   2. the encrypted+signed send path is available for that recipient — a credential
- *      must NEVER traverse the plaintext fallback (credential-requires-encrypted-path), AND
+ *   2. the pinned encrypted+signed send is available (sendCredentialToPinned) — a
+ *      credential must NEVER traverse the plaintext fallback (credential-requires-encrypted-path), AND
  *   3. that path's encryption key is derived from the pinned, human-verified identity key
  *      and the pairing still matches our current key (encryption-key-not-bound, FD4 v2).
  *
@@ -115,7 +124,9 @@ export function evaluateOutboundCredentialShare(
 
     // (2) The credential must go encrypted+signed only — never sendPlaintext.
     // If we cannot probe the path, or the path is plaintext-only, fail closed.
-    if (!encryptedPath || !encryptedPath.hasEncryptedSendPath(recipientFp)) {
+    // (2) The only route a credential takes is the pinned encrypted send; a client that
+    // cannot do it would fall back to plaintext, so it is refused.
+    if (!encryptedPath || typeof encryptedPath.sendCredentialToPinned !== 'function') {
       return { allow: false, reason: 'credential-requires-encrypted-path' };
     }
 

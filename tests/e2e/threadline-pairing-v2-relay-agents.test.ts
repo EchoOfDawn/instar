@@ -73,6 +73,7 @@ function relayClientFor(self: Agent, known: Array<{ agent: Agent; x25519?: Buffe
     identity: { publicKey: self.idPub },
     getKnownAgents: () => [...knownAgents.values()],
     hasEncryptedSendPath: (fp: string) => Boolean(knownAgents.get(fp)?.x25519PublicKey),
+    sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }), // the real client always has the pinned send
   } as Record<string, unknown>;
   fake.isChannelBoundToPairing = ThreadlineClient.prototype.isChannelBoundToPairing.bind(fake as never);
   return fake as never;

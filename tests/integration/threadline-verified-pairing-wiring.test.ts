@@ -27,6 +27,7 @@ import express from 'express';
 import request from 'supertest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { createRoutes } from '../../src/server/routes.js';
@@ -68,7 +69,7 @@ function makePeer(): Peer {
 }
 // `isChannelBoundToPairing` stands in for the real X25519-binding check (exercised for real in
 // threadline-pairing-v2-relay-agents.test.ts).
-const encryptedPath = (known: boolean) => ({ hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => known });
+const encryptedPath = (known: boolean) => ({ hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => known, ...(known ? { sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }) } : {}) });
 
 /** Record a pending pairing on a real trust manager and (optionally) verify it. */
 function seedPairing(tm: AgentTrustManager, self: Peer, peer: Peer, verify: boolean): { pairingId: string; sasWords: string[]; sasFingerprint: string } {
@@ -82,7 +83,7 @@ function seedPairing(tm: AgentTrustManager, self: Peer, peer: Peer, verify: bool
   return { pairingId, sasWords, sasFingerprint };
 }
 
-function appWith(opts: { enabled: boolean; trustManager: AgentTrustManager; stateDir: string; dashboardPin?: string; knownAgents?: unknown }): express.Express {
+function appWith(opts: { enabled: boolean; trustManager: AgentTrustManager; stateDir: string; dashboardPin?: string; knownAgents?: unknown; relayClient?: unknown }): express.Express {
   const ctx = {
     config: {
       projectName: 'test', projectDir: opts.stateDir, stateDir: opts.stateDir, port: 0,
@@ -93,6 +94,7 @@ function appWith(opts: { enabled: boolean; trustManager: AgentTrustManager; stat
     sessionManager: {} as never,
     state: {} as never,
     unifiedTrust: { trustManager: opts.trustManager },
+    threadlineRelayClient: opts.relayClient,
     threadlineReplyWaiters: new Map(),
     startTime: new Date(),
   } as unknown as RouteContext;
@@ -180,6 +182,32 @@ describe('Verified Pairing — wiring integrity (deps are real, not null/no-op)'
     expect(res.status).toBe(403);
     expect(res.body.refused).toBe(true);
     expect(res.body.reason).toBe('peer-not-mutually-verified');
+  });
+
+  it('5c. a credential to a VERIFIED co-located agent never touches the localhost route, which is plaintext (§3.5)', async () => {
+    const stateDir = mkStateDir();
+    const tm = new AgentTrustManager({ stateDir });
+    const self = makePeer(); const peer = makePeer();
+    seedPairing(tm, self, peer, true);
+    // A live co-located agent: answers health, would accept a relay-agent POST.
+    const hits: string[] = [];
+    const local = http.createServer((req, res) => { hits.push(req.url ?? ''); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"status":"ok"}'); });
+    await new Promise<void>((r) => local.listen(0, '127.0.0.1', () => r()));
+    const port = (local.address() as { port: number }).port;
+    try {
+      const app = appWith({
+        enabled: true, trustManager: tm, stateDir, dashboardPin: DASHBOARD_PIN,
+        knownAgents: { agents: [{ name: 'dawn', port, fingerprint: peer.fp }] },
+        relayClient: { ...encryptedPath(true), getKnownAgents: () => [] },
+      });
+      const res = await request(app)
+        .post('/threadline/relay-send')
+        .send({ targetAgent: 'dawn', message: 'here is the API key', kind: 'credential-share' });
+      expect(hits).toEqual([]);
+      expect(res.body.deliveryPath).not.toBe('local');
+    } finally {
+      await new Promise<void>((r) => local.close(() => r()));
+    }
   });
 
   it('5b. a NON-credential send is NOT gated by the funnel (the gate is credential-keyed only)', async () => {

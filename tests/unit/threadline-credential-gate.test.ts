@@ -116,7 +116,8 @@ function makeMessage(fromFp: string, content: unknown): ReceivedMessage {
 // (the encryption key derived from the pinned identity key; exercised for real in
 // threadline-pairing-v2.test.ts).
 function encryptedPath(known: boolean, bound = true) {
-  return { hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => bound };
+  // `known` = the client can do the pinned encrypted send (FD4 v2), the only route a credential takes.
+  return { hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => bound, ...(known ? { sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }) } : {}) };
 }
 
 // ── Outbound credential-share gate ────────────────────────────────────
@@ -150,13 +151,13 @@ describe('CredentialShareGate — outbound (load-bearing, §3.5/FD9)', () => {
 
   it('a binding check that THROWS refuses as encryption-key-not-bound, not peer-not-mutually-verified', () => {
     setUpPairing(tm, self, peer, { verify: true });
-    const throwing = { hasEncryptedSendPath: () => true, isChannelBoundToPairing: () => { throw new Error('boom'); } };
+    const throwing = { sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }), isChannelBoundToPairing: () => { throw new Error('boom'); } };
     expect(evaluateOutboundCredentialShare(tm, throwing, peer.fp)).toEqual({ allow: false, reason: 'encryption-key-not-bound' });
   });
 
   it('REFUSES when the path probe cannot check the binding at all (fail-closed)', () => {
     setUpPairing(tm, self, peer, { verify: true });
-    const d = evaluateOutboundCredentialShare(tm, { hasEncryptedSendPath: () => true }, peer.fp);
+    const d = evaluateOutboundCredentialShare(tm, { sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }) }, peer.fp);
     expect(d.allow).toBe(false);
     expect(d.reason).toBe('encryption-key-not-bound');
   });

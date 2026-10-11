@@ -23,7 +23,8 @@ Verified pairing (docs/specs/secure-a2a-verified-pairing.md) had every part exce
 
 ## 1. Over-block
 
-- **Credential-share to an agent whose X25519 key is not the standard derivation.** `IdentityManager.loadFromLegacy` can carry a stored `x25519PublicKey` that differs from the derived one. Such a peer is now refused credentials even when verified, which is the intended fail-closed outcome. Ordinary messages are not affected.
+- **Credential-share to an agent whose cached X25519 key is not the standard derivation.** `IdentityManager.loadFromLegacy` can carry a stored `x25519PublicKey` that differs from the derived one. Such a cached key is refused by the binding check (fail-closed), and the credential send never uses a cached key anyway. Ordinary messages are not affected.
+- **A credential to a co-located agent no longer takes the localhost route.** That route is plaintext. The credential is judged by the gate first (same refusals as before) and then goes over the relay, so it needs a relay connection.
 - **Start when the peer's key is not cached** returns 409 ("exchange a Threadline message first"). This is a usability cost, not a security one. It is the only way to bind the relay-observed key rather than a caller-chosen key.
 - **A denied match cannot be retried without the PIN.** This is intended (spec §3.2), because static words would show the same mismatch again.
 - **Receipts from a sender whose clock is more than 5 minutes off** are dropped. The receipt is optional (FD8), so the only cost is a missing `peerAcked`.
@@ -32,6 +33,7 @@ Verified pairing (docs/specs/secure-a2a-verified-pairing.md) had every part exce
 
 - **The words are only as good as the comparison.** If an operator confirms without comparing, nothing here helps (unchanged from v1, §3.9).
 - **2^66 is a work bound, not impossibility.** A relay with enormous compute could still search. 12 words was chosen over scrypt-stretched 6 words because it reaches this bound with no memory cost.
+- **Receive side.** When the receiver holds only the sender's identity key, it tries the key derived from it; anything that does not open (every plaintext envelope) goes to the unknown-sender path exactly as before. The cost is one failed decrypt attempt per plaintext envelope from such a peer. A forged envelope fails the signature check and is not delivered.
 - **Ordinary (non-credential) messages still encrypt to whatever X25519 key the relay supplied.** This change binds the key only on the credential path. Binding it on ingest for all messages is a separate change; doing it here could start encrypting to peers whose listeners cannot decrypt (Dawn's portal listener has no X25519 key at all).
 - **Option B (a handshake carried over the relay) would have the same offline-search weakness**, since the v1 handshake has no commitment step. Noted in the spec and not built.
 
@@ -103,7 +105,9 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 
 - **Stale stdio status.** The stdio MCP process holds its own copy of the trust manager, so `status` now reloads it, and the pending-words store, from disk before reading. This is opt-in via `reloadTrustBeforePairingRead`, set only in the stdio entry, because an in-process reload could drop writes still waiting on the save debounce.
 
-Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm.
+- **Credential path encrypts to the derived key (built 2026-10-11).** The production-path E2E (real bootstrap, in-process RelayServer, nothing hand-built) showed that after a full mutual verification a credential was refused with `credential-requires-encrypted-path`: the real clients never cache an X25519 key for each other (a start caches the identity key only; relay discovery is keyless). `ThreadlineClient.sendCredentialToPinned` now encrypts to the pinned identity key and its derived X25519 key; the gate's second check requires that send; the relay-send route uses it for every credential. Over 50 random keys the derived key equals the agent's own X25519 key.
+
+Still open, pending Echo's spec review: sending the receipt after a confirm.
 
 ## Conclusion
 
@@ -122,6 +126,9 @@ The review led to four design changes before commit: 12 words instead of 6 (Echo
 
 - `tests/unit/threadline-pairing-v2.test.ts` (12): the curve map against the encryptor on 200 keys, the SAS symmetric and key-sensitive, receipt freshness on both sides of each 5-minute bound, and the start rules.
 - `tests/e2e/threadline-pairing-v2-relay-agents.test.ts` (5): two servers start independently and reach pending with the same 12 words; a substituted key gives different words; a cached key that mismatches its fingerprint is refused; credential allowed only with a bound key; a denied match needs the PIN.
+- `tests/e2e/threadline/pairing-v2-production-path-alive.test.ts` (7): real `bootstrapThreadline` on an in-process RelayServer; the start takes the key from the relay card; same 12 words; typed confirmation; a credential to the verified peer is delivered and decrypted with no cached X25519 key on either side; one to an unverified peer is refused.
+- `tests/unit/ThreadlineClient-pinned-credential.test.ts` (4) and wiring test 5c: plaintext from an identity-key-only peer still goes to unknown-sender; a wrong pinned key sends nothing; a forged sender is not delivered; a credential never contacts the localhost route.
+- Seven credential-path breakages (wrong encryption key, no receive derivation, credential via the ordinary send, credential on the localhost route, gate without the pinned-send check, no fingerprint check, dropped unknown-sender fallback) each fail at least one test, run in a scratch worktree.
 - Deliberate breakages, each failing at least one test: X25519 binding check removed; own-rotation check removed; gate ignores binding; denied resets to pending; fingerprint check removed; unsorted key pair. The remaining breakages run in a scratch worktree and are recorded on the PR.
 
 ---

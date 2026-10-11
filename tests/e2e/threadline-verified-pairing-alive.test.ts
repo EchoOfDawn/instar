@@ -73,7 +73,7 @@ function makePeer(): Peer {
 // Encrypted-path probe stub (the §3.5 "this peer has an encrypted+signed channel" oracle).
 // `isChannelBoundToPairing` stands in for the real X25519-binding check (exercised for real in
 // threadline-pairing-v2-relay-agents.test.ts).
-const encryptedPath = (known: boolean) => ({ hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => known });
+const encryptedPath = (known: boolean) => ({ hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => known, ...(known ? { sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }) } : {}) });
 
 const AUTH = 'test-e2e-verified-pairing';
 const DASHBOARD_PIN = '654321';

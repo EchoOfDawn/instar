@@ -13,7 +13,7 @@ It works like verifying a contact on Signal. Both agents compute the **same 12-w
 - **Why 12 words.** A relay that swaps keys controls both of its fake keys, so it could search offline for a pair that makes both people see the same words. Against 6 words that search takes hours on ordinary hardware; against 12 it is out of practical reach.
 - **Typed, not eyeballed.** To confirm, the operator types the 12 words the *other* side shows, and the server compares all 12 in order. Any difference is treated as a failed match.
 - **Operator-confirmed, never self-granted.** Confirming or denying requires the operator's **dashboard PIN**; the agent's own API token cannot do it. A denied match stays denied until an operator clears it with the PIN.
-- **A credential gate that fails closed.** A credential goes only to a verified peer, only over the encrypted path, and only when the encryption key is the one derived from the peer's verified identity key. Any doubt refuses.
+- **A credential gate that fails closed.** A credential goes only to a verified peer, and it is encrypted to the peer's verified identity key and the encryption key derived from it, never to a key the relay handed over and never in plaintext. Any doubt refuses.
 - **It follows you across machines.** A pairing verified on one of your machines is honored on the others, pinned to the peer's exact identity key. The words themselves never leave the machine that showed them.
 
 ## How it works under the hood
@@ -29,7 +29,7 @@ It works like verifying a contact on Signal. Both agents compute the **same 12-w
 ## Using it
 
 - **Is my channel to a peer verified?** `GET /threadline/pairing` lists every pairing and its state.
-- **To pair:** both agents start the pairing (`threadline_pair` with `action: "start"`). Each operator reads their own 12 words (`GET /threadline/pairing/:peerFp` with the dashboard PIN), then types the other side's 12 words to confirm (`POST /threadline/pairing/:peerFp/verify` with `words` and the PIN). A dashboard pairing panel for doing this from a phone is planned; until it ships, these are the routes.
+- **To pair:** both agents start the pairing (`threadline_pair` with `action: "start"`). Each operator reads their own 12 words (`GET /threadline/pairing/:peerFp` with the dashboard PIN), then types the other side's 12 words to confirm (`POST /threadline/pairing/:peerFp/verify` with `words` and the PIN). The dashboard's Threadline tab has a Verified Pairing panel that does the same from a phone: enter your PIN to see your words, type the other side's 12 words, confirm.
 - **Never send a peer a secret until the pairing shows `mutual-verified`.** The gate enforces this, but knowing it lets you pair first instead of hitting a refusal.
 - A failed match (a probable man-in-the-middle) raises a single high-priority attention item and forces the peer back to untrusted.
 
