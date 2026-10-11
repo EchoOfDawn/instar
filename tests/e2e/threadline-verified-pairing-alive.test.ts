@@ -205,7 +205,7 @@ describe('Secure A2A Verified Pairing E2E lifecycle (feature is alive)', () => {
     const res = await request(app)
       .post(`/threadline/pairing/${peer.fp}/verify`)
       .set('Authorization', `Bearer ${AUTH}`)
-      .send({ match: true, pin: DASHBOARD_PIN });
+      .send({ words: sasWords, pin: DASHBOARD_PIN });
     expect(res.status).toBe(200);
     expect(res.body.state).toBe('mutual-verified');
     // The REAL trust manager state mutated through the SOLE writer.

@@ -224,7 +224,11 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
   });
 
   it('after the operator confirms, a credential is allowed only over an encryption key bound to the pinned identity key', async () => {
-    const v = await authed(request(A.app).post(`/threadline/pairing/${scout.fp}/verify`)).send({ match: true, pin: PIN });
+    // Confirming needs the OTHER side's 12 words typed in (spec FD2a). A bare match:true is
+    // refused, and one wrong word is a denial — checked on a scratch pairing below.
+    expect((await authed(request(A.app).post(`/threadline/pairing/${scout.fp}/verify`)).send({ match: true, pin: PIN })).status).toBe(400);
+    const scoutWords = (await authed(request(B.app).get(`/threadline/pairing/${dawn.fp}`)).send({ pin: PIN })).body.pairing.sasWords as string[];
+    const v = await authed(request(A.app).post(`/threadline/pairing/${scout.fp}/verify`)).send({ words: scoutWords.map((w) => w.toUpperCase()), pin: PIN });
     expect(v.status).toBe(200);
     const after = await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).send({});
     expect(after.body.pairing.state).toBe('mutual-verified');
@@ -244,6 +248,26 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
     const rotatedSelf = { ...makeAgent('dawn') };
     const rotated = relayClientFor(rotatedSelf, [{ agent: scout }]);
     expect(evaluateOutboundCredentialShare(A.trustManager, rotated, scout.fp).allow).toBe(false);
+  });
+
+  it('one wrong typed word is a mismatch and denies the pairing', async () => {
+    const other = makeAgent('other');
+    const F = await startServer('dawn-typed', relayClientFor(dawn, [{ agent: other }]));
+    try {
+      await authed(request(F.app).post(`/threadline/pairing/${other.fp}/start`)).send({});
+      const own = (await authed(request(F.app).get(`/threadline/pairing/${other.fp}`)).send({ pin: PIN })).body.pairing.sasWords as string[];
+      const typed = [...own];
+      typed[7] = typed[7] === 'abandon' ? 'ability' : 'abandon';
+      const r = await authed(request(F.app).post(`/threadline/pairing/${other.fp}/verify`)).send({ words: typed, pin: PIN });
+      expect(r.body.state).toBe('verification-failed');
+      const swapped = [...own];
+      [swapped[0], swapped[1]] = [swapped[1], swapped[0]];
+      // already failed; a reordered set would also have been a mismatch (checked by the unit-level compare)
+      expect(swapped).not.toEqual(own);
+    } finally {
+      await F.server.stop();
+      SafeFsExecutor.safeRmSync(F.tmpDir, { recursive: true, force: true, operation: 'tests/e2e/threadline-pairing-v2-relay-agents.test.ts:cleanup-typed' });
+    }
   });
 
   it('a denied match stays failed; only an operator with the PIN can clear it', async () => {

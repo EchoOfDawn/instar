@@ -107,7 +107,7 @@ describe('Secure A2A Verified Pairing routes (integration)', () => {
     it('503s the verify route when the flag is off', async () => {
       const res = await request(app)
         .post(`/threadline/pairing/${PEER_FP}/verify`)
-        .send({ match: true, pin: DASHBOARD_PIN });
+        .send({ words: SAS_WORDS, pin: DASHBOARD_PIN });
       expect(res.status).toBe(503);
     });
   });
@@ -179,10 +179,10 @@ describe('Secure A2A Verified Pairing routes (integration)', () => {
       expect(tm.getProfileByFingerprint(PEER_FP)?.pairingState).toBe('pending-verification');
     });
 
-    it('verify with a valid PIN + match:true flips to mutual-verified', async () => {
+    it('verify with a valid PIN + the other side\'s 12 typed words flips to mutual-verified', async () => {
       const res = await request(app)
         .post(`/threadline/pairing/${PEER_FP}/verify`)
-        .send({ match: true, pin: DASHBOARD_PIN });
+        .send({ words: SAS_WORDS, pin: DASHBOARD_PIN });
       expect(res.status).toBe(200);
       expect(res.body.state).toBe('mutual-verified');
       const profile = tm.getProfileByFingerprint(PEER_FP);
@@ -225,7 +225,7 @@ describe('Secure A2A Verified Pairing routes (integration)', () => {
       const app = appWith({ enabled: true, trustManager: tm, dashboardPin: DASHBOARD_PIN });
       await request(app)
         .post(`/threadline/pairing/${PEER_FP}/verify`)
-        .send({ match: true, pin: DASHBOARD_PIN });
+        .send({ words: SAS_WORDS, pin: DASHBOARD_PIN });
       expect(tm.listProfiles().filter((p) => p.pairingState === 'mutual-verified').length).toBe(1);
     });
 

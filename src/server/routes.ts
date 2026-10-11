@@ -18632,14 +18632,30 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     }
     const peerFp = String(req.params.peerFp || '').toLowerCase(); // FD13
     const body = req.body ?? {};
-    if (typeof body.match !== 'boolean') {
-      res.status(400).json({ error: 'match (boolean) is required' });
-      return;
-    }
-
     const profile = trustManager.getProfileByFingerprint(peerFp);
     if (!profile || profile.pairingState === undefined) {
       res.status(404).json({ error: `no pairing for fingerprint "${peerFp}"` });
+      return;
+    }
+    // Typed comparison (spec FD2a): to CONFIRM, the operator types the 12 words the OTHER
+    // side shows and the server compares all 12, in order, with its own. Eyeballing is not
+    // enough against a partial-match attack (8 of 12 chosen words ~ 2^44). `match:false`
+    // remains an explicit deny; `match:true` without words is refused.
+    if (Array.isArray(body.words)) {
+      const pending = trustManager.getPendingPairing(peerFp);
+      if (!pending || profile.pairingState !== 'pending-verification') {
+        res.status(409).json({ error: 'this pairing is not waiting for a comparison' });
+        return;
+      }
+      const typed = (body.words as unknown[]).map((w) => String(w ?? '').trim().toLowerCase());
+      const own = pending.sasWords.map((w) => w.toLowerCase());
+      body.match = typed.length === own.length && typed.every((w, i) => w === own[i]);
+    } else if (body.match === true) {
+      res.status(400).json({ error: 'to confirm, send words: the 12 words the other side shows, in order' });
+      return;
+    }
+    if (typeof body.match !== 'boolean') {
+      res.status(400).json({ error: 'send words (12, in order) to confirm, or match:false to deny' });
       return;
     }
 

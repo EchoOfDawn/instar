@@ -90,7 +90,9 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 - **Binding-check errors.** An exception while checking the binding reports `encryption-key-not-bound`.
 - **Fingerprints.** Routes lowercase `:peerFp` (FD13).
 
-Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; typed 12-word comparison; the stdio `status` read; the dashboard panel; and the migrator replacing the v1 section.
+- **Typed comparison (FD2a).** Verify takes the OTHER side's 12 words; the server compares all 12 in order. A bare `match:true` is refused, and any difference is a denial. This is an over-block for an operator who only eyeballs: intended, because a careless eyeball check is what a partial-match attack targets.
+
+Still open, pending Echo's spec review: the credential path encrypting to the derived X25519 key; a production-path E2E with no hand-built relay client; sending the receipt after a confirm; the stdio `status` read; the dashboard panel; and the migrator replacing the v1 section.
 
 ## Conclusion
 

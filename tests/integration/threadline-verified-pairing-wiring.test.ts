@@ -133,7 +133,7 @@ describe('Verified Pairing — wiring integrity (deps are real, not null/no-op)'
     const stateDir = mkStateDir();
     const tm = new AgentTrustManager({ stateDir });
     const self = makePeer(); const peer = makePeer();
-    seedPairing(tm, self, peer, false);
+    const { sasWords } = seedPairing(tm, self, peer, false);
     const app = appWith({ enabled: true, trustManager: tm, stateDir, dashboardPin: DASHBOARD_PIN });
 
     // No PIN (bearer-only) → refused AND no mutation (anti-confabulation, FD7).
@@ -143,7 +143,7 @@ describe('Verified Pairing — wiring integrity (deps are real, not null/no-op)'
     expect(tm.getProfileByFingerprint(peer.fp)?.source).not.toBe('mutual-verified');
 
     // Valid PIN → real mutation through the SOLE writer.
-    const withPin = await request(app).post(`/threadline/pairing/${peer.fp}/verify`).send({ match: true, pin: DASHBOARD_PIN });
+    const withPin = await request(app).post(`/threadline/pairing/${peer.fp}/verify`).send({ words: sasWords, pin: DASHBOARD_PIN });
     expect(withPin.status).toBe(200);
     const profile = tm.getProfileByFingerprint(peer.fp);
     expect(profile?.pairingState).toBe('mutual-verified');
