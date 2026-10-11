@@ -4947,6 +4947,18 @@ export interface InstarConfig {
   inputGuard?: InputGuardConfig;
   /** Threadline relay — cloud relay connection for inter-agent communication */
   threadline?: ThreadlineConfig;
+  /**
+   * Agent identity (a2a-single-agent-identity). `adoption.enabled` is the FLEET-LIVE kill
+   * switch for post-pairing adoption (§1.2): off, a joined identity-less machine stays
+   * `identity-not-provisioned` and loud, and still yields the lease to a live sibling that holds
+   * the identity (observing continues under the switch) — strictly better than minting.
+   * The CLI (`instar identity adopt --from`) works regardless. Default true.
+   */
+  agentIdentity?: {
+    adoption?: {
+      enabled?: boolean;
+    };
+  };
   /** Dashboard configuration */
   dashboard?: DashboardConfig;
   /**
@@ -5459,6 +5471,29 @@ export interface ThreadlineConfig {
    * unchanged; only an explicit `false` refuses (pre-admission 403).
    */
   localRouteTrust?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * A2A local-route signed envelope (docs/specs/a2a-local-route-signed-envelope.md):
+   * the same-machine route verifies the sender's Ed25519 signature against the
+   * key held for its name. `enabled` OMITTED ⇒ the developmentAgent gate decides
+   * (live on a dev agent, off on the fleet). `dryRun` defaults TRUE (verify,
+   * count, log; deliver as today); only an explicit `false` refuses.
+   */
+  localRouteSignature?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Honest sender-side reporting of a send that stays queued
+   * (docs/specs/a2a-single-agent-identity.md §3). `enabled` omitted ⇒ the
+   * developmentAgent gate (live on a dev agent, dark on the fleet). `dryRun`
+   * defaults TRUE: would-raise / would-sentence rows go to
+   * logs/a2a-peer-dark.jsonl, no item and no sentence; the raw health fields
+   * (`dark`, `darkSince`, `queuedCount`, `connectedNow`) are live regardless.
+   * `queuedDarkAfterMs` default 2 h (floor 5 min); `cooldownMs` default 12 h.
+   * `perPeer` sets the threshold for ONE peer by its full fingerprint, e.g.
+   * `{ "<fp>": { queuedDarkAfterMs: 1800000 } }` for a pair that answers in minutes.
+   */
+  peerDarkNotice?: {
+    enabled?: boolean; dryRun?: boolean; queuedDarkAfterMs?: number; cooldownMs?: number;
+    perPeer?: Record<string, { queuedDarkAfterMs?: number }>;
+  };
   /**
    * Relay unknown-sender trust (docs/specs/a2a-relay-unknown-sender-trust.md).
    * Read live per unknown-sender relay message. `enabled` omitted ⇒ the

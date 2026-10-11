@@ -1702,6 +1702,242 @@ const passkeyRevokeOutbox: SelfActionController = {
   },
 };
 
+
+// ── a2a-single-agent-identity (§1.2 adoption loop, §2.2 coherence detector) ──
+
+/**
+ * agent-identity-adoption — the §1.2 adoption loop, a DECLARED Eternal Sentinel
+ * (P19): a paired machine with no agent identity observes its siblings every
+ * round (constant cost: one signed read per active sibling) and sends at most
+ * ONE `agent-identity-request` per 10 min, one in flight, rotating on a typed
+ * refusal; it escalates ONCE (4 consecutive fleet refusals or 120 s → one `high`
+ * item, re-raised only when the refusal REASON changes) and keeps healing at the
+ * 5-min observe floor after 1 h. Under the pinned fixture (every sibling refuses
+ * forever — `targetAlwaysRejects`), the emits are the paced requests + the single
+ * escalation: never faster than the 10-min floor, never a second item.
+ */
+function makeAgentIdentityAdoptionLoop(f: PressureFixture, sink: ActionSink): { tick(): void } {
+  const REQUEST_INTERVAL_MS = 10 * 60_000;
+  const ESCALATE_AFTER_MS = 120_000;
+  const ESCALATE_AFTER_REFUSALS = 4;
+  // The responder's per-requester share interval is SERVER-side state (durable across
+  // the requester's restarts): a restarted requester's first request is refused
+  // `rate-limited` with retryAfterMs and the requester paces off it.
+  const key = 'agent-identity-adoption:responder-last-share-at';
+  const startedAt = f.clock.nowMs();
+  let refusals = 0;
+  let escalated = false;
+  return {
+    tick() {
+      sink.considered += 1;
+      // Observe round (constant per-round cost; not an emit — a signed read).
+      const lastShare = (f.durableState.get(key) as number | undefined) ?? Number.NEGATIVE_INFINITY;
+      if (f.clock.nowMs() - lastShare < REQUEST_INTERVAL_MS) {
+        // Paced (locally, or by the responder's retryAfterMs after a restart).
+      } else {
+        sink.emit({ verb: 'retry', target: 'sibling-request' });
+        sink.emitTimesMs.push(f.clock.nowMs());
+        f.durableState.set(key, f.clock.nowMs());
+        if (f.targetAlwaysRejects()) refusals += 1;
+      }
+      const byRefusals = refusals >= ESCALATE_AFTER_REFUSALS;
+      const byTime = f.clock.nowMs() - startedAt >= ESCALATE_AFTER_MS;
+      if (!escalated && (byRefusals || byTime)) {
+        // ONE item per machine; re-raised only when the refusal reason changes (never here).
+        escalated = true;
+        // Counted in the audit, not as a paced emit: a single constant-cost line.
+      }
+    },
+  };
+}
+
+const agentIdentityAdoption: SelfActionController = {
+  id: 'agent-identity-adoption',
+  actionVerb: 'adoption-retry',
+  models: 'src/core/AgentIdentityAdoption.ts (AgentIdentityAdoptionLoop — ≤1 request per 10 min, one in flight, ONE escalation per reason, 5-min observe floor)',
+  modelsPath: 'src/core/AgentIdentityAdoption.ts',
+  restartPosture: {
+    pressureSurvives: true,
+    restartUnderPressure: (f, sink) => makeAgentIdentityAdoptionLoop(f, sink),
+  },
+  delegatedGiveUp: 'the responder-side share rate-limit (one share per requester per 10 min, carried as retryAfterMs) + the ONE-item escalation after 4 fleet refusals / 120 s — the heal continues at the 5-min floor, never a second item for the same reason',
+  boundK: Number.POSITIVE_INFINITY, // exempt — bounded by the 10-min request floor, not a total count
+  perTargetBoundK: Number.POSITIVE_INFINITY,
+  ticks: 48,
+  tickMs: 5 * 60_000, // 5 min/tick (the observe floor) — 4 h of sustained refusal
+  eternalSentinel: { reason: 'declared Eternal Sentinel (spec §Watchers, P19): healer-only, constant per-round cost, escalates once', rateFloorMs: 10 * 60_000 },
+  makeUnderPressure(f, sink) {
+    return makeAgentIdentityAdoptionLoop(f, sink);
+  },
+};
+
+/**
+ * agent-identity-coherence-detector — the §2.2 continuous identity check. Under a
+ * split that NEVER repairs (the pinned fixture), it raises exactly ONE `high`
+ * item per sorted-fingerprint-set episode (after 2 consecutive `disagree`
+ * reads, lease holder only) and at most ONE `medium` cannot-tell item per
+ * online-but-unanswering peer; the attention store dedupes by id, so a restart
+ * re-raising the same episode id never posts a second message.
+ */
+function makeAgentIdentityCoherenceDetector(f: PressureFixture, sink: ActionSink): { tick(): void } {
+  const RAISE_AFTER = 2;
+  const key = 'agent-identity-coherence:raised-ids'; // the per-machine attention store (dedupe by id)
+  const raised = (f.durableState.get(key) as Set<string> | undefined) ?? new Set<string>();
+  f.durableState.set(key, raised);
+  let consecutiveDisagree = 0;
+  let cannotTellRounds = 0;
+  return {
+    tick() {
+      sink.considered += 1;
+      // The pressure: every round reads `disagree` on the SAME sorted set, and one online
+      // peer never answers /provenance.
+      consecutiveDisagree += 1;
+      const episodeId = 'agent-identity-split:echo:A+B';
+      if (consecutiveDisagree >= RAISE_AFTER && !raised.has(episodeId)) {
+        raised.add(episodeId);
+        sink.emit({ verb: 'escalate', target: episodeId });
+      }
+      cannotTellRounds += 1;
+      const ctId = 'agent-identity-cannot-tell:echo:m_slow';
+      if (cannotTellRounds >= 10 && !raised.has(ctId)) {
+        raised.add(ctId);
+        sink.emit({ verb: 'escalate', target: ctId });
+      }
+    },
+  };
+}
+
+const agentIdentityCoherenceDetector: SelfActionController = {
+  id: 'agent-identity-coherence-detector',
+  actionVerb: 'split-escalate',
+  models: 'src/core/AgentIdentityCoherence.ts (IdentityCoherenceDetector — one item per sorted-set episode after 2 consecutive disagree reads, holder-only; one cannot-tell item per peer after 10 online rounds)',
+  modelsPath: 'src/core/AgentIdentityCoherence.ts',
+  restartPosture: {
+    pressureSurvives: true,
+    restartUnderPressure: (f, sink) => makeAgentIdentityCoherenceDetector(f, sink),
+  },
+  boundK: 2, // one split item + one cannot-tell item while the episode persists
+  perTargetBoundK: 1,
+  ticks: 60,
+  tickMs: 5 * 60_000, // 5 min/tick — 5 h of a split that never repairs
+  makeUnderPressure(f, sink) {
+    return makeAgentIdentityCoherenceDetector(f, sink);
+  },
+};
+
+/**
+ * telegram-origin-forward-ladder — a2a-single-agent-identity §4.2 (ACT-058).
+ * A reply from a machine that does not hold the serving lease is forwarded to
+ * the lease holder: ONE attempt inside the reply request, then a durable hold
+ * whose quick ladder retries from the 5 s boot tick at +10 s and +20 s (the
+ * ladder state lives in the held row's `holdDetail.ladder`, restart-surviving),
+ * then the EXISTING 15-minute `reserveRecoveryAttempt` schedule until the
+ * operation's 6 h deadline expires it (`expireOperation`, reported once). Under
+ * a holder that always refuses, one held reply therefore costs at most
+ * 1 + 2 + 24 = 27 forward attempts, horizon-independent: past the deadline the
+ * row is `expired` and nothing fires again. Real source:
+ * src/messaging/telegram-origin/OriginForwardToHolder.ts (nextLadderState,
+ * recoverForwardedHold) + TelegramOriginRuntime.runForwardLadder/recoverHeld.
+ */
+const telegramOriginForwardLadder: SelfActionController = {
+  id: 'telegram-origin-forward-ladder', actionVerb: 'retry-forward-to-holder',
+  models: 'OriginForwardToHolder.nextLadderState (two quick steps, +10 s/+20 s, persisted in holdDetail.ladder) then OriginStoreBackend.reserveRecoveryAttempt (15-min interval) until expireOperation at the 6 h deadline.',
+  modelsPath: 'src/messaging/telegram-origin/OriginForwardToHolder.ts',
+  boundK: 27, perTargetBoundK: 27, ticks: 6_000, tickMs: 5_000, // 8h20m horizon > the 6 h deadline
+  restartPosture: { pressureSurvives: true, restartUnderPressure: makeTelegramOriginForwardLadderPressure },
+  makeUnderPressure: makeTelegramOriginForwardLadderPressure,
+};
+function makeTelegramOriginForwardLadderPressure(f: PressureFixture, sink: ActionSink): { tick(): void } {
+  const LADDER_DELAYS_MS = [10_000, 20_000], SCHEDULE_MS = 15 * 60_000, DEADLINE_MS = 6 * 60 * 60_000;
+  return { tick() {
+    sink.considered++;
+    if (!f.targetAlwaysRejects()) return;
+    const now = f.clock.nowMs();
+    // The held row (durable): prepared at the first pressured tick; `ladder` + `nextAttemptAt` persist across reconstruction.
+    let row = f.durableState.get('origin-forward:row') as { preparedAt: number; ladderAttempts: number; nextAt: number | null; state: 'held' | 'expired' } | undefined;
+    if (!row) {
+      sink.emit({ verb: 'retry-forward-to-holder', target: 'op-1' }); // the one in-request attempt
+      row = { preparedAt: now, ladderAttempts: 0, nextAt: now + LADDER_DELAYS_MS[0], state: 'held' };
+      f.durableState.set('origin-forward:row', row); return;
+    }
+    if (row.state === 'expired') return;
+    if (now - row.preparedAt >= DEADLINE_MS) { row.state = 'expired'; f.durableState.set('origin-forward:row', row); return; } // expireOperation
+    if (row.nextAt === null || now < row.nextAt) return;
+    sink.emit({ verb: 'retry-forward-to-holder', target: 'op-1' });
+    if (row.ladderAttempts < LADDER_DELAYS_MS.length) {
+      row.ladderAttempts += 1; // nextLadderState
+      row.nextAt = row.ladderAttempts < LADDER_DELAYS_MS.length ? now + LADDER_DELAYS_MS[row.ladderAttempts] : now + SCHEDULE_MS; // exhausted → the 15-min schedule
+    } else row.nextAt = now + SCHEDULE_MS; // reserveRecoveryAttempt
+    f.durableState.set('origin-forward:row', row);
+  } };
+}
+
+/**
+ * a2a-peer-dark-raise — the reworked A2ARedeliverySentinel's §3 dark pass
+ * (docs/specs/a2a-single-agent-identity.md §3.2–3.3). The pressure: two peers
+ * whose queued messages never get acknowledged (the relay queues forever, no
+ * inbound, no delivered verdict), while my own relay stays connected on the
+ * awake machine. Each 15-min tick re-reads the ledger, heals (reconnect is a
+ * no-op while connected; one presence refresh; self-check `ok`) and would raise
+ * the per-peer item. Convergence shape: ONE item per (peer, episode) — the open
+ * episode is the latch (deterministic id `a2a-peer-dark:<agent>:<peerFp>`), the
+ * per-peer 12 h cooldown brakes a re-raise after a resolve, and a restart
+ * REBUILDS the episode from the durable OPEN item (attentionState) instead of
+ * raising again. Sustained pressure converges to exactly one emit per peer; a
+ * longer horizon adds nothing while the episode persists.
+ */
+const a2aPeerDarkRaise: SelfActionController = {
+  id: 'a2a-peer-dark-raise',
+  actionVerb: 'escalate-dark-peer',
+  models: 'src/monitoring/A2ARedeliverySentinel.ts (darkPass — episode latch + inCooldown + episodeFor restart rebuild)',
+  modelsPath: 'src/monitoring/A2ARedeliverySentinel.ts',
+  boundK: 2, // 2 dark peers → at most one item each while the episode persists
+  perTargetBoundK: 1,
+  ticks: 96,
+  tickMs: 15 * 60_000, // 15-min sweep — 24 h of a peer that never answers
+  restartPosture: {
+    pressureSurvives: true,
+    restartUnderPressure: (f, sink) => makeA2aPeerDarkRaise(f, sink),
+  },
+  makeUnderPressure(f, sink) {
+    return makeA2aPeerDarkRaise(f, sink);
+  },
+};
+
+function makeA2aPeerDarkRaise(f: PressureFixture, sink: ActionSink): { tick(): void } {
+  const PEERS = ['peer-A', 'peer-B'];
+  const COOLDOWN_MS = 12 * 60 * 60_000;
+  // Durable per-peer item state (the attention store the real sentinel reads
+  // through `attentionState`): 'OPEN' while the episode persists, plus the last
+  // raise time for the cooldown. A fresh instance holds NO in-memory episodes.
+  const itemKey = (p: string) => `a2a-peer-dark:item:${p}`;
+  const raisedAtKey = (p: string) => `a2a-peer-dark:raisedAt:${p}`;
+  const episodes = new Set<string>();
+  return {
+    tick() {
+      sink.considered += 1;
+      // The relay stays connected: no aggregate, no reconnect; the heal's
+      // presence refresh and self-check are side-effect-free here.
+      for (const peer of PEERS) {
+        // The pressure: the peer is dark with queued rows every tick
+        // (targetAlwaysRejects — nothing ever acknowledges).
+        if (!f.targetAlwaysRejects()) continue;
+        if (episodes.has(peer)) continue; // open in-process episode — the latch
+        // Restart rebuild (episodeFor): a durable OPEN item re-arms the latch
+        // without a second raise.
+        if (f.durableState.get(itemKey(peer)) === 'OPEN') { episodes.add(peer); continue; }
+        // Cooldown (inCooldown): a resolved item's last update inside 12 h brakes a re-raise.
+        const lastRaisedAt = (f.durableState.get(raisedAtKey(peer)) as number | undefined) ?? Number.NEGATIVE_INFINITY;
+        if (f.clock.nowMs() - lastRaisedAt < COOLDOWN_MS) continue;
+        sink.emit({ verb: 'escalate-dark-peer', target: peer });
+        episodes.add(peer);
+        f.durableState.set(itemKey(peer), 'OPEN');
+        f.durableState.set(raisedAtKey(peer), f.clock.nowMs());
+      }
+    },
+  };
+}
+
 export const SELF_ACTION_CONTROLLERS: SelfActionController[] = [
   feedbackTriageTick,
   feedbackTriageActionList,
@@ -1711,6 +1947,7 @@ export const SELF_ACTION_CONTROLLERS: SelfActionController[] = [
   originStoreWorkerRestart,
   telegramOriginOwnedDetectorCanary,
   telegramOriginNativeModelCanary,
+  telegramOriginForwardLadder,
   telegramBrowserCanaryRecovery,
   identityReannounce,
   windowRunCadenceDeliveryRedrive,
@@ -1742,4 +1979,7 @@ export const SELF_ACTION_CONTROLLERS: SelfActionController[] = [
   feedbackExecute,
   mutualSshRepairSweep,
   followMeEnrollmentConsumer,
+  agentIdentityAdoption,
+  agentIdentityCoherenceDetector,
+  a2aPeerDarkRaise,
 ];

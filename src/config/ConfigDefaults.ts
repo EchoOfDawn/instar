@@ -855,6 +855,14 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
       dryRun: false,
     },
   },
+  // a2a-single-agent-identity §1.2 — post-pairing adoption of the agent identity from a
+  // sibling. FLEET-LIVE (not dev-gated): a joined machine with no identity must never mint,
+  // and adoption is the path that fills the void. `enabled:false` is the kill switch (the
+  // machine then stays unprovisioned and loud, still yielding the lease to a live provisioned sibling). Backfilled on update by
+  // applyDefaults add-missing + an explicit existence check in migrateConfig.
+  agentIdentity: {
+    adoption: { enabled: true },
+  },
   threadline: {
     relayEnabled: false,
     visibility: 'public',
@@ -980,6 +988,21 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
     // applyDefaults deep-merges this under `threadline` on update (Migration Parity).
     inboundIdLedger: {
       retentionDays: 14,
+    },
+    // Honest sender-side reporting of a send that stays queued
+    // (docs/specs/a2a-single-agent-identity.md §3.4). `enabled` is OMITTED on
+    // purpose — the developmentAgent gate decides (registered in
+    // DEV_GATED_FEATURES as threadline.peerDarkNotice.enabled): LIVE on a dev
+    // agent, DARK on the fleet. Ships dry-run FIRST: would-raise and
+    // would-sentence rows land in logs/a2a-peer-dark.jsonl; no attention item
+    // and no deliveryOutcome sentence until a deliberate dryRun:false. The raw
+    // health fields are live from the first build (they are reads). applyDefaults
+    // deep-merges this under `threadline` on update (Migration Parity) — nested,
+    // so migrateConfig is not the carrier.
+    peerDarkNotice: {
+      dryRun: true,
+      queuedDarkAfterMs: 7200000,  // 2 h — below the 6 h `stale` window so the sender hears first
+      cooldownMs: 43200000,        // 12 h per peer
     },
   },
   // Topic-intent auto-capture loop (rung 0 of continuous-working-awareness).

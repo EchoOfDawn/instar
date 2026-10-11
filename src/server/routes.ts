@@ -9,7 +9,7 @@ import { withUnknownProducerOrigin } from '../messaging/telegram-origin/OriginDe
 
 import { Router } from 'express';
 import { mountTelegramOriginRoutes, sendOriginHoldResponse } from './telegramOriginRoutes.js';
-import { TelegramOriginHoldError } from '../messaging/telegram-origin/types.js';
+import { TelegramOriginHoldError, OriginForwardSettledLocallyError } from '../messaging/telegram-origin/types.js';
 import { deterministicAutomationAuthor } from '../messaging/telegram-origin/OriginAutomationAuthor.js';
 import { cadenceReportProducerPayload, type WindowRunCadenceExecutor, type WindowCadenceReportReceipt } from '../core/WindowRunCadenceExecutor.js';
 import { verify as verifyEd25519 } from '../threadline/ThreadlineCrypto.js';
@@ -197,6 +197,16 @@ import { PlaywrightSeatLease } from '../core/PlaywrightSeatLease.js';
 import { writeConfigAtomic, readSelfKnowledgeFlags } from '../core/BootSelfKnowledge.js';
 import { rateLimiter, signViewPath, OUTBOUND_GATE_REVIEW_BUDGET_MS, resolveFollowMeBudgets, FOLLOWME_SIMPLE_RELAY_FETCH_MS, bearerMatches } from './middleware.js';
 import { relayHoldHours } from '../threadline/relayVerdict.js';
+import {
+  buildPeerDarkSentence,
+  createPeerDarkAuditWriter,
+  resolvePeerDarkAuditPath,
+  resolvePeerDarkNoticeConfig,
+  queuedDarkAfterMsFor,
+  PRESENCE_RELAY_DOWN,
+  type PeerDarkReport,
+  type PeerPresenceRead,
+} from '../threadline/peerDark.js';
 import { buildTopicProfileOptions, validateDashboardProfileChoice, seedTopicProfileAtCreation, claimDashboardCreatedTopic, settleDashboardCreatedTopic, frameworkLabel } from '../core/dashboardTopicProfile.js';
 import { reviewWithinBudget } from './outboundGateBudget.js';
 import { resolveToneRecipientClass } from './toneRecipientClass.js';
@@ -536,6 +546,21 @@ import {
   resolveLocalRouteTrustMode,
   statedLocalTrustLevel,
 } from '../threadline/localRouteTrust.js';
+import {
+  REQUIRE_SIGNATURE_HEADER,
+  appendLocalRouteSignatureAudit,
+  countLocalEnvelopeVerdict,
+  createAgentLocalEnvelopeSigner,
+  localEnvelopeRefusalBody,
+  localEnvelopeRefusalLogLine,
+  localEnvelopeSignerAvailable,
+  localEnvelopeVerifier,
+  localRouteSignatureCounters,
+  localRouteSignatureCountersSince,
+  requiresUnmetSignature,
+  resolveLocalRouteSignatureMode,
+  verifyLocalRouteEnvelope,
+} from '../threadline/localEnvelopeSignature.js';
 import {
   relayUnknownSenderTrustCounters,
   resolveRelayUnknownSenderTrustMode,
@@ -1229,6 +1254,8 @@ export interface RouteContext {
   topicLinkageHandler: import('../threadline/TopicLinkageHandler.js').TopicLinkageHandler | null;
   handshakeManager: HandshakeManager | null;
   threadlineRelayClient: import('../threadline/client/ThreadlineClient.js').ThreadlineClient | null;
+  /** a2a-single-agent-identity §1–§2: the agent-identity runtime (detector, audit, posture, reload lever). */
+  agentIdentity?: import('../core/AgentIdentityRuntime.js').AgentIdentityRuntime | null;
   /** Relay connection-LOSS reader. Null when no relay client exists in this
    *  process (relay disabled, or the listener daemon owns it). */
   getLastRelayEvent?: (() => import('../threadline/relayConnectionObserver.js').RelayConnectionEvent | null) | null;
@@ -3187,6 +3214,16 @@ export function createRoutes(ctx: RouteContext): Router {
   const backupRouteCounters = createBackupRouteCounters();
   // Local-route trust counters (docs/specs/a2a-local-route-trust.md): in memory,
   // surfaced on the AUTHED /health — the evidence the wider rollout is decided on.
+  // A2A local-route signed envelope (docs/specs/a2a-local-route-signed-envelope.md).
+  // The mode is read live; the signer is THE production signer (Threadline identity).
+  const localRouteSignatureMode = () => resolveLocalRouteSignatureMode(
+    {
+      enabled: ctx.liveConfig?.get<boolean | undefined>('threadline.localRouteSignature.enabled', undefined),
+      dryRun: ctx.liveConfig?.get<boolean | undefined>('threadline.localRouteSignature.dryRun', undefined),
+    },
+    ctx.config as { developmentAgent?: boolean; threadline?: { localRouteSignature?: { enabled?: boolean; dryRun?: boolean } } },
+  );
+  const localEnvelopeSigner = createAgentLocalEnvelopeSigner(ctx.config.projectName, ctx.config.stateDir);
   const localRouteTrustCounters = createLocalRouteTrustCounters();
   const localRouteTrustMode = () => resolveLocalRouteTrustMode(
     {
@@ -4873,6 +4910,11 @@ export function createRoutes(ctx: RouteContext): Router {
       if (ctx.telegramOrigin) {
         try { base.telegramOriginStorage = ctx.telegramOrigin.storageHealth(); }
         catch { base.telegramOriginStorage = { state: 'unavailable' }; }
+        // a2a-single-agent-identity §4.2 — held FORWARDS (a reply this machine
+        // could not hand to the lease holder) are a /health degradation, read
+        // from the runtime's last refresh (never a live store query here).
+        try { base.telegramOrigin = { ...(base.telegramOrigin as object ?? {}), heldForward: ctx.telegramOrigin.heldForwardHealth() }; }
+        catch { base.telegramOrigin = { ...(base.telegramOrigin as object ?? {}), heldForward: { state: 'unavailable' } }; }
       }
       // Honest delivery (spec §1): verdict-dispatcher counters ride the AUTHED
       // branch only — every /threadline/* path bypasses Bearer auth by design.
@@ -4893,6 +4935,16 @@ export function createRoutes(ctx: RouteContext): Router {
       base.threadline = {
         ...(base.threadline as object ?? {}),
         localRouteTrust: { ...localRouteTrustMode(), trustManagerWired: !!ctx.unifiedTrust?.trustManager, ...localRouteTrustCounters },
+        // A2A local-route signed envelope: mode + in-memory counters. The
+        // rollout evidence is logs/relay-agent-signature.jsonl, not this block.
+        localRouteSignature: {
+          mode: localRouteSignatureMode(),
+          since: localRouteSignatureCountersSince,
+          ...localRouteSignatureCounters,
+          firstContactKeys: localEnvelopeVerifier.firstContact.size,
+          replayCacheSize: localEnvelopeVerifier.replay.size,
+          signerAvailable: localEnvelopeSignerAvailable(ctx.config.stateDir),
+        },
         // Relay unknown-sender trust (docs/specs/a2a-relay-unknown-sender-trust.md):
         // the live mode and the process-wide verdict counters. AUTHED only.
         relayUnknownSenderTrust: {
@@ -11358,6 +11410,18 @@ export function createRoutes(ctx: RouteContext): Router {
       return;
     }
 
+    // ── EVO-025: target refusals run PRE-202 ──
+    // A name the resolver cannot bind (e.g. the display name "Jev" instead of
+    // the tmux name "echo-jev"), a missing session, an in-flight refresh or an
+    // exhausted rate budget used to be answered 202 "Refresh scheduled" and
+    // then refused only in server.log. Answer them synchronously instead.
+    // refreshSession() still re-checks everything authoritatively post-202.
+    const refusal = ctx.sessionRefresh.precheckRefusal(sessionName);
+    if (refusal) {
+      res.status(refusal.code === 'rate_limited' ? 429 : 409).json({ code: refusal.code, error: refusal.message });
+      return;
+    }
+
     // ── swap-continuity-antithrash §4.5: the work gate runs PRE-202 ──
     // Busy → synchronous 409 `session-busy` with the live work summary
     // (counts and ages only — no titles, no transcript paths, no message
@@ -17505,7 +17569,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     // credential wall. (A willRelay hand-off is walled by the lease holder's
     // own receive path, which re-enters the full authority.)
     if ((isProxy || isSystemTemplate) && refuseIfCredential(text, res)) return;
-    if (!isProxy && !isSystemTemplate && !willRelay) {
+    const gateLocally = async (): Promise<boolean> => {
       if (await checkOutboundMessage(text, 'telegram', res, {
         topicId,
         allowDebugText,
@@ -17518,8 +17582,15 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         toneAdvisoryComplied,
         // jev-signal-live: this reply path carries the acknowledge-and-override fields.
         liveArtefactSignals: true,
-      })) return;
+      })) return false;
       ctx.telegramOrigin?.service.markCurrentSendPolicyReviewed();
+      return true;
+    };
+    // a2a-single-agent-identity §4.1: the gate skipped here for a relay is
+    // re-run below if the adapter finds the send must proceed LOCALLY after all.
+    const gateSkippedForRelay = !isProxy && !isSystemTemplate && willRelay;
+    if (!isProxy && !isSystemTemplate && !willRelay) {
+      if (!await gateLocally()) return;
     }
 
     // In-flight reservation (2026-07-03): the isDuplicate pre-check above and the
@@ -17542,7 +17613,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       // whether the reply actually landed — without it the relay could only
       // ever return a placeholder 0 and so reported "ok" even when nothing was
       // delivered (the false-success-under-load class).
-      const sendResult = await ctx.telegram.sendToTopic(topicId, text, {
+      const sendOptions = {
         skipStallClear: isProxy,
         provenance,
         // Relay-hop forwarding (§2.5): when this standby relays through the
@@ -17568,7 +17639,20 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
                 ...(toneAdvisoryComplied ? { toneAdvisoryComplied } : {}),
               }
             : undefined,
-      });
+      };
+      let sendResult: Awaited<ReturnType<typeof ctx.telegram.sendToTopic>>;
+      try {
+        sendResult = await ctx.telegram.sendToTopic(topicId, text, { ...sendOptions, gateSkippedForRelay });
+      } catch (err) {
+        if (!(err instanceof OriginForwardSettledLocallyError) || !gateSkippedForRelay) throw err;
+        // The lease settled on THIS machine after the local gate was skipped for
+        // the holder: gate now, then send locally. Never gated zero times.
+        if (!await gateLocally()) {
+          if (!originOwnsContent && !allowDuplicate) outboundContentDedup.releaseReservation(topicId, text);
+          return;
+        }
+        sendResult = await ctx.telegram.sendToTopic(topicId, text, { ...sendOptions, gateSkippedForRelay: false });
+      }
       // Record the content fingerprint AFTER a successful send so an identical
       // re-send within the window is suppressed — but a FAILED send (which
       // throws before here) is never recorded, so its legitimate retry isn't lost.
@@ -18115,6 +18199,22 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
   };
   const isPeerHealthBody = (b: Record<string, unknown>): boolean => Array.isArray(b.peers) && typeof b.count === 'number';
   const isPeerHealthOne = (b: Record<string, unknown>): boolean => typeof b.peerFp === 'string' && typeof b.stale === 'boolean';
+  // §3 (a2a-single-agent-identity): the dark threshold is config (read live when
+  // a live config exists); `connectedNow` comes from the presence map — never an
+  // inline discover. Both are reads, live from the first build regardless of the
+  // notice gate (only the item + the sentence ride the gate/dry-run).
+  const peerDarkNotice = () => resolvePeerDarkNoticeConfig(
+    ctx.config as { developmentAgent?: boolean; threadline?: { peerDarkNotice?: Record<string, unknown> } },
+    ctx.liveConfig?.get<boolean | undefined>('threadline.peerDarkNotice.enabled', undefined),
+  );
+  // No relay client (a standby, or relay off) reads as `relay-down`: my side, not the peer's.
+  const peerPresence = (fp: string): PeerPresenceRead => {
+    try { return ctx.threadlineRelayClient?.peerPresence(fp) ?? PRESENCE_RELAY_DOWN; } catch { return PRESENCE_RELAY_DOWN; } // @silent-fallback-ok: unknown is the honest read
+  };
+  const withConnectedNow = <T extends { peerFp: string }>(p: T): T & PeerPresenceRead => ({ ...p, ...peerPresence(p.peerFp) });
+  // The dark threshold for ONE peer: its `perPeer` entry, else the default.
+  const darkAfterFor = (fp: string): number => queuedDarkAfterMsFor(peerDarkNotice(), fp);
+  const peerDarkAudit = createPeerDarkAuditWriter(resolvePeerDarkAuditPath(ctx.config.stateDir), (l) => console.warn(l));
   const poolPeerRows = (peers: ReaperPoolPeer[], pick: (body: Record<string, unknown>) => unknown[]) => {
     const local = peerHealthInstarVersion();
     let mixedVersion = false;
@@ -18137,9 +18237,9 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const staleAfterMs = typeof req.query.staleAfterMs === 'string' && Number.isFinite(Number(req.query.staleAfterMs))
       ? Number(req.query.staleAfterMs)
       : undefined;
-    const peers = ctx.a2aDeliveryTracker?.allPeerHealth({ staleAfterMs }) ?? null;
+    const peers = ctx.a2aDeliveryTracker?.allPeerHealth({ staleAfterMs, queuedDarkAfterMsFor: darkAfterFor })?.map(withConnectedNow) ?? null;
     const localBody = peers
-      ? { peers, count: peers.length, staleCount: peers.filter((p) => p.stale).length, instarVersion: peerHealthInstarVersion() }
+      ? { peers, count: peers.length, staleCount: peers.filter((p) => p.stale).length, darkCount: peers.filter((p) => p.dark).length, instarVersion: peerHealthInstarVersion() }
       : null;
     if (req.query.scope !== 'pool') {
       if (!localBody) { res.status(503).json({ error: 'A2A delivery tracker not initialized' }); return; }
@@ -18159,6 +18259,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       peers: all,
       count: all.length,
       staleCount: all.filter((p) => (p as { stale?: boolean }).stale).length,
+      darkCount: all.filter((p) => (p as { dark?: boolean }).dark === true).length,
       mixedVersion,
       pool: { selfMachineId: selfId, peersQueried, peersOk: pool.length, failed },
     });
@@ -18219,7 +18320,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       ? Number(req.query.staleAfterMs)
       : undefined;
     const local = ctx.a2aDeliveryTracker
-      ? { ...ctx.a2aDeliveryTracker.peerHealth(fp, { staleAfterMs }), instarVersion: peerHealthInstarVersion() }
+      ? { ...withConnectedNow(ctx.a2aDeliveryTracker.peerHealth(fp, { staleAfterMs, queuedDarkAfterMs: darkAfterFor(fp) })), instarVersion: peerHealthInstarVersion() }
       : null;
     if (req.query.scope !== 'pool') {
       if (!local) { res.status(503).json({ error: 'A2A delivery tracker not initialized' }); return; }
@@ -35095,6 +35196,61 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         return;
       }
 
+      // Local-route signed envelope (docs/specs/a2a-local-route-signed-envelope.md,
+      // ACT-067): PRE-ADMISSION — after auth and the shape check, before the loop
+      // check, the trust check, the content window and the ledger commit. The
+      // mode is resolved once for this request.
+      const sigMode = localRouteSignatureMode();
+      // A sender that must never deliver an unproven message says so; a receiver
+      // that is not enforcing refuses it, in every mode, and records nothing.
+      if (requiresUnmetSignature(req.headers[REQUIRE_SIGNATURE_HEADER], sigMode)) {
+        const from = typeof envelope.message?.from?.agent === 'string' && envelope.message.from.agent ? envelope.message.from.agent : null;
+        countLocalEnvelopeVerdict(sigMode, { ok: false, reason: 'not-enforcing', senderName: from }, sigMode === 'off' ? undefined : ctx.config.stateDir);
+        res.status(401).json(localEnvelopeRefusalBody('not-enforcing'));
+        return;
+      }
+      // Enforcing and proven: the fingerprint derived from the verified key.
+      let provenSenderFp: string | null = null;
+      if (sigMode !== 'off') {
+        let sigVerdict: Awaited<ReturnType<typeof verifyLocalRouteEnvelope>> | null = null;
+        try {
+          sigVerdict = await verifyLocalRouteEnvelope(envelope, { stateDir: ctx.config.stateDir, selfName: ctx.config.projectName });
+        } catch (sigErr) {
+          localRouteSignatureCounters.errors++;
+          console.warn(`[relay-agent-signature] check failed: ${sigErr instanceof Error ? sigErr.message : String(sigErr)}`);
+          appendLocalRouteSignatureAudit(ctx.config.stateDir, {
+            source: 'route', mode: sigMode, outcome: sigMode === 'enforcing' ? 'refused' : 'would-refuse',
+            from: typeof envelope.message?.from?.agent === 'string' ? envelope.message.from.agent : null, reason: 'error',
+          });
+          if (sigMode === 'enforcing') {
+            res.status(503).json({ error: 'signature-check-unavailable', refused: true, retryable: true });
+            return;
+          }
+        }
+        if (sigVerdict) {
+          countLocalEnvelopeVerdict(sigMode, sigVerdict, ctx.config.stateDir);
+          if (!sigVerdict.ok) {
+            const line = localEnvelopeRefusalLogLine(sigMode === 'enforcing' ? 'refuse' : 'would-refuse', sigVerdict.senderName, sigVerdict.reason);
+            if (line) console.log(line);
+            if (sigMode === 'enforcing') {
+              res.status(401).json(localEnvelopeRefusalBody(sigVerdict.reason));
+              return;
+            }
+          } else if (sigMode === 'enforcing') {
+            provenSenderFp = sigVerdict.fingerprint;
+          }
+          // Every success answer of this request says whether the envelope was
+          // proven and under which mode (the sender holds our token).
+          const signatureInfo = { mode: sigMode, verified: sigVerdict.ok };
+          const plainJson = res.json.bind(res);
+          res.json = ((body: unknown) => plainJson(
+            res.statusCode < 400 && body && typeof body === 'object' && !Array.isArray(body)
+              ? { ...(body as Record<string, unknown>), signature: signatureInfo }
+              : body,
+          )) as typeof res.json;
+        }
+      }
+
       // One relay-chain-loop predicate (inbound-id ledger §1): a loop envelope is
       // refused through the existing refusal answer and writes no ledger row.
       {
@@ -35114,9 +35270,11 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       const relayFromAgent: string = typeof envelope.message?.from?.agent === 'string' ? envelope.message.from.agent : 'unknown';
       const trustMode = localRouteTrustMode();
       // One registry read serves both the trust check and the ledger key.
-      const senderRegistryFp = (relayLedger || trustMode.enabled)
+      // Signed envelope, enforcing: the PROVEN fingerprint replaces the
+      // name-resolved one for the trust check and the ledger's registry: key.
+      const senderRegistryFp = provenSenderFp ?? ((relayLedger || trustMode.enabled)
         ? (resolvePeerFingerprintByName(ctx.config.stateDir, relayFromAgent) ?? null)
-        : null;
+        : null);
       const relayRegistryFp = relayLedger ? senderRegistryFp : null;
       const relayAssertedFp = typeof envelope.message?.from?.fingerprint === 'string' && /^[0-9a-f]{6,64}$/i.test(envelope.message.from.fingerprint)
         ? envelope.message.from.fingerprint as string
@@ -36134,6 +36292,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         localAgent: ctx.config.projectName,
         version: '1.0',
         stateDir: ctx.config.stateDir,
+        // Signed envelope §8: advertise the live mode on /threadline/health.
+        localEnvelopeSignatureMode: localRouteSignatureMode,
         // Secure A2A Verified Pairing (§3.6): surface mutualVerifiedCount on
         // /threadline/health. The count is the number of profiles whose pairing
         // reached 'mutual-verified'. Gated on the verified-pairing flag so a dark
@@ -36160,11 +36320,27 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
           return {
             connectionState: rc.connectionState,
             lastEvent: ctx.getLastRelayEvent?.() ?? null,
+            standby: ctx.a2aRelayForward?.relaySuppressedByStandby === true,
           };
         },
         // Inbound-id ledger (late-bound; live flips handled by the controller).
         inboundIdLedger: () => ctx.inboundIdLedger?.current() ?? null,
         inboundIdLedgerDaemonDeferred: () => ctx.inboundIdLedgerDaemonDeferred?.() ?? false,
+        // a2a-single-agent-identity §1.1 / §2.2: the posture and the coherence verdict.
+        identityNotProvisioned: () => ctx.agentIdentity?.notProvisioned() ?? false,
+        identityCoherence: () => {
+          const h = ctx.agentIdentity?.coherence.health();
+          if (!h) return null;
+          return {
+            state: h.state,
+            connectedAs: h.connectedAs,
+            selfDisk: h.selfDisk,
+            siblingsPublish: h.siblingsPublish,
+            cannotTellRounds: h.cannotTellRounds,
+            lastCheckedAt: h.lastCheckedAt,
+            openEpisode: h.openEpisode,
+          };
+        },
       },
       // Robustness Phase 1 (D-E / F4): wire the ack funnel so the verified E2E
       // relay inbound path records the implicit ack (the one path that lacked it).
@@ -36376,6 +36552,70 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         error: `channel registry could not be resolved: ${error instanceof Error ? error.message : String(error)}`,
         generatedAt: new Date().toISOString(),
       });
+    }
+  });
+
+  // ── Agent identity (a2a-single-agent-identity §1.2 / §Multi-machine posture) ──
+  // GET /agent-identity/audit — the key-free audit rows (machine-local; `?scope=pool`
+  // merges online machines' rows tagged by machineId, dark-peer tolerant). Read-only.
+  router.get('/agent-identity/audit', async (req, res) => {
+    const rt = ctx.agentIdentity;
+    if (!rt) return res.status(503).json({ error: 'agent-identity runtime not constructed' });
+    const limit = Math.max(1, Math.min(2000, parseInt(String(req.query.limit ?? '200'), 10) || 200));
+    const since = typeof req.query.since === 'string' ? req.query.since : undefined;
+    const own = rt.audit.read({ limit, since }).map((r) => ({ ...r, machineId: r.machineId ?? rt.selfMachineId }));
+    if (req.query.scope !== 'pool') {
+      return res.json({ scope: 'local', machineId: rt.selfMachineId, count: own.length, rows: own, adoption: rt.adoptionStatus(), posture: rt.notProvisioned() ? 'identity-not-provisioned' : 'provisioned' });
+    }
+    const peers = rt.resolvePeerUrls();
+    const failed: Array<{ machineId: string; reason: string }> = [];
+    const rows = [...own];
+    await Promise.all(peers.map(async (p) => {
+      try {
+        const r = await fetch(`${p.url.replace(/\/+$/, '')}/agent-identity/audit?limit=${limit}${since ? `&since=${encodeURIComponent(since)}` : ''}`, {
+          headers: { Authorization: `Bearer ${ctx.config.authToken ?? ''}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!r.ok) { failed.push({ machineId: p.machineId, reason: `http-${r.status}` }); return; }
+        const j = (await r.json()) as { rows?: Array<Record<string, unknown>> };
+        for (const row of j.rows ?? []) rows.push({ ...row, machineId: p.machineId } as (typeof own)[number]);
+      } catch (err) {
+        // @silent-fallback-ok — the dark peer becomes a NAMED `pool.failed` row in the response; the read never 500s and never pretends the peer answered.
+        // A dark peer is a NAMED row, never a 500 (pool-scope reads are dark-peer tolerant).
+        failed.push({ machineId: p.machineId, reason: err instanceof Error && err.name === 'TimeoutError' ? 'timeout' : 'unreachable' });
+      }
+    }));
+    rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+    return res.json({ scope: 'pool', machineId: rt.selfMachineId, count: rows.length, rows: rows.slice(-limit), pool: { peersQueried: peers.length, peersOk: peers.length - failed.length, failed } });
+  });
+
+  // POST /agent-identity/reload — the reload lever (§1.2): re-read THIS machine's own
+  // identity from disk, rebuild its relay client under the new key, answer the resulting
+  // fingerprint. Local effect only; carries no key; installs nothing. Single-flight with a
+  // 60 s per-machine cooldown (429) — shared by the CLI (§1.4) and the mirror repair (§1.5).
+  let identityReloadInFlight: Promise<unknown> | null = null;
+  let identityReloadLastAt = 0;
+  router.post('/agent-identity/reload', async (_req, res) => {
+    const rt = ctx.agentIdentity;
+    if (!rt) return res.status(503).json({ error: 'agent-identity runtime not constructed' });
+    const now = Date.now();
+    if (identityReloadInFlight) return res.status(429).json({ error: 'reload already in flight', retryAfterMs: 1000 });
+    if (now - identityReloadLastAt < 60_000) {
+      const retryAfterMs = 60_000 - (now - identityReloadLastAt);
+      res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(429).json({ error: 'reload cooldown (one per 60 s per machine)', retryAfterMs });
+    }
+    identityReloadLastAt = now;
+    identityReloadInFlight = rt.reload();
+    try {
+      const r = (await identityReloadInFlight) as { fingerprint: string | null; connected: boolean; reason: string };
+      rt.audit.append('identity-reloaded', { machineId: rt.selfMachineId, fingerprint: r.fingerprint, connected: r.connected, reason: r.reason });
+      return res.json({ ok: true, ...r, posture: rt.notProvisioned() ? 'identity-not-provisioned' : 'provisioned' });
+    } catch (err) {
+      // @silent-fallback-ok — the lever's failure is returned to the caller as a 500 with the message; nothing is swallowed.
+      return res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      identityReloadInFlight = null;
     }
   });
 
@@ -37094,6 +37334,12 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
                 // §1: the POST is issued from here on; its own fetch is wrapped so
                 // only ITS error code can prove non-admission (an error from anywhere
                 // else in the shared catch below never counts).
+                // Signed envelope (§7): sign immediately before the POST. Senders
+                // are not gated — an older receiver ignores the field.
+                {
+                  const signature = localEnvelopeSigner(envelope);
+                  if (signature) (envelope as { signature?: string }).signature = signature;
+                }
                 const postBody = JSON.stringify(envelope);
                 localPostPeerFp = resolvePeerFingerprint(localTarget) ?? '';
                 localPostOutcome = { kind: 'issued' };
@@ -37570,17 +37816,56 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       }
       if (ctx.listenerManager && typeof inReplyTo === 'string') ctx.listenerManager.releaseReplyClaim(inReplyTo, replyClaimOwner);
 
-      const deliveryOutcome = relayStatus === 'delivered'
+      let deliveryOutcome = relayStatus === 'delivered'
         ? "handed to the peer's relay connection; not yet confirmed read"
         : relayStatus === 'queued'
           ? `peer offline; the relay holds it for up to ${relayHoldHours(verdict?.ttlSec)} h`
           : banSuspected
             ? 'submitted to relay; the relay reports this sender banned'
             : `submitted to relay; no relay acknowledgement within ${RELAY_ACK_WAIT_MS / 1000}s`;
+      // §3.2 (a2a-single-agent-identity): a send to a DARK peer carries
+      // `peerDark` (a read of my own ledger + the presence map, never an inline
+      // discover) and — when the notice is on and not dry-run — a deliveryOutcome
+      // worded to the evidence. A send the relay just `delivered` is not "still
+      // queued", so it carries no `peerDark` — but `delivered` alone does NOT
+      // clear the peer's dark state (only an ack or an inbound does), so the
+      // health read keeps saying `dark` until the peer actually answers.
+      let peerDark: PeerDarkReport | undefined;
+      if (ctx.a2aDeliveryTracker && relayStatus !== 'delivered') {
+        try {
+          const notice = peerDarkNotice();
+          const h = ctx.a2aDeliveryTracker.peerHealth(resolvedId, { queuedDarkAfterMs: queuedDarkAfterMsFor(notice, resolvedId) });
+          if (h.dark) {
+            // This send's own row joins the set once its `queued` verdict is
+            // recorded; count it now so "this and K other" is right either way.
+            // A rejected/unconfirmed verdict is not a queued row — no +1.
+            const thisRowCounted = ctx.a2aDeliveryTracker.get(relayMsgId)?.relayStatus === 'queued';
+            peerDark = {
+              since: h.darkSince,
+              queuedCount: h.queuedCount + (relayStatus === 'queued' && !thisRowCounted ? 1 : 0),
+              expiresAt: h.queuedExpiresAt,
+              ...(h.handedUnackedCount > 0 ? { handedUnackedCount: h.handedUnackedCount } : {}),
+              ...peerPresence(resolvedId),
+            };
+            const sentence = buildPeerDarkSentence(peerDark, { peerFp: resolvedId, peerName: targetAgent });
+            if (notice.enabled && !notice.dryRun) {
+              deliveryOutcome = sentence;
+              peerDarkAudit({ ts: new Date().toISOString(), kind: 'sentence', peerFp: resolvedId, queuedCount: peerDark.queuedCount, darkSince: peerDark.since, connectedNow: peerDark.connectedNow, connectedNowReason: peerDark.connectedNowReason, connectedAsOf: peerDark.connectedAsOf, dryRun: false });
+            } else if (notice.enabled) {
+              peerDarkAudit({ ts: new Date().toISOString(), kind: 'would-sentence', peerFp: resolvedId, queuedCount: peerDark.queuedCount, darkSince: peerDark.since, connectedNow: peerDark.connectedNow, connectedNowReason: peerDark.connectedNowReason, connectedAsOf: peerDark.connectedAsOf, dryRun: true });
+            }
+          }
+        } catch (err) {
+          // @silent-fallback-ok: a dark read must never break the send — the
+          // ledger is observability; the message was already submitted. Logged.
+          console.warn(`[relay-send] peer-dark read failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+        }
+      }
       const honest = {
         relayStatus,
         ...(relayReasonCode ? { relayReasonCode } : {}),
         ...(banSuspected ? { banSuspected: true } : {}),
+        ...(peerDark ? { peerDark } : {}),
       };
 
       if (waitForReply) {

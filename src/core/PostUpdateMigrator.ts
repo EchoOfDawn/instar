@@ -24,9 +24,10 @@ import { originToolGuardHook } from '../messaging/telegram-origin/OriginToolGuar
 import fs from 'node:fs';
 import { FEEDBACK_INBOX_TOKEN_SENTENCE, refreshFeedbackInboxTokenAwareness } from '../feedback-factory/inbox/inboxAwareness.js';
 import { JOB_DECLARED_FAILURE_AWARENESS } from '../scheduler/jobDeclaredFailure.js';
-import { telegramOriginAwareness, telegramOriginNoticeAwareness, telegramOriginCertificationAwareness, telegramOriginLeaseAwareness, telegramOriginDashboardAwareness, telegramOriginDetectorAwareness, telegramOriginRecoveryAwareness, telegramOriginTransportAwareness, telegramOriginCapacityAwareness, telegramOriginWorkerAwareness, telegramDashboardEditAwareness, refreshOriginCanaryStartupAwareness, refreshOriginCanaryCleanupAwareness, refreshOriginCapacityAwareness } from '../messaging/telegram-origin/OriginAwareness.js';
+import { telegramOriginAwareness, telegramOriginForwardAwareness, telegramOriginNoticeAwareness, telegramOriginCertificationAwareness, telegramOriginLeaseAwareness, telegramOriginDashboardAwareness, telegramOriginDetectorAwareness, telegramOriginRecoveryAwareness, telegramOriginTransportAwareness, telegramOriginCapacityAwareness, telegramOriginWorkerAwareness, telegramDashboardEditAwareness, refreshOriginCanaryStartupAwareness, refreshOriginCanaryCleanupAwareness, refreshOriginCapacityAwareness } from '../messaging/telegram-origin/OriginAwareness.js';
 import { migrateTelegramOriginDisplay } from '../messaging/telegram-origin/OriginConfig.js';
 import path from 'node:path';
+import { KEY_MATERIAL_GITIGNORE_PROJECT, KEY_MATERIAL_GITIGNORE_STATE } from './keyMaterialPaths.js';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -6691,6 +6692,13 @@ setTimeout(() => process.exit(0), 2000);
       result.upgraded.push('CLAUDE.md: added Telegram outage notice permission awareness');
     }
 
+    // a2a-single-agent-identity §4 — forward-to-holder + durable reported hold.
+    if (!content.includes('replies are forwarded to the holder')) {
+      content += '\n' + telegramOriginForwardAwareness(port);
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added forward-to-holder reply hold awareness');
+    }
+
     if (!content.includes('Message origins on your phone:')) {
       content += '\n' + telegramOriginDashboardAwareness();
       patched = true;
@@ -8262,6 +8270,24 @@ Every loop I open — a promise to a user, a feature shipped dark, a gate I depl
     // me" source is the routing fingerprint (relay registration / health
     // fingerprint), not the legacy publicKey hex — this is exactly the bug that
     // made a peer's sends vanish. Content-sniffed on a distinctive marker.
+    // a2a-single-agent-identity (§Agent awareness, rows §1 + §2): one identity across
+    // machines (adoption, the not-provisioned posture, the operator-yes replacement path)
+    // and the continuous coherence check. Content-sniffed on the heading for idempotency.
+    if (!content.includes('One identity across my machines (agent identity)')) {
+      const agentIdentitySection = `
+### One identity across my machines (agent identity)
+
+I am ONE agent on every machine I run on, and the agent network knows me by ONE routing fingerprint. A machine that joins or is rebuilt ADOPTS that identity from its siblings (signed, sealed to its own registry key, only when every reachable sibling agrees); it never invents one. A paired machine with no identity boots \`identity-not-provisioned\`: off the relay, yielding the serving lease only to a live provisioned sibling, with ONE \`agent-identity-missing\` item naming the refusal reason and the lever.
+- **"Are my machines the same me on the agent network?"** → \`curl -H "Authorization: Bearer $AUTH" http://localhost:4042/threadline/health\` → \`identityCoherence.state\` (\`agree\` / \`partial-agree\` / \`disagree\` / \`cannot-tell\`) plus \`connectedAs\` and \`siblingsPublish\`. The check runs every 5 min on every machine; a \`disagree\` means peers' messages to the other address are queued and lost, and the lease holder raises ONE \`agent-identity-split\` item naming the machine, the majority value and the source to adopt from. \`cannot-tell\` is honest insufficient observation, never a verdict.
+- **On \`identity-not-provisioned\`** (\`relay.state: not-provisioned\`), read the health and the item; name the refusal reason (\`single-witness\`, \`last-known-mismatch\`, \`disagree\`, \`identity-file-invalid\`, …) — never guess. Adoption keeps retrying and clears the item itself.
+- **Replacing an EXISTING identity is MY action, after the operator's yes.** I move the conversation to the named machine (\`POST /pool/transfer {"topic":N,"to":"<nick>"}\`), run \`instar identity adopt --from <sibling>\` there (it moves the old files aside — never deletes — installs, reloads the running server and restarts a live listener), report the outcome in one line, then release the pin again (the pool unpin lever). Never a file copy, never a command handed to the operator. A 409 (machine offline) means the item stays open — say so. Where the pool is dark (503) the yes is recorded on the item and that machine runs the command from its next session. A fleet with no usable candidate mints with \`instar identity init --standalone --i-understand-peers-must-repin\`; a decommissioned machine is removed with \`instar machines remove\` (it still holds a copy of the identity until rotation).
+- **Audit + lever:** \`GET /agent-identity/audit\` (\`?scope=pool\` merges every online machine; never key material). \`POST /agent-identity/reload\` re-reads THIS machine's own disk and rebuilds its relay client — local effect only, carries no key, installs nothing (429 inside 60 s).
+`;
+      content += '\n' + agentIdentitySection;
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added One identity across my machines (agent identity) section');
+    }
+
     if (!content.includes('What address reaches me (Threadline routing fingerprint)')) {
       const routingFingerprintSection = `
 ### What address reaches me (Threadline routing fingerprint)
@@ -8352,6 +8378,17 @@ When this machine is a standby and another of my machines holds my relay connect
       result.upgraded.push('CLAUDE.md: added A2A relay forward section');
     }
 
+    // A2A dark peers (docs/specs/a2a-single-agent-identity.md §3, Agent
+    // awareness). OWN sniff key `A2A dark peers` — content-sniffed for idempotency.
+    if (!content.includes('A2A dark peers')) {
+      content += '\n\n' + `### A2A dark peers (did my message arrive?)
+
+A peer is \`dark\` when my own delivery ledger shows messages to it queued at the relay, unconfirmed, or expired for hours with nothing back — no acknowledgement and no inbound since. A relay \`delivered\` verdict alone does NOT clear it: it shows only that something holding the peer's address took the message, not that the peer read it. Messages the relay queued and later handed over stay counted until the peer acknowledges or replies (\`handedUnackedCount\`). It is a proxy read from my ledger: it means "nothing from this peer for N h" and cannot by itself tell offline from a wrong address. A send to a dark peer answers with \`peerDark\` (\`since\`, \`queuedCount\`, \`expiresAt\`, \`connectedNow\`, \`connectedNowReason\`, \`connectedAsOf\`) beside \`relayStatus\`; \`connectedNow\` is the presence map's answer (\`true\` / \`false\` / \`null\` = unknown — never a fresh discover on the send path). When it is \`null\`, \`connectedNowReason\` says why: \`no-row\` (the relay gave me no record of this peer), \`relay-down\` (my own relay is not connected — my side, not theirs) or \`stale\` (my record is too old to trust). \`connectedAsOf\` is when that record was written, so "connected" always means "as of N minutes ago", never "right now". \`GET /threadline/peers/health\` and the per-peer route (\`?scope=pool\` across my machines) carry \`dark\`, \`darkSince\`, \`queuedCount\`, \`connectedNow\`, \`connectedNowReason\`, \`connectedAsOf\`. The wait before a peer counts as dark is 2 h by default and can be set for one peer by its fingerprint (\`threadline.peerDarkNotice.perPeer\`, e.g. 30 min for a peer that normally answers in minutes). Before blaming the peer I read my own \`relay.state\` first: a disconnected sender makes every peer look queued. The operator hears about it ONCE per peer (item \`a2a-peer-dark:<agent>:<peer>\`, 12 h cooldown) only after the awake machine reconnected its relay, refreshed the presence map and re-checked; a peer that answered on any of my machines is not dark, and the item resolves naming the messages that expired unacknowledged. Ships dry-run (\`threadline.peerDarkNotice\`): the fields are live, the worded sentence and the item wait for \`dryRun: false\`. **When to use** (PROACTIVE): a user asks "did <peer> get my message?" → read the send's \`relayStatus\` AND \`peerDark\`; "is <peer> there?" → \`GET /threadline/peers/<fingerprint>/health\` → \`dark\`, \`darkSince\`, \`queuedCount\`, \`connectedNow\`. It may be offline, or listening under a different address — I say which evidence I have, never "nothing will arrive".
+`;
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added A2A dark peers section');
+    }
+
     // A2A local-route trust (docs/specs/a2a-local-route-trust.md, Agent awareness).
     // OWN sniff key `A2A local-route trust` — content-sniffed for idempotency.
     if (!content.includes('A2A local-route trust')) {
@@ -8361,6 +8398,17 @@ Messages from another agent on this machine arrive on a direct route that used t
 `;
       patched = true;
       result.upgraded.push('CLAUDE.md: added A2A local-route trust section');
+    }
+
+    // A2A local-route signed envelope (docs/specs/a2a-local-route-signed-envelope.md,
+    // Agent awareness). OWN sniff key `A2A local-route signed envelope`.
+    if (!content.includes('A2A local-route signed envelope')) {
+      content += '\n\n' + `### A2A local-route signed envelope
+
+Messages I send to another agent on this machine carry a signature made with my identity key. With \`threadline.localRouteSignature\` on, my same-machine route checks each incoming message's signature against the key I hold for the sender's name, that it was addressed to me, that it is under ten minutes old and that it is not a repeat. It starts watch-only (\`dryRun\`, the default): everything is delivered as before, and each message that would be refused is logged (\`[relay-agent-signature] would-refuse\`) and counted by reason. With \`dryRun: false\` such a message is refused before it is recorded, with HTTP 401 \`{ error: 'bad-signature', refused: true, reason, remedy, retryable }\`; a relay-send then falls back to the relay, and a \`/messages/send\` fails and says why. If I have no key on record for the sender I fetch it myself on first contact, into memory (at most five tries per peer). \`signature-invalid\` from a peer I know means it signs with a different key than the one I hold; I never swap a key on my own — find out why its identity moved first, and know that \`threadline_discover\` re-reads EVERY peer's key, not just that one. A message another agent parked for me while I was down is held, not ingested, if I cannot prove it, and expires after 7 days (\`dropsHeld\`, \`dropsExpired\`). A sender that must never deliver an unproven message adds the header \`X-Instar-Require-Signature: v1\`; unless I am enforcing I refuse that request with reason \`not-enforcing\`. Live on a development agent, off on the fleet (omitted \`enabled\`). Mode and counters: authed \`/health\` → \`threadline.localRouteSignature\`; the mode is also on \`/threadline/health\` → \`localEnvelopeSignature\`. **When to use** (PROACTIVE): before turning \`dryRun\` off, read the last 24 hours of \`logs/relay-agent-signature.jsonl\` (one row per check), not the \`/health\` counters, which reset at every restart: at least 20 \`verified\` rows per peer, and no \`unsigned\`, \`signature-invalid\` or \`fingerprint-mismatch\` row. If the file's oldest row is newer than 24 hours, or \`auditWriteFailures\` is not zero, the answer is unknown and the flip waits. If \`signerAvailable\` is false, an enforcing peer refuses everything I send it locally.
+`;
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added A2A local-route signed envelope section');
     }
 
     // A2A relay unknown-sender trust (docs/specs/a2a-relay-unknown-sender-trust.md,
@@ -10714,6 +10762,7 @@ The user has been talking to you (possibly for days). A generic greeting like "H
 - **Download a file**: \`curl -H "Authorization: Bearer $AUTH" "http://localhost:${port}/api/files/download?path=.claude/CLAUDE.md" -O\`
 - **Default config**: Browsing and editing enabled for the entire project directory (\`./\`) by default.
 - **Never editable**: \`.claude/hooks/\`, \`.claude/scripts/\`, \`node_modules/\`, \`.instar/jobs/instar/\` are always read-only regardless of config.
+- **Never served**: key material (\`.instar/identity.json\` and its siblings, the threadline key files, machine keys, the headless key vault, origin-session credentials) is never listed, read, downloaded, linked or backed up — by a list the config cannot loosen. A 403 there is correct; move the document, never the key.
 `;
       // Insert after Dashboard section
       const dashboardIdx = content.indexOf('**Dashboard**');
@@ -10738,6 +10787,29 @@ The user has been talking to you (possibly for days). A generic greeting like "H
       result.upgraded.push('CLAUDE.md: added File Viewer section');
     } else {
       result.skipped.push('CLAUDE.md: File Viewer section already present');
+    }
+
+    // a2a-single-agent-identity §5 (Agent Awareness): an agent that already
+    // carries the File Viewer section learns that key material is never served
+    // and that a 403 there is correct. Content-sniffed on the row's own label;
+    // inserted right after the "Never editable" row, else appended to the
+    // section's end.
+    if (content.includes('**File Viewer') && !content.includes('**Never served**')) {
+      const neverServedRow =
+        '- **Never served**: key material (\`.instar/identity.json\` and its siblings, the threadline key files, machine keys, the headless key vault, origin-session credentials) is never listed, read, downloaded, linked or backed up — by a list the config cannot loosen. A 403 there is correct; move the document, never the key.';
+      const editableIdx = content.indexOf('- **Never editable**');
+      if (editableIdx >= 0) {
+        const lineEnd = content.indexOf('\n', editableIdx);
+        const at = lineEnd >= 0 ? lineEnd : content.length;
+        content = content.slice(0, at) + '\n' + neverServedRow + content.slice(at);
+      } else {
+        const sectionIdx = content.indexOf('**File Viewer');
+        const sectionEnd = content.indexOf('\n\n', sectionIdx);
+        const at = sectionEnd >= 0 ? sectionEnd : content.length;
+        content = content.slice(0, at) + '\n' + neverServedRow + content.slice(at);
+      }
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added File Viewer "Never served" row');
     }
 
     // Secret Drop hardened retrieve — patch the unsafe `curl /secrets/retrieve/TOKEN`
@@ -11312,6 +11384,10 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
     // sections preserve narrative ordering in the shadow.
     const markers = [
       '### Telegram message origin',
+      // a2a-single-agent-identity: the agent identity + coherence check are server-side and
+      // framework-agnostic (a Codex/Gemini agent runs on the same mesh and must explain the
+      // not-provisioned posture and the adopt-from-a-sibling path honestly too).
+      '### One identity across my machines (agent identity)',
       // Jev job-completion audit: framework-agnostic server behavior (capture
       // happens in the scheduler), so a Codex/Gemini agent must be able to
       // explain it honestly too — especially that it is dark by default.
@@ -11352,6 +11428,14 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
       // route, framework-agnostic — a Codex/Gemini agent must know the 403 and
       // the watch-only counters.
       '### A2A local-route trust',
+      // A2A local-route signed envelope: a server-side check on the same-machine
+      // inbound route, framework-agnostic — a Codex/Gemini agent must know the
+      // 401, its reason/remedy fields and the audit file the flip is read from.
+      '### A2A local-route signed envelope',
+      // A2A dark peers: server-side send-response + health-read fields,
+      // framework-agnostic — a Codex/Gemini agent must know `peerDark` and the
+      // `dark` health fields to answer "did <peer> get my message?" honestly.
+      '### A2A dark peers',
       // A2A relay unknown-sender trust: a server-side check on the relay inbound
       // path, framework-agnostic — a Codex/Gemini agent must know the counters.
       '### A2A relay unknown-sender trust',
@@ -12655,7 +12739,19 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
     // Presentation and outage-notice permission defaults are independent from writer enrollment.
     if (migrateTelegramOriginDisplay(config)) {
       patched = true;
-      result.upgraded.push('config.json: added missing Telegram origin display and outage-notice defaults');
+      result.upgraded.push('config.json: added missing Telegram origin display, outage-notice and forward-to-holder defaults');
+    }
+
+    // a2a-single-agent-identity §1.2: the FLEET-LIVE adoption kill switch. Add the missing
+    // nested default only; an operator's explicit value (true or false) is never overwritten.
+    {
+      const ai: Record<string, unknown> = (config.agentIdentity && typeof config.agentIdentity === 'object') ? config.agentIdentity as Record<string, unknown> : {};
+      if (!ai.adoption || typeof ai.adoption !== 'object') {
+        ai.adoption = { enabled: true };
+        config.agentIdentity = ai;
+        patched = true;
+        result.upgraded.push('config.json: added agentIdentity.adoption default (enabled: true)');
+      }
     }
 
     // Codex lifecycle reliability rollout. Stage B becomes pending only when
@@ -13347,6 +13443,19 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
     // cartographer-freshness.mjs historically (wrongly) claimed this was gitignored;
     // this entry makes it true. Idempotent (addGitignoreEntry no-ops if present).
     this.addGitignoreEntry(projectGitignore, '.instar/cartographer/', result, 'project .gitignore');
+
+    // Key material (a2a-single-agent-identity §5.3): the agent identity (+ its
+    // superseded/invalid/temp siblings), the legacy routing mirror, threadline
+    // HMAC/invitation/token files, dedicated SSH keys, the headless key vault
+    // and the bind-token secret. New agents get these via GITIGNORE_ENTRIES at
+    // init; existing agents ONLY through this step (Migration Parity). Both
+    // repos, both spellings, idempotent.
+    for (const entry of KEY_MATERIAL_GITIGNORE_STATE) {
+      this.addGitignoreEntry(instarGitignore, entry, result, '.instar/.gitignore');
+    }
+    for (const entry of KEY_MATERIAL_GITIGNORE_PROJECT) {
+      this.addGitignoreEntry(projectGitignore, entry, result, 'project .gitignore');
+    }
   }
 
   /**
