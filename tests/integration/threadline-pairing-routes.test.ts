@@ -149,12 +149,20 @@ describe('Secure A2A Verified Pairing routes (integration)', () => {
       expect(res.body.pairing.sasWords).toEqual(SAS_WORDS);
     });
 
-    it('detail with an INCORRECT PIN still omits the SAS words', async () => {
+    it('detail with an INCORRECT PIN is refused and never shows the SAS words', async () => {
       const res = await request(app)
         .get(`/threadline/pairing/${PEER_FP}`)
         .send({ pin: '000000' });
-      expect(res.status).toBe(200);
-      expect(res.body.pairing.sasWords).toBeUndefined();
+      expect(res.status).toBe(403);
+      expect(res.body.pairing).toBeUndefined();
+    });
+
+    it('wrong PINs on the detail route count toward the same lockout as every PIN route', async () => {
+      const statuses: number[] = [];
+      for (let i = 0; i < 7; i++) {
+        statuses.push((await request(app).get(`/threadline/pairing/${PEER_FP}`).set('X-Forwarded-For', '203.0.113.9').send({ pin: '999999' })).status);
+      }
+      expect(statuses).toContain(429);
     });
 
     it('detail 404s for an unknown fingerprint', async () => {

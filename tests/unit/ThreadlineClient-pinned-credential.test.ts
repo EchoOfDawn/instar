@@ -91,3 +91,53 @@ describe('ThreadlineClient — pinned credential send (FD4 v2)', () => {
     expect(got).toHaveLength(0);
   });
 });
+
+describe('ThreadlineClient — the pinned key is the authority after a restart (FD4a)', () => {
+  it('the receiver opens a credential with an EMPTY cache by asking the pinned-key resolver', () => {
+    const a = makeAgent();
+    const b = makeAgent();
+    const sent: unknown[] = [];
+    const { client: ca } = clientFor(a, sent);
+    const { client: cb, internals: ib } = clientFor(b, []);
+    cb.setPinnedKeyResolver((fp) => (fp === a.fp ? a.pub : null)); // what the trust profile holds
+    const got: unknown[] = [];
+    const unknown: unknown[] = [];
+    cb.on('message', (m: { content: { content?: unknown } }) => got.push(m.content.content));
+    cb.on('unknown-sender', (e: unknown) => unknown.push(e));
+    ca.sendCredentialToPinned(b.fp, b.pub.toString('hex'), 'after a restart');
+    ib.handleIncomingMessage(sent[0]);
+    expect(got).toEqual(['after a restart']);
+    expect(unknown).toHaveLength(0);
+  });
+
+  it('a resolver key that is not the sender\'s is ignored (unknown-sender, nothing delivered)', () => {
+    const a = makeAgent();
+    const b = makeAgent();
+    const sent: unknown[] = [];
+    const { client: ca } = clientFor(a, sent);
+    const { client: cb, internals: ib } = clientFor(b, []);
+    cb.setPinnedKeyResolver(() => makeAgent().pub);
+    const got: unknown[] = [];
+    const unknown: unknown[] = [];
+    cb.on('message', (m: unknown) => got.push(m));
+    cb.on('unknown-sender', (e: unknown) => unknown.push(e));
+    ca.sendCredentialToPinned(b.fp, b.pub.toString('hex'), 'x');
+    ib.handleIncomingMessage(sent[0]);
+    expect(got).toHaveLength(0);
+    expect(unknown).toHaveLength(1);
+  });
+
+  it('the binding check accepts an empty cache but refuses a DIFFERENT cached key', () => {
+    const a = makeAgent();
+    const b = makeAgent();
+    const { client: ca, internals: ia } = clientFor(a, []);
+    const pinnedHex = b.pub.toString('hex');
+    expect(ca.isChannelBoundToPairing(b.fp, pinnedHex, null)).toBe(true);
+    ia.knownAgents.set(b.fp, { agentId: b.fp, name: 'b', publicKey: makeAgent().pub });
+    expect(ca.isChannelBoundToPairing(b.fp, pinnedHex, null)).toBe(false);
+    ia.knownAgents.set(b.fp, { agentId: b.fp, name: 'b', publicKey: b.pub });
+    expect(ca.isChannelBoundToPairing(b.fp, pinnedHex, null)).toBe(true);
+    // A pinned key that is not this recipient's never binds.
+    expect(ca.isChannelBoundToPairing(b.fp, makeAgent().pub.toString('hex'), null)).toBe(false);
+  });
+});

@@ -189,7 +189,9 @@ describe('startStaticPairing rules', () => {
     expect(t.startStaticPairing(peer.fp, { ownIdentityPub: self.pub, peerIdentityPub: peer.pub, ownFp: self.fp }).outcome).toBe('already-verified');
     const rotated = agent();
     expect(t.startStaticPairing(peer.fp, { ownIdentityPub: rotated.pub, peerIdentityPub: peer.pub, ownFp: rotated.fp }).outcome).toBe('started');
-    expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('pending-verification');
+    expect(t.getProfileByFingerprint(peer.fp)!.pairingState).toBe('pending-verification');    // and it no longer carries the credential-authorizing source
+    expect(t.getProfileByFingerprint(peer.fp)!.source).not.toBe('mutual-verified');
+    expect(t.isCredentialShareAllowedByFingerprint(peer.fp)).toBe(false);
   });
 });
 

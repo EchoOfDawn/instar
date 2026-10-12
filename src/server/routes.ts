@@ -510,6 +510,7 @@ import { readThreadHistoryUnion, type CanonicalReadDeps, type AggregateMessage }
 import { isAuthenticatedThreadlineInbound } from '../threadline/ThreadlineReplyValidation.js';
 import { computeSymmetryState, localThreadSync, honorPeerThreadSync, type SymmetryState } from '../threadline/threadSymmetry.js';
 import { resolveSingleNegotiatorConfig, readNegotiatorCounts } from '../threadline/NegotiatorLease.js';
+import { loadSasWordlist } from '../threadline/ThreadlineCrypto.js';
 import { evaluateOutboundCredentialShare } from '../threadline/CredentialShareGate.js';
 import { detectCommitmentClass, commitmentNudge } from '../threadline/ContentClassifier.js';
 import type { UnifiedTrustSystem } from '../threadline/UnifiedTrustWiring.js';
@@ -12968,7 +12969,7 @@ export function createRoutes(ctx: RouteContext): Router {
    *  write through to the durable PinAttemptStore when available, so a server
    *  restart no longer resets brute-force lockout. The in-memory Map remains the
    *  fallback when stateDir is unavailable. */
-  function checkMandatePin(req: import('express').Request, res: import('express').Response): boolean {
+  function checkMandatePin(req: import('express').Request, res: import('express').Response, pinOverride?: string): boolean {
     if (!ctx.config.dashboardPin) {
       res.status(503).json({ error: 'PIN authentication not available (no dashboardPin configured)' });
       return false;
@@ -12985,7 +12986,7 @@ export function createRoutes(ctx: RouteContext): Router {
       res.status(429).json({ error: 'Too many attempts. Try again later.' });
       return false;
     }
-    const pin = (req.body ?? {}).pin;
+    const pin = pinOverride ?? (req.body ?? {}).pin;
     if (!pin || typeof pin !== 'string') {
       res.status(403).json({ error: 'Operator PIN required — mandate issuance/revocation is a human action, not an agent action' });
       return false;
@@ -18527,15 +18528,15 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     // in the X-Dashboard-Pin header. Same constant-time comparison either way.
     const headerPin = req.headers['x-dashboard-pin'];
     const pin = (req.body ?? {}).pin ?? (typeof headerPin === 'string' ? headerPin : undefined);
-    const pinValid =
-      !!ctx.config.dashboardPin &&
-      typeof pin === 'string' &&
-      pin.length > 0 &&
-      (() => {
-        const ha = createHash('sha256').update(pin).digest();
-        const hb = createHash('sha256').update(ctx.config.dashboardPin!).digest();
-        return ha.length === hb.length && timingSafeEqual(ha, hb);
-      })();
+    // A supplied PIN goes through the SAME check (and the same failure counters and
+    // lockout) as every other PIN route (Echo's second review, B): before, a wrong PIN here
+    // was never counted, so a Bearer holder could try all of them. A wrong PIN is a 403/429.
+    // No PIN at all is a plain Bearer read: allowed, and it never shows the words.
+    let pinValid = false;
+    if (typeof pin === 'string' && pin.length > 0) {
+      if (!checkMandatePin(req, res, pin)) return;
+      pinValid = true;
+    }
     if (profile.pairingState === 'pending-verification' && pinValid) {
       const pending = trustManager.getPendingPairing(peerFp);
       if (pending) detail.sasWords = pending.sasWords;
@@ -18631,6 +18632,9 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    // Bearer first (FD7; Echo's second review, A): /threadline/* skips global auth, and
+    // without this an unauthenticated caller could burn the operator's per-IP PIN lockout.
+    if (!pairingRouteAuthorized(req, res)) return;
     if (!checkMandatePin(req, res)) return; // FD7 — PIN required (response already sent)
 
     const trustManager = ctx.unifiedTrust?.trustManager;
@@ -18657,6 +18661,20 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       }
       const typed = (body.words as unknown[]).map((w) => String(w ?? '').trim().toLowerCase());
       const own = pending.sasWords.map((w) => w.toLowerCase());
+      // A typo is not a mismatch (Echo's second review, C). Every word the other side can
+      // show is in the wordlist, so a word that is not in it can only be mistyped: refuse
+      // with a retryable 400 and record nothing. A wrong but VALID word is still a denial.
+      const wordlist = new Set(loadSasWordlist());
+      const notWords = typed.map((w, i) => (wordlist.has(w) ? -1 : i + 1)).filter((n) => n > 0);
+      if (typed.length !== own.length || notWords.length > 0) {
+        res.status(400).json({
+          retryable: true,
+          error: typed.length !== own.length
+            ? `type all ${own.length} words; nothing was recorded`
+            : `not in the word list (check the spelling): word ${notWords.join(', ')}; nothing was recorded`,
+        });
+        return;
+      }
       body.match = typed.length === own.length && typed.every((w, i) => w === own[i]);
     } else if (body.match === true) {
       res.status(400).json({ error: 'to confirm, send words: the 12 words the other side shows, in order' });

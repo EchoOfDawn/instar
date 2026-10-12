@@ -64,8 +64,8 @@ describe('Verified pairing v2 — production path is alive', () => {
   let a: Side;
   let b: Side;
 
-  async function bootSide(name: string, auth: string, relayUrl: string, port: number): Promise<Side> {
-    const project = createTempProject();
+  async function bootSide(name: string, auth: string, relayUrl: string, port: number, reuse?: TempProject): Promise<Side> {
+    const project = reuse ?? createTempProject();
     // The same live config reader server.ts passes (spec §3.10); without it the inbound
     // gate treats verified pairing as off and never processes a receipt.
     const boot = await bootstrapThreadline({
@@ -205,6 +205,40 @@ describe('Verified pairing v2 — production path is alive', () => {
       b.boot.relayClient!.off('message', onMsg);
     }
   });
+
+  it('after either agent restarts, a credential still goes both ways (the pinned key is reloaded at boot)', async () => {
+    const relayUrl = `ws://127.0.0.1:${relay.address!.port}/v1/connect`;
+    // Restart = shut down and bootstrap again on the SAME state dir, as an auto-update does.
+    const restart = async (s: Side, port: number): Promise<Side> => {
+      await s.server.stop();
+      s.trust.shutdown();
+      await s.boot.shutdown();
+      return bootSide(s.name, s.auth, relayUrl, port, s.project);
+    };
+    const sendCredential = async (from: Side, to: Side, text: string) => {
+      const got: unknown[] = [];
+      const unknown: unknown[] = [];
+      const onMsg = (m: { from: string; content: { content?: unknown } }) => { if (m.from === from.fp) got.push(m.content?.content); };
+      const onUnknown = (e: unknown) => unknown.push(e);
+      to.boot.relayClient!.on('message', onMsg);
+      to.boot.relayClient!.on('unknown-sender', onUnknown);
+      try {
+        const r = await call(from, 'POST', '/threadline/relay-send', { targetAgent: to.fp, message: text, credentialShare: true });
+        expect(r.status, JSON.stringify(r.body)).toBeLessThan(300);
+        await vi.waitFor(() => expect(got).toContain(text), { timeout: 10_000 });
+        expect(unknown).toHaveLength(0);
+      } finally {
+        to.boot.relayClient!.off('message', onMsg);
+        to.boot.relayClient!.off('unknown-sender', onUnknown);
+      }
+    };
+    b = await restart(b, 4062); // the receiver restarts
+    expect(b.boot.trustManager!.getProfileByFingerprint(a.fp)!.pairingState).toBe('mutual-verified');
+    await sendCredential(a, b, 'after the receiver restarted');
+    a = await restart(a, 4061); // the sender restarts
+    await sendCredential(a, b, 'after the sender restarted');
+    await sendCredential(b, a, 'and back the other way');
+  }, 60_000);
 
   it('a credential to a peer that was never verified is refused before anything is sent', async () => {
     const c = await bootSide(`pv2-d-${process.pid}`, 'pv2-d-auth', `ws://127.0.0.1:${relay.address!.port}/v1/connect`, 4054);

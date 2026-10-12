@@ -159,13 +159,18 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
     // Browsers cannot send a body on a GET, so the dashboard passes the PIN in a header.
     const viaHeader = await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).set('X-Dashboard-Pin', PIN);
     expect(viaHeader.body.pairing.sasWords).toEqual(wa.body.pairing.sasWords);
+    // A wrong PIN is refused (and counted toward the PIN lockout), never a silent read.
     const wrongHeader = await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).set('X-Dashboard-Pin', '000000');
-    expect(wrongHeader.body.pairing.sasWords).toBeUndefined();
+    expect(wrongHeader.status).toBe(403);
+    expect(wrongHeader.body.pairing).toBeUndefined();
 
     // Every pairing route checks the Bearer token itself (/threadline/* skips global auth).
     expect((await request(A.app).post(`/threadline/pairing/${scout.fp}/start`).send({})).status).toBe(401);
     expect((await request(A.app).get(`/threadline/pairing/${scout.fp}`).send({})).status).toBe(401);
     expect((await request(A.app).get('/threadline/pairing').send()).status).toBe(401);
+    // Including verify: the PIN alone is not enough, so no anonymous caller can burn the PIN lockout.
+    expect((await request(A.app).post(`/threadline/pairing/${scout.fp}/verify`).send({ match: false, pin: PIN })).status).toBe(401);
+    expect((await authed(request(A.app).get(`/threadline/pairing/${scout.fp}`)).send({})).body.pairing.state).toBe('pending-verification');
     // Mixed-case fingerprints resolve to the same pairing (FD13).
     const upper = await authed(request(A.app).get(`/threadline/pairing/${scout.fp.toUpperCase()}`)).send({});
     expect(upper.body.pairing.state).toBe('pending-verification');
@@ -262,6 +267,17 @@ describe('Verified pairing v2 — two relay-only agents (FD4 v2)', () => {
     try {
       await authed(request(F.app).post(`/threadline/pairing/${other.fp}/start`)).send({});
       const own = (await authed(request(F.app).get(`/threadline/pairing/${other.fp}`)).send({ pin: PIN })).body.pairing.sasWords as string[];
+      // A misspelled word is a typo, not a mismatch: retryable, nothing recorded.
+      const misspelled = [...own];
+      misspelled[3] = misspelled[3] + 'x';
+      const typo = await authed(request(F.app).post(`/threadline/pairing/${other.fp}/verify`)).send({ words: misspelled, pin: PIN });
+      expect(typo.status).toBe(400);
+      expect(typo.body).toMatchObject({ retryable: true });
+      expect(typo.body.error).toMatch(/word 4/);
+      expect((await authed(request(F.app).get(`/threadline/pairing/${other.fp}`)).send({})).body.pairing.state).toBe('pending-verification');
+      // Eleven words is also a retry, not a denial.
+      expect((await authed(request(F.app).post(`/threadline/pairing/${other.fp}/verify`)).send({ words: own.slice(0, 11), pin: PIN })).status).toBe(400);
+      // A wrong but REAL word is a mismatch, and denies.
       const typed = [...own];
       typed[7] = typed[7] === 'abandon' ? 'ability' : 'abandon';
       const r = await authed(request(F.app).post(`/threadline/pairing/${other.fp}/verify`)).send({ words: typed, pin: PIN });

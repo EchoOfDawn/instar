@@ -588,6 +588,11 @@ export class AgentTrustManager {
     profile.peerAcked = undefined;
     profile.pairingRecordedAt = now;
     profile.updatedAt = now;
+    // A pairing back at pending is no longer verified, so it must not keep the
+    // credential-authorizing source (Echo's second review, item 2). The trust LEVEL is left
+    // alone: an operator may have set it independently, and credentials are gated on the
+    // source and the pairing state, not on the level.
+    if (profile.source === 'mutual-verified') profile.source = 'setup-default';
 
     const record: PendingPairingRecord = {
       pairingId: args.pairingId,
