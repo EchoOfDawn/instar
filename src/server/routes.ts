@@ -510,6 +510,7 @@ import { readThreadHistoryUnion, type CanonicalReadDeps, type AggregateMessage }
 import { isAuthenticatedThreadlineInbound } from '../threadline/ThreadlineReplyValidation.js';
 import { computeSymmetryState, localThreadSync, honorPeerThreadSync, type SymmetryState } from '../threadline/threadSymmetry.js';
 import { resolveSingleNegotiatorConfig, readNegotiatorCounts } from '../threadline/NegotiatorLease.js';
+import { loadSasWordlist } from '../threadline/ThreadlineCrypto.js';
 import { evaluateOutboundCredentialShare } from '../threadline/CredentialShareGate.js';
 import { detectCommitmentClass, commitmentNudge } from '../threadline/ContentClassifier.js';
 import type { UnifiedTrustSystem } from '../threadline/UnifiedTrustWiring.js';
@@ -12968,7 +12969,7 @@ export function createRoutes(ctx: RouteContext): Router {
    *  write through to the durable PinAttemptStore when available, so a server
    *  restart no longer resets brute-force lockout. The in-memory Map remains the
    *  fallback when stateDir is unavailable. */
-  function checkMandatePin(req: import('express').Request, res: import('express').Response): boolean {
+  function checkMandatePin(req: import('express').Request, res: import('express').Response, pinOverride?: string): boolean {
     if (!ctx.config.dashboardPin) {
       res.status(503).json({ error: 'PIN authentication not available (no dashboardPin configured)' });
       return false;
@@ -12985,7 +12986,7 @@ export function createRoutes(ctx: RouteContext): Router {
       res.status(429).json({ error: 'Too many attempts. Try again later.' });
       return false;
     }
-    const pin = (req.body ?? {}).pin;
+    const pin = pinOverride ?? (req.body ?? {}).pin;
     if (!pin || typeof pin !== 'string') {
       res.status(403).json({ error: 'Operator PIN required — mandate issuance/revocation is a human action, not an agent action' });
       return false;
@@ -18356,6 +18357,15 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       ctx.config as { developmentAgent?: boolean },
     );
 
+  // `/threadline/*` is exempt from the global Bearer middleware (middleware.ts: Threadline
+  // protocol endpoints authenticate themselves), so every pairing route checks the agent
+  // Bearer token itself (spec FD7). Returns false after sending 401.
+  const pairingRouteAuthorized = (req: import('express').Request, res: import('express').Response): boolean => {
+    if (bearerMatches(req, ctx.config.authToken)) return true;
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  };
+
   // Build THIS machine's local pairings list (the shape the plain + pool reads share,
   // so a peer's plain reply merges in identically). No SAS words ever.
   const buildLocalPairings = (): Array<Record<string, unknown>> => {
@@ -18461,6 +18471,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    if (!pairingRouteAuthorized(req, res)) return;
     const trustManager = ctx.unifiedTrust?.trustManager;
     if (!trustManager) {
       res.status(503).json({ error: 'trust manager unavailable' });
@@ -18486,12 +18497,13 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    if (!pairingRouteAuthorized(req, res)) return;
     const trustManager = ctx.unifiedTrust?.trustManager;
     if (!trustManager) {
       res.status(503).json({ error: 'trust manager unavailable' });
       return;
     }
-    const peerFp = req.params.peerFp;
+    const peerFp = String(req.params.peerFp || '').toLowerCase(); // FD13
     const profile = trustManager.getProfileByFingerprint(peerFp);
     if (!profile || profile.pairingState === undefined) {
       res.status(404).json({ error: `no pairing for fingerprint "${peerFp}"` });
@@ -18512,22 +18524,104 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     // SAS words: pending-verification ONLY, and ONLY to a valid-PIN operator.
     // We validate the PIN WITHOUT sending a response (the detail read succeeds
     // regardless) — a non-throwing constant-time compare mirroring checkMandatePin.
-    const pin = (req.body ?? {}).pin;
-    const pinValid =
-      !!ctx.config.dashboardPin &&
-      typeof pin === 'string' &&
-      pin.length > 0 &&
-      (() => {
-        const ha = createHash('sha256').update(pin).digest();
-        const hb = createHash('sha256').update(ctx.config.dashboardPin!).digest();
-        return ha.length === hb.length && timingSafeEqual(ha, hb);
-      })();
+    // The PIN may arrive in the body or, for browsers (which cannot send a body on a GET),
+    // in the X-Dashboard-Pin header. Same constant-time comparison either way.
+    const headerPin = req.headers['x-dashboard-pin'];
+    const pin = (req.body ?? {}).pin ?? (typeof headerPin === 'string' ? headerPin : undefined);
+    // A supplied PIN goes through the SAME check (and the same failure counters and
+    // lockout) as every other PIN route (Echo's second review, B): before, a wrong PIN here
+    // was never counted, so a Bearer holder could try all of them. A wrong PIN is a 403/429.
+    // No PIN at all is a plain Bearer read: allowed, and it never shows the words.
+    let pinValid = false;
+    if (typeof pin === 'string' && pin.length > 0) {
+      if (!checkMandatePin(req, res, pin)) return;
+      pinValid = true;
+    }
     if (profile.pairingState === 'pending-verification' && pinValid) {
       const pending = trustManager.getPendingPairing(peerFp);
       if (pending) detail.sasWords = pending.sasWords;
     }
 
     res.json({ pairing: detail });
+  });
+
+  // Start (or re-check) a v2 static-key pairing with a peer (spec §3.2, FD4 v2 — 2026-10-10).
+  // Both sides call this independently: the 12 SAS words are a function of the two
+  // Ed25519 identity keys, so no handshake round trip is needed and it works between
+  // relay-only agents (issue #2117 gap G). Starting needs only the agent Bearer token,
+  // because it records a PENDING pairing and grants nothing; the words are still shown
+  // only to a PIN-authed operator on the detail route, and confirming still needs the
+  // PIN. The one PIN-gated path here is `clearFailed`: a denied match stays
+  // verification-failed until an operator explicitly clears it (spec §3.2).
+  // The peer's identity key comes from the relay client's known-agent cache — never
+  // from the request — so a caller cannot choose which key gets bound.
+  router.post('/threadline/pairing/:peerFp/start', async (req, res) => {
+    if (!verifiedPairingRouteEnabled()) {
+      res.status(503).json({ error: 'verified pairing not enabled' });
+      return;
+    }
+    if (!pairingRouteAuthorized(req, res)) return; // FD7: /threadline/* skips global auth
+    const trustManager = ctx.unifiedTrust?.trustManager;
+    if (!trustManager) {
+      res.status(503).json({ error: 'trust manager unavailable' });
+      return;
+    }
+    const relay = ctx.threadlineRelayClient;
+    const ownPub = relay?.publicKey ?? null;
+    const ownFp = relay?.fingerprint ?? null;
+    if (!relay || !ownPub || !ownFp) {
+      res.status(503).json({ error: 'this machine does not hold the Threadline relay identity; start the pairing on the machine that does' });
+      return;
+    }
+    const peerFp = String(req.params.peerFp || '').toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(peerFp)) {
+      res.status(400).json({ error: 'peerFp must be a 32-hex-char Threadline fingerprint' });
+      return;
+    }
+    const clearFailed = (req.body ?? {}).clearFailed === true;
+    if (clearFailed && !checkMandatePin(req, res)) return; // clearing a denied match is an operator act
+    const known = relay.getKnownAgents().find((a) => a.agentId === peerFp);
+    // Not cached (e.g. the peer's messages arrive unsigned): read the key from the relay's
+    // public card. Relay-supplied is acceptable for pairing — a substituted key yields
+    // different words and the human comparison catches it (spec §3.0).
+    const peerKey =
+      known?.publicKey ??
+      (typeof relay.fetchPeerIdentityKey === 'function' ? await relay.fetchPeerIdentityKey(peerFp) : null);
+    if (!peerKey) {
+      res.status(409).json({ error: `no identity key found for "${peerFp}" in the known-agent cache or on the relay card` });
+      return;
+    }
+    // Fill the cache with the identity key (never an X25519 key), so the credential binding
+    // check can see it later (spec FD4a; Echo's review: nothing in src filled it).
+    if (!known?.publicKey && typeof relay.rememberPeerIdentityKey === 'function') {
+      relay.rememberPeerIdentityKey(peerFp, peerKey);
+    }
+    const result = trustManager.startStaticPairing(peerFp, {
+      ownIdentityPub: ownPub,
+      peerIdentityPub: peerKey,
+      ownFp,
+      displayName: known?.name,
+      clearFailed,
+    });
+    switch (result.outcome) {
+      case 'self-pair':
+        res.status(400).json({ error: 'cannot pair with yourself' });
+        return;
+      case 'fingerprint-mismatch':
+        res.status(409).json({ error: 'the cached identity key does not match that fingerprint' });
+        return;
+      case 'refused-failed':
+        res.status(409).json({ error: 'this pairing was denied by an operator; clearing it requires the dashboard PIN (clearFailed: true)' });
+        return;
+      default:
+        res.json({
+          outcome: result.outcome,
+          peerFp,
+          pairingId: result.pairingId,
+          sasFingerprint: result.sasFingerprint,
+          next: 'Compare the 12 words with the other side out of band: GET /threadline/pairing/' + peerFp + ' with the dashboard PIN shows them; POST /threadline/pairing/' + peerFp + '/verify with the PIN confirms or denies.',
+        });
+    }
   });
 
   // Operator confirm/deny of a pairing — PIN-GATED (FD7). The local human SAS
@@ -18538,6 +18632,9 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
     }
+    // Bearer first (FD7; Echo's second review, A): /threadline/* skips global auth, and
+    // without this an unauthenticated caller could burn the operator's per-IP PIN lockout.
+    if (!pairingRouteAuthorized(req, res)) return;
     if (!checkMandatePin(req, res)) return; // FD7 — PIN required (response already sent)
 
     const trustManager = ctx.unifiedTrust?.trustManager;
@@ -18545,16 +18642,46 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'trust manager unavailable' });
       return;
     }
-    const peerFp = req.params.peerFp;
+    const peerFp = String(req.params.peerFp || '').toLowerCase(); // FD13
     const body = req.body ?? {};
-    if (typeof body.match !== 'boolean') {
-      res.status(400).json({ error: 'match (boolean) is required' });
-      return;
-    }
-
     const profile = trustManager.getProfileByFingerprint(peerFp);
     if (!profile || profile.pairingState === undefined) {
       res.status(404).json({ error: `no pairing for fingerprint "${peerFp}"` });
+      return;
+    }
+    // Typed comparison (spec FD2a): to CONFIRM, the operator types the 12 words the OTHER
+    // side shows and the server compares all 12, in order, with its own. Eyeballing is not
+    // enough against a partial-match attack (8 of 12 chosen words ~ 2^44). `match:false`
+    // remains an explicit deny; `match:true` without words is refused.
+    if (Array.isArray(body.words)) {
+      const pending = trustManager.getPendingPairing(peerFp);
+      if (!pending || profile.pairingState !== 'pending-verification') {
+        res.status(409).json({ error: 'this pairing is not waiting for a comparison' });
+        return;
+      }
+      const typed = (body.words as unknown[]).map((w) => String(w ?? '').trim().toLowerCase());
+      const own = pending.sasWords.map((w) => w.toLowerCase());
+      // A typo is not a mismatch (Echo's second review, C). Every word the other side can
+      // show is in the wordlist, so a word that is not in it can only be mistyped: refuse
+      // with a retryable 400 and record nothing. A wrong but VALID word is still a denial.
+      const wordlist = new Set(loadSasWordlist());
+      const notWords = typed.map((w, i) => (wordlist.has(w) ? -1 : i + 1)).filter((n) => n > 0);
+      if (typed.length !== own.length || notWords.length > 0) {
+        res.status(400).json({
+          retryable: true,
+          error: typed.length !== own.length
+            ? `type all ${own.length} words; nothing was recorded`
+            : `not in the word list (check the spelling): word ${notWords.join(', ')}; nothing was recorded`,
+        });
+        return;
+      }
+      body.match = typed.length === own.length && typed.every((w, i) => w === own[i]);
+    } else if (body.match === true) {
+      res.status(400).json({ error: 'to confirm, send words: the 12 words the other side shows, in order' });
+      return;
+    }
+    if (typeof body.match !== 'boolean') {
+      res.status(400).json({ error: 'send words (12, in order) to confirm, or match:false to deny' });
       return;
     }
 
@@ -18577,7 +18704,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       void ctx.telegram?.createAttentionItem?.({
         id: `threadline-pairing-verification-failed:${peerFp}`,
         title: 'Threadline pairing verification FAILED — possible MITM',
-        summary: `The SAS for peer ${peerFp.slice(0, 12)}… was asserted NOT to match. The peer was forced to untrusted and credential-share revoked. Re-handshake before retrying.`,
+        summary: `The SAS for peer ${peerFp.slice(0, 12)}… was asserted NOT to match. The peer was forced to untrusted and credential-share revoked. The pairing stays failed until an operator clears it with the dashboard PIN (POST /threadline/pairing/${peerFp}/start with clearFailed: true); the words will be the same unless a key changes, so find out why they differed first.`,
         category: 'general',
         priority: 'HIGH',
         sourceContext: 'threadline-verified-pairing',
@@ -18604,7 +18731,21 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(409).json({ error: 'could not confirm pairing (state/epoch mismatch or not pending) — re-handshake required' });
       return;
     }
-    res.json({ ok: true, peerFp, state: 'mutual-verified' });
+    // Tell the peer this side confirmed (spec §3.4): ONE signed receipt, encrypted to the
+    // pinned key. Best effort — the receipt only sets the peer's optional peerAcked flag,
+    // so a send failure never undoes or blocks the confirmation.
+    let receiptSent = false;
+    try {
+      const confirmed = trustManager.getProfileByFingerprint(peerFp);
+      const relay = ctx.threadlineRelayClient;
+      if (relay && typeof relay.sendPairVerifyReceipt === 'function' && confirmed?.peerIdentityPub && confirmed.sasFingerprint) {
+        relay.sendPairVerifyReceipt(peerFp, confirmed.peerIdentityPub, { pairingId, sasFingerprint: confirmed.sasFingerprint });
+        receiptSent = true;
+      }
+    } catch (err) {
+      console.warn(`[pairing] receipt to ${peerFp.slice(0, 12)} not sent: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    res.json({ ok: true, peerFp, state: 'mutual-verified', receiptSent });
   });
 
   // ── Negotiator lease state (Robustness Phase 1, FD-9) ──────────────────
@@ -37165,12 +37306,13 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
             }
           } catch { /* @silent-fallback-ok — identity read is best-effort */ }
         }
-        if (localTarget?.port && !isSelfTarget) {
-          // §3.5 outbound credential-share chokepoint (local-delivery path). A credential
-          // must go to a mutual-verified peer over the encrypted+signed path only — the
-          // plaintext localhost relay-agent path is refused for a credential.
-          const localFp = resolvePeerFingerprint(localTarget) ?? '';
-          if (refuseCredentialShareIfBlocked(localFp)) return;
+        // §3.5: a credential never takes the localhost relay-agent route, which is
+        // plaintext. It is judged here first (same refusal as before), then goes to the
+        // relay leg below, through the pinned encrypted send.
+        if (localTarget?.port && !isSelfTarget && isCredentialShareSend) {
+          if (refuseCredentialShareIfBlocked(resolvePeerFingerprint(localTarget) ?? '')) return;
+        }
+        if (localTarget?.port && !isSelfTarget && !isCredentialShareSend) {
           // Check if the local agent is actually running
           try {
             const healthResp = await fetch(`http://localhost:${localTarget.port}/threadline/health`, {
@@ -37613,8 +37755,20 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
           backupRouteCounters.unmarkedFallthroughAfterPost++;
         }
       }
-      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } =
-        (fallthrough?.marked || (forwardedRequest && req.body?.resend === true))
+      const relayLegResend = Boolean(fallthrough?.marked || (forwardedRequest && req.body?.resend === true));
+      // A credential that passed the gate goes ONLY through the pinned encrypted send
+      // (FD4 v2): encrypted to the verified identity key and the key derived from it,
+      // never to a cached encryption key and never plaintext.
+      const pinnedForCredential = isCredentialShareSend && verifiedPairingEnabled
+        ? ctx.unifiedTrust?.trustManager?.getProfileByFingerprint(resolvedId)?.peerIdentityPub
+        : undefined;
+      if (isCredentialShareSend && verifiedPairingEnabled && (!pinnedForCredential || typeof relayClient.sendCredentialToPinned !== 'function')) {
+        res.status(403).json({ success: false, refused: true, reason: 'credential-requires-encrypted-path', error: 'Credential-share refused: credential-requires-encrypted-path.' });
+        return;
+      }
+      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } = pinnedForCredential
+        ? relayClient.sendCredentialToPinned(resolvedId, pinnedForCredential, message, relayLegThreadId, msgId, relayLegResend || undefined)
+        : relayLegResend
           ? relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId, true)
           : relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId);
       // waitForReply: the reply listener is registered NOW, before any await, so

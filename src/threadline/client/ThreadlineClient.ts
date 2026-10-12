@@ -15,6 +15,8 @@ import { IdentityManager, type IdentityInfo } from './IdentityManager.js';
 import { MessageEncryptor, type PlaintextMessage } from './MessageEncryptor.js';
 import { AUTO_ACK_TYPE, encodePlaintextPayload } from '../autoAck.js';
 import { RelayClient } from './RelayClient.js';
+import { derivePairingIdV2, edPublicToX25519, isX25519BoundToIdentity } from '../ThreadlineCrypto.js';
+import { buildPairVerifyReceipt, PAIR_VERIFY_OP } from '../PairVerifyReceipt.js';
 import type { PeerPresenceRead } from '../peerDark.js';
 import { DEFAULT_RELAY_URL } from '../constants.js';
 import {
@@ -111,6 +113,7 @@ export class ThreadlineClient extends EventEmitter {
   private encryptor: MessageEncryptor | null = null;
   private relayClient: RelayClient | null = null;
   private identity: IdentityInfo | null = null;
+  private pinnedKeyResolver: ((fp: string) => Buffer | null) | null = null;
   private readonly knownAgents = new Map<AgentFingerprint, KnownAgent>();
   /** threadId of the most recent send()/sendPlaintext() envelope (synchronous; read by sendAutoWithThread). */
   private lastWireThreadId: string | null = null;
@@ -499,6 +502,71 @@ export class ThreadlineClient extends EventEmitter {
   }
 
   /**
+   * Send a credential to a verified peer (spec §3.5 / FD4 v2). Encrypts to the PINNED
+   * identity key the operator verified and to the X25519 key derived from it — never to
+   * an encryption key held in the known-agent cache, which the relay may have supplied.
+   * There is no plaintext fallback: if the pinned key does not belong to this recipient,
+   * it throws.
+   */
+  sendCredentialToPinned(
+    recipientId: AgentFingerprint,
+    pinnedIdentityPubHex: string,
+    content: string,
+    threadId?: string,
+    callerMessageId?: string,
+    resend?: boolean,
+  ): { messageId: string; threadId: string } {
+    return this.sendToPinned(recipientId, pinnedIdentityPubHex, resend ? { content, resend: true } : { content }, threadId, callerMessageId);
+  }
+
+  /**
+   * Send the signed `pair-verify` receipt after this side's operator confirmed the words
+   * (spec §3.4). The receipt is signed with our identity key and travels encrypted to the
+   * peer's PINNED key, the same route as a credential: the receiver reads it from the
+   * decrypted content, which the plaintext path would flatten. It only ever sets the
+   * peer's optional `peerAcked` flag.
+   */
+  sendPairVerifyReceipt(
+    recipientId: AgentFingerprint,
+    pinnedIdentityPubHex: string,
+    args: { pairingId: string; sasFingerprint: string },
+  ): string {
+    if (!this.identity) throw new Error('Not connected');
+    const receipt = buildPairVerifyReceipt(this.identity.privateKey, {
+      pairingId: args.pairingId,
+      ownFp: this.identity.fingerprint,
+      peerFp: String(recipientId),
+      sasFingerprint: args.sasFingerprint,
+    });
+    return this.sendToPinned(recipientId, pinnedIdentityPubHex, { content: PAIR_VERIFY_OP, ...receipt }).messageId;
+  }
+
+  private sendToPinned(
+    recipientId: AgentFingerprint,
+    pinnedIdentityPubHex: string,
+    message: PlaintextMessage,
+    threadId?: string,
+    callerMessageId?: string,
+  ): { messageId: string; threadId: string } {
+    if (!this.encryptor || !this.relayClient) {
+      throw new Error('Not connected');
+    }
+    const pinned = Buffer.from(pinnedIdentityPubHex, 'hex');
+    if (pinned.length !== 32 || pinned.subarray(0, 16).toString('hex') !== String(recipientId).toLowerCase()) {
+      throw new Error('Pinned identity key does not match the recipient fingerprint');
+    }
+    const tId = threadId
+      ?? this.peekClientAffinity(recipientId)
+      ?? `thread-${this.nowFn()}-${Math.random().toString(36).slice(2, 8)}`;
+    const envelope = this.encryptor.encrypt(pinned, edPublicToX25519(pinned), tId, message, callerMessageId);
+    this.relayClient.sendMessage(envelope);
+    this.noteSent(envelope.messageId);
+    this.recordClientAffinity(recipientId, tId);
+    this.lastWireThreadId = tId;
+    return { messageId: envelope.messageId, threadId: tId };
+  }
+
+  /**
    * Whether the ENCRYPTED+SIGNED send path is available for a recipient — i.e. we
    * know its keys so `send()`/`sendAuto()` would use MessageEncryptor.encrypt rather
    * than the plaintext fallback. Mirrors the exact key check in `sendAuto`.
@@ -510,6 +578,64 @@ export class ThreadlineClient extends EventEmitter {
   hasEncryptedSendPath(recipientId: AgentFingerprint): boolean {
     const known = this.knownAgents.get(recipientId);
     return Boolean(known?.publicKey && known?.x25519PublicKey);
+  }
+
+  /**
+   * Fetch a peer's Ed25519 identity key from the relay's public A2A card
+   * (GET /v1/registry/agent/:fp/a2a-card → x-threadline.publicKey), for verified
+   * pairing v2 when the key is not in the known-agent cache (spec §3.0). The key is
+   * relay-supplied, which is acceptable for pairing: a substituted key yields different
+   * words, and the human comparison catches it. Returns null unless the key is 32 bytes
+   * and its first 16 bytes are exactly `recipientId` (the fingerprint rule). Never throws.
+   */
+  async fetchPeerIdentityKey(recipientId: AgentFingerprint, timeoutMs = 10_000): Promise<Buffer | null> {
+    try {
+      const fp = String(recipientId).toLowerCase();
+      if (!/^[0-9a-f]{32}$/.test(fp)) return null;
+      const wsUrl = new URL(this.config.relayUrl ?? DEFAULT_RELAY_URL);
+      const httpBase = `${wsUrl.protocol === 'ws:' ? 'http:' : 'https:'}//${wsUrl.host}`;
+      const res = await fetch(`${httpBase}/v1/registry/agent/${fp}/a2a-card`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) return null;
+      const card = (await res.json()) as { 'x-threadline'?: { publicKey?: unknown } };
+      const b64 = card?.['x-threadline']?.publicKey;
+      if (typeof b64 !== 'string') return null;
+      const key = Buffer.from(b64, 'base64');
+      if (key.length !== 32 || key.subarray(0, 16).toString('hex') !== fp) return null;
+      return key;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Whether the channel a credential would travel on is bound to the pairing a human
+   * verified (spec §3.5 / FD4 v2, issue #2117 gap I). TRUE only when ALL hold:
+   *  - the peer's currently-known Ed25519 key is exactly the pinned key the human verified;
+   *  - the peer's X25519 key (the one encrypt() would use) is the key DERIVED from that
+   *    identity key — a relay-supplied encryption key that does not match is never trusted;
+   *  - the pairingId recomputed from OUR current identity key and the pinned key equals the
+   *    recorded one, so a rotation of our own key since verification invalidates it.
+   * Never throws; any doubt is false (fail-closed, FD9).
+   */
+  isChannelBoundToPairing(recipientId: AgentFingerprint, pinnedIdentityPubHex: string, pairingId: string | null): boolean {
+    try {
+      const known = this.knownAgents.get(recipientId);
+      const own = this.identity?.publicKey;
+      if (!own || !pinnedIdentityPubHex) return false;
+      const pinned = Buffer.from(pinnedIdentityPubHex, 'hex');
+      if (pinned.length !== 32 || pinned.subarray(0, 16).toString('hex') !== String(recipientId).toLowerCase()) return false;
+      // The pinned key the operator verified is the authority (Echo's second review): an
+      // empty cache (e.g. after a restart) is fine, and only a DIFFERENT cached key refuses.
+      if (known?.publicKey && !crypto.timingSafeEqual(pinned, known.publicKey)) return false;
+      // The credential path encrypts to the key DERIVED from the pinned identity key (spec
+      // §3.5), so a relay-supplied X25519 key is irrelevant here; if one is cached and
+      // disagrees, that is a substitution signal and we refuse.
+      if (known?.x25519PublicKey && !isX25519BoundToIdentity(pinned, known.x25519PublicKey)) return false;
+      // An inherited pairing (pairingId null) binds on the pinned key alone.
+      return pairingId === null ? true : derivePairingIdV2(own, pinned) === pairingId;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -878,6 +1004,41 @@ export class ThreadlineClient extends EventEmitter {
   }
 
   /**
+   * Remember a peer's Ed25519 identity key learned while starting a verified pairing
+   * (spec FD4a). MERGES into the known-agent entry; it never sets or replaces an X25519
+   * key, because a derived encryption key would switch ordinary sends to encryption for
+   * peers that may not decrypt. Refuses a key whose first 16 bytes are not the fingerprint,
+   * and never overwrites a DIFFERENT cached identity key (that is a substitution signal for
+   * the operator, not something to resolve silently). Returns whether the key is now cached.
+   */
+  /**
+   * Where to find a peer's PINNED identity key (the one an operator verified) when the
+   * in-memory cache has none, as after every restart. Wired by the bootstrap to the trust
+   * manager. Returns null for a peer with no live pairing.
+   */
+  setPinnedKeyResolver(resolver: ((fp: string) => Buffer | null) | null): void {
+    this.pinnedKeyResolver = resolver;
+  }
+
+  private resolvePinnedKey(fp: string): Buffer | null {
+    try {
+      const key = this.pinnedKeyResolver?.(String(fp).toLowerCase()) ?? null;
+      return key && key.length === 32 && key.subarray(0, 16).toString('hex') === String(fp).toLowerCase() ? key : null;
+    } catch {
+      return null;
+    }
+  }
+
+  rememberPeerIdentityKey(agentId: AgentFingerprint, identityKey: Buffer, name?: string): boolean {
+    const fp = String(agentId).toLowerCase();
+    if (identityKey.length !== 32 || identityKey.subarray(0, 16).toString('hex') !== fp) return false;
+    const existing = this.knownAgents.get(fp);
+    if (existing?.publicKey) return crypto.timingSafeEqual(existing.publicKey, identityKey);
+    this.knownAgents.set(fp, { ...(existing ?? { agentId: fp, name: name ?? fp }), publicKey: identityKey } as KnownAgent);
+    return true;
+  }
+
+  /**
    * Disconnect from the relay.
    */
   disconnect(): void {
@@ -1039,20 +1200,42 @@ export class ThreadlineClient extends EventEmitter {
   private handleIncomingMessage(envelope: MessageEnvelope): void {
     if (!this.encryptor) return;
 
-    // Look up sender's public key
+    // The sender's identity key: the cached one, or else the key pinned by a verified
+    // pairing. The in-memory cache is empty after a restart, so the pinned key in the
+    // trust profile is the authority (spec FD4a).
     const sender = this.knownAgents.get(envelope.from);
-    if (!sender?.publicKey || !sender?.x25519PublicKey) {
+    const senderPub = sender?.publicKey ?? this.resolvePinnedKey(envelope.from);
+    if (!senderPub) {
       // Unknown sender — we can't decrypt without their keys
       this.emit('unknown-sender', envelope);
       return;
     }
 
-    try {
-      const plaintext = this.encryptor.decrypt(envelope, sender.publicKey, sender.x25519PublicKey);
+    let plaintext: PlaintextMessage;
+    if (sender?.publicKey && sender.x25519PublicKey) {
+      try {
+        plaintext = this.encryptor.decrypt(envelope, sender.publicKey, sender.x25519PublicKey);
+      } catch (err) {
+        this.emit('decrypt-error', { envelope, error: err });
+        return;
+      }
+    } else {
+      // We hold only the sender's identity key. A credential or receipt from a paired peer
+      // arrives encrypted to keys derived from the two identity keys (spec FD4 v2), so try
+      // the key derived from it. Anything that does not open that way (every plaintext
+      // envelope) goes exactly where it went before: the unknown-sender path.
+      try {
+        plaintext = this.encryptor.decrypt(envelope, senderPub, edPublicToX25519(senderPub));
+      } catch {
+        this.emit('unknown-sender', envelope);
+        return;
+      }
+    }
 
+    try {
       const received: ReceivedMessage = {
         from: envelope.from,
-        fromName: sender.name,
+        fromName: sender?.name ?? envelope.from,
         threadId: envelope.threadId,
         messageId: envelope.messageId,
         content: plaintext,

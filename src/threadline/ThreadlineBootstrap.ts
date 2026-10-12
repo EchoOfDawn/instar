@@ -447,6 +447,18 @@ export async function bootstrapThreadline(
       stateDir: config.stateDir,
     });
 
+    // Verified pairing (spec FD4a): the peer's PINNED identity key lives in the trust
+    // profile, which survives a restart; the client's key cache does not. Without this, a
+    // credential or receipt between two verified agents fails after either one restarts
+    // (Echo's second review of #2173). Only a live pairing yields a key.
+    const pinnedTrust = trustManager;
+    relayClient.setPinnedKeyResolver((fp) => {
+      const p = pinnedTrust?.getProfileByFingerprint(fp);
+      if (!p?.peerIdentityPub) return null;
+      if (p.pairingState !== 'pending-verification' && p.pairingState !== 'mutual-verified' && p.pairingState !== 'identity-verified') return null;
+      return Buffer.from(p.peerIdentityPub, 'hex');
+    });
+
     // Create inbound message gate (imports ThreadlineRouter lazily if needed)
     // For now, router is not available at bootstrap time — it's created in server.ts
     // The gate will be wired to the router after server setup

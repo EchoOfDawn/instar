@@ -131,3 +131,40 @@ describe('migrateClaudeMd — Verified Pairing awareness reaches EXISTING agents
     expect(afterSecond.match(/Verified Pairing — is my channel to a peer mutually verified/g)!.length).toBe(1);
   });
 });
+
+describe('migrateClaudeMd — Verified Pairing v2 REPLACES a v1 section in place', () => {
+  let projectDir: string;
+  let claudeMdPath: string;
+  beforeEach(() => {
+    projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'instar-vp2-md-'));
+    fs.mkdirSync(path.join(projectDir, '.instar'), { recursive: true });
+    claudeMdPath = path.join(projectDir, 'CLAUDE.md');
+  });
+  afterEach(() => {
+    SafeFsExecutor.safeRmSync(projectDir, { recursive: true, force: true, operation: 'tests/unit/PostUpdateMigrator-verifiedPairing.test.ts:v2-cleanup' });
+  });
+
+  it('replaces the v1 section with v2, keeps what follows, and is idempotent', () => {
+    fs.writeFileSync(claudeMdPath, '# CLAUDE.md\n\n### Verified Pairing — is my channel to a peer mutually verified before I share a secret?\n\nv1 text: each side renders 6 words.\n\n### Something Else\n\nkeep me\n');
+    const first = runClaudeMdMigration(projectDir);
+    expect(first.upgraded.some((u) => u.includes('replaced the Verified Pairing section'))).toBe(true);
+    const after = fs.readFileSync(claudeMdPath, 'utf-8');
+    expect(after).not.toContain('6 words');
+    expect(after).toContain('12 words');
+    expect(after).toContain('/threadline/pairing/:peerFp/start');
+    expect(after).toContain('### Something Else\n\nkeep me');
+    expect(after.match(/### Verified Pairing — is my channel/g)!.length).toBe(1);
+    runClaudeMdMigration(projectDir);
+    expect(fs.readFileSync(claudeMdPath, 'utf-8')).toBe(after);
+  });
+
+  it('leaves a new agent whose template already teaches v2 untouched', () => {
+    const md = generateClaudeMd('test', 'TestAgent', 4042, false);
+    expect(md).toContain('/threadline/pairing/:peerFp/start');
+    expect(md).toContain('12 words');
+    expect(md).not.toMatch(/renders 6 words/);
+    fs.writeFileSync(claudeMdPath, md);
+    const r = runClaudeMdMigration(projectDir);
+    expect(r.upgraded.some((u) => u.includes('Verified Pairing'))).toBe(false);
+  });
+});

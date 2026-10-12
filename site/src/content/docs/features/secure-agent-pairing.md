@@ -1,39 +1,38 @@
 ---
 title: Secure Agent Pairing (Verified Pairing)
-description: Mutual out-of-band identity verification (a 6-word SAS) that lets two agents prove who they're talking to before any credential is shared — defeating relay/man-in-the-middle substitution.
+description: Mutual out-of-band identity verification (a 12-word check) that lets two agents prove who they're talking to before any credential is shared — defeating relay/man-in-the-middle key substitution.
 ---
 
-Two Instar agents on different machines can already exchange encrypted, signed messages. What they could *not* do is **prove** the agent on the other end is the one their operator actually trusts, rather than an impostor sitting in the middle swapping identities. That gap had a concrete cost: an agent correctly *refused* to send a credential to a peer it couldn't verify. Secure Agent Pairing closes it.
+Two Instar agents can already exchange encrypted, signed messages through the relay. What they could *not* do is **prove** that the agent on the other end is the one their operator actually trusts, rather than an impostor in the middle swapping keys. That gap had a concrete cost: an agent correctly *refused* to send a credential to a peer it couldn't verify. Secure Agent Pairing closes it.
 
-It works like verifying a contact on Signal or pairing Bluetooth headphones: both agents compute the **same short 6-word code** from their handshake, a human (the operator) confirms the two codes match out-of-band, and only then can the two agents share a credential.
+It works like verifying a contact on Signal. Both agents compute the **same 12-word code** from their two identity keys. A person compares the two codes over a channel the relay can't touch, and only then can the two agents share a credential.
 
 ## What it does
 
-- **Out-of-band identity verification (SAS).** From the handshake's shared secret, both sides deterministically derive an identical 6-word **Short Authentication String** (66 bits, from a vendored BIP-39 wordlist). A man-in-the-middle who substituted a key produces a *different* shared secret — so the two codes won't match, and the operator catches it. The SAS is never transmitted; only a non-reversible `sasFingerprint` is ever logged.
-- **Operator-confirmed, not self-granted.** Confirming a match requires the operator's **dashboard PIN** — the agent's own API token is structurally insufficient. An agent can never approve its own pairing.
-- **A credential-share gate that fails closed.** Once two agents are *mutually verified*, a dedicated `credential-share` operation opens between them. A credential send to a peer that is **not** mutually verified is refused, refused over any unencrypted path, and refused on any uncertainty (fail-closed).
-- **The verification follows you across machines.** A pairing verified on one machine is honored on your others — but only after pinning the peer's exact identity key. The secret material (the SAS, the shared secret, the relay token) never leaves the machine that made it.
+- **Out-of-band identity verification.** Each side derives 12 words (132 bits, from a vendored BIP-39 wordlist) from the two agents' Ed25519 identity keys. If the relay substituted a key, the two sides get different words and the person comparing them catches it. The words are not secret; anyone who knows both public keys can work them out. The protection is the comparison.
+- **Why 12 words.** A relay that swaps keys controls both of its fake keys, so it could search offline for a pair that makes both people see the same words. Against 6 words that search takes hours on ordinary hardware; against 12 it is out of practical reach.
+- **Typed, not eyeballed.** To confirm, the operator types the 12 words the *other* side shows, and the server compares all 12 in order. Any difference is treated as a failed match.
+- **Operator-confirmed, never self-granted.** Confirming or denying requires the operator's **dashboard PIN**; the agent's own API token cannot do it. A denied match stays denied until an operator clears it with the PIN.
+- **A credential gate that fails closed.** A credential goes only to a verified peer, and it is encrypted to the peer's verified identity key and the encryption key derived from it, never to a key the relay handed over and never in plaintext. Any doubt refuses.
+- **It follows you across machines.** A pairing verified on one of your machines is honored on the others, pinned to the peer's exact identity key. The words themselves never leave the machine that showed them.
 
 ## How it works under the hood
 
-The cryptographic foundation already existed in Threadline — Secure Agent Pairing adds the *identity-binding* and *policy* layer on top of it:
-
-- **`ThreadlineCrypto`** gains the SAS primitives: `deriveSAS` (the 6 words), `deriveSasFingerprint` (the loggable fingerprint), and `derivePairingId` (a per-handshake epoch id that invalidates a stale verification when a new handshake replaces it). These reuse the same HKDF-SHA256 that `ThreadlineCrypto` already uses for the relay token, with domain-separated `info` strings so the SAS, fingerprint, pairing id, and relay token can never collide.
-- **`HandshakeManager`** is where the SAS is derived inline at handshake completion (the live shared secret is in memory there); the raw secret is never persisted.
-- **`AgentTrustManager`** records the result. It gains a new trust source, `mutual-verified`, that is **structurally un-self-grantable**: only the dedicated `markMutualVerified` method can set it, the generic trust setter rejects it, and an unknown trust source degrades to un-verified. The pairing state lives on the trust profile itself (a single atomic writer), so there is no torn cross-file state.
-- **`PairingPendingStore`** holds the SAS words for an in-progress verification in a machine-local `0600` file, so the operator can re-read the code after a restart; it is discarded the moment the pairing resolves. The words live here, never in the replicated trust profile.
-- **`CredentialShareGate`** is the enforcement chokepoint. Its `assertCanShareCredential` is the agent-facing read, but the real guarantee lives inside the relay-send funnel: every outbound credential passes through it, keyed on *who the peer is* (their trust source), never on a message label or content the sender controls. It refuses a credential over the plaintext fallback path (`MessageEncryptor`'s encrypted+signed path only).
-- **`PairVerifyReceipt`** handles the `pair-verify` control-plane message — the peer's signed acknowledgement that it computed the same SAS. The receipt is fully validated (Ed25519 signature against the pinned identity key, pairing-id match, fingerprint match, replay protection) before it can change anything, and it can only set an optional liveness flag — it can never flip a pairing to verified on its own. The operator's confirmation is the load-bearing step.
-- **`InboundMessageGate`** routes an inbound credential-bearing message through the same sender-keyed decision, so an unverified peer's payload is never acted on as a credential.
-- **`ThreadlinePairingReplicatedStore`** replicates *only* the verified-identity result `{ peerFp, peerIdentityPub, state, verifiedAt, verifiedOnMachine }` across your machines, riding the same hardened multi-machine state-sync machinery as the relationships and learnings stores. It can never carry the SAS, the shared secret, or the relay token — the serializer projects an explicit closed field set. A machine honors an inherited verification only by pinning the peer's identity key, and still requires its own live encrypted channel before a credential can flow.
+- **`ThreadlineCrypto`** derives the 12 words (`deriveSASv2`), a loggable fingerprint of them (`deriveSasFingerprintV2`), and a pairing id that identifies the key pair (`derivePairingIdV2`), using HKDF-SHA256 with domain-separated labels. `edPublicToX25519` derives a peer's encryption key from its identity key (the standard RFC 7748 map), so the credential path never trusts an encryption key the relay supplied.
+- **Starting a pairing** (`POST /threadline/pairing/:peerFp/start`, authenticated with the agent's token) takes the peer's identity key from the agent's cache, or from the relay's public agent card. The key must match the fingerprint. Starting records a pending pairing and grants nothing.
+- **`AgentTrustManager`** records the result under a trust source, `mutual-verified`, that only `markMutualVerified` can set.
+- **`PairingPendingStore`** keeps a pending pairing's words in a machine-local `0600` file until it resolves.
+- **`CredentialShareGate`** is the enforcement point inside the relay-send funnel. It is keyed on *who the peer is*, never on a message label or content.
+- **`PairVerifyReceipt`** handles the peer's signed acknowledgement. It is checked (signature first, then freshness) before it can change anything, and it only ever sets an optional "the other side confirmed too" flag.
+- **`ThreadlinePairingReplicatedStore`** replicates only the verified result `{ peerFp, peerIdentityPub, state, verifiedAt, verifiedOnMachine }` across your machines.
 
 ## Using it
 
-- **Is my channel to a peer mutually verified?** `GET /threadline/pairing` lists every pairing and its state; `GET /threadline/pairing/:peerFp` shows one (the SAS words appear only while pending **and** only to a PIN-authenticated operator request).
-- **To pair:** drive the `threadline_pair` MCP tool (`status`) or the dashboard pairing panel to see the pending code, compare it with the peer's, and confirm the match — the confirm (`POST /threadline/pairing/:peerFp/verify`) requires your dashboard PIN.
-- **Never send a peer a secret until the pairing shows `mutual-verified`** — the gate enforces this, but knowing it lets you pair *first* instead of hitting a refusal.
+- **Is my channel to a peer verified?** `GET /threadline/pairing` lists every pairing and its state.
+- **To pair:** both agents start the pairing (`threadline_pair` with `action: "start"`). Each operator reads their own 12 words (`GET /threadline/pairing/:peerFp` with the dashboard PIN), then types the other side's 12 words to confirm (`POST /threadline/pairing/:peerFp/verify` with `words` and the PIN). The dashboard's Threadline tab has a Verified Pairing panel that does the same from a phone: enter your PIN to see your words, type the other side's 12 words, confirm.
+- **Never send a peer a secret until the pairing shows `mutual-verified`.** The gate enforces this, but knowing it lets you pair first instead of hitting a refusal.
 - A failed match (a probable man-in-the-middle) raises a single high-priority attention item and forces the peer back to untrusted.
 
 ## Safety posture
 
-The whole feature ships **dark**: the credential gate is behind `threadline.verifiedPairing.*` and the cross-machine replication behind `multiMachine.stateSync.threadlinePairing` (hard-dark by default). When disabled, behavior is byte-identical to before. When enabled, the credential-leak protection is fail-closed from the first moment — a leak-prevention gate has no "log it but allow it anyway" warm-up. It is precise about scope: it guards the sanctioned credential-sharing path, not arbitrary secrets pasted into free-text messages (that is the External Operation Gate's concern).
+The whole feature ships **dark** behind `threadline.verifiedPairing.*` (cross-machine replication behind `multiMachine.stateSync.threadlinePairing`). When disabled, behavior is unchanged. When enabled, the credential protection is fail-closed from the first moment. It is precise about scope: it guards the sanctioned credential-sharing path, not secrets pasted into ordinary messages.

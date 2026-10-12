@@ -1042,6 +1042,24 @@
     .mnd-reason-cell { color: var(--text-dim); }
     .mnd-audit-head { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
     .mnd-dim { font-size: 13px; color: var(--text-dim); }
+    .pair-card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-top: 10px; }
+    .pair-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+    .pair-state { font-size: 13px; color: var(--text-dim); }
+    .pair-state-verification-failed { color: #f85149; }
+    .pair-state-mutual-verified, .pair-state-identity-verified { color: #3fb950; }
+    .pair-step { margin-top: 10px; }
+    .pair-step-title { font-size: 13px; margin-bottom: 6px; }
+    .pair-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+    .pair-own-words { columns: 3; font-family: ui-monospace, monospace; font-size: 15px; margin: 6px 0; }
+    .pair-words { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+    .pair-word { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); }
+    .pair-word input { flex: 1; min-width: 0; padding: 6px; font-family: ui-monospace, monospace; font-size: 15px; }
+    .pair-meta { font-size: 11px; color: var(--text-dim); margin-top: 8px; }
+    @media (max-width: 640px) {
+      .pair-own-words { columns: 2; }
+      .pair-words { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pair-row .mnd-pin, .pair-row .mnd-btn { flex: 1 1 100%; width: 100%; }
+    }
     /* Mobile-first (item 5): at phone width the 5-column audit table stacks into
        labelled rows so the reason — the useful column — is never truncated. */
     @media (max-width: 640px) {
@@ -4208,6 +4226,17 @@
         <div id="tlBridgeError" style="color:var(--err, #c44);font-size:12px;display:none"></div>
       </div>
 
+      <!-- Verified pairing — the 12-word check (docs/specs/secure-a2a-verified-pairing.md §3.6) -->
+      <div id="pairCard" class="mnd-card" style="border:1px solid var(--border);border-radius:8px;padding:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <strong>Verified pairing</strong>
+          <button onclick="startPairingPanel()" class="mnd-btn mnd-btn-quiet" style="padding:6px 12px">Refresh</button>
+        </div>
+        <div class="mnd-hint">Confirm another agent is really who it says it is: compare 12 words with its operator before it can be sent credentials.</div>
+        <div id="pairNotice" class="mnd-notice"></div>
+        <div id="pairList"></div>
+      </div>
+
       <!-- Conversation observability — threads list + message stream + search -->
       <div style="border:1px solid var(--border);border-radius:8px;padding:0;display:flex;flex-direction:column;min-height:480px">
         <!-- Toolbar -->
@@ -5990,6 +6019,7 @@
         onActivate: () => {
           if (typeof loadThreadlineBridgeConfig === 'function') loadThreadlineBridgeConfig();
           if (typeof tlObsLoadThreads === 'function') tlObsLoadThreads();
+          if (typeof startPairingPanel === 'function') startPairingPanel();
         },
       },
       {
@@ -10411,6 +10441,26 @@
         const metrics = [['merges','Merges'],['medianLatencyH','Median latency (h)'],['reworkLoops','Rework loops'],['reverts','Reverts'],['medianPushIters','Median push iterations'],['medianLoc','Changed lines'],['index','Composite index']];
         host.innerHTML = metrics.map(([key,label]) => { const vals = data.rows.map(x => Number((key === 'index' ? x.team : author === 'team' ? x.team : (x.authors[author] || {}))[key] || 0)); const max = Math.max(1,...vals); const bars = vals.map((v,i) => '<div title="'+data.rows[i].day+': '+v+'" style="height:'+Math.max(3,Math.round(v/max*100))+'%;flex:1;background:'+(key==='index'?'#7c9cff':'#4bbf9f')+';border-radius:3px 3px 0 0"></div>').join(''); return '<section style="border:1px solid var(--border,#2a2a2a);border-radius:10px;padding:14px;'+(key==='index'?'grid-column:1/-1;':'')+'"><div style="font-weight:600;margin-bottom:10px">'+label+'</div><div style="height:'+(key==='index'?'180':'130')+'px;display:flex;align-items:end;gap:3px">'+bars+'</div><div style="opacity:.55;font-size:11px;margin-top:7px">latest: '+(vals.at(-1) ?? 0)+'</div></section>'; }).join('');
       } catch { host.innerHTML = '<div style="opacity:.7">Throughput data is temporarily unavailable.</div>'; }
+    }
+
+    // ── Verified pairing panel (Threadline tab; secure-a2a-verified-pairing §3.6) ──
+    // Lazy-loaded like Mandates. The PIN typed here is sent once per action, never stored.
+    let __pairController = null;
+    let __pairModule = null;
+    async function startPairingPanel() {
+      if (!__pairModule) {
+        try { __pairModule = await import('/dashboard/pairing.js'); }
+        catch (e) { console.error('[pairing] module load failed', e); return; }
+      }
+      if (!__pairController) {
+        const els = { list: document.getElementById('pairList'), notice: document.getElementById('pairNotice') };
+        const fetchImpl = (url, opts = {}) => fetch(url, {
+          ...opts,
+          headers: { 'Authorization': `Bearer ${token}`, ...(opts.headers || {}) },
+        });
+        __pairController = __pairModule.createController({ doc: document, els, fetchImpl });
+      }
+      __pairController.start();
     }
 
     // ── Mandates tab (coordination-mandate spec, decision 2A) ──

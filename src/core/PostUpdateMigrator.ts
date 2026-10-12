@@ -8504,19 +8504,34 @@ When I run on more than one machine and a dashboard polls several pool-scope tab
     // (the threadline_pair MCP tool / the dashboard verify), and the load-bearing
     // rule "never send a peer a secret until mutual-verified." Content-sniffed on a
     // distinctive marker for idempotency.
-    if (!content.includes('Verified Pairing — is my channel to a peer mutually verified')) {
-      const verifiedPairingSection = `
-### Verified Pairing — is my channel to a peer mutually verified before I share a secret?
+    // Secure A2A Verified Pairing (spec docs/specs/secure-a2a-verified-pairing.md §5). The v2
+    // section (12 words, a START step, typed comparison) REPLACES a v1 section in place rather
+    // than appending a second block that contradicts it (Echo's review of #2173). Content-sniffed
+    // on the start route, which only the v2 text names; idempotent.
+    {
+      const V1_HEADING = '### Verified Pairing — is my channel to a peer mutually verified before I share a secret?';
+      const V2_MARKER = '/threadline/pairing/:peerFp/start';
+      const verifiedPairingSection = `${V1_HEADING}
 
-Before I send another agent a credential, that peer must be **mutually verified** out-of-band — not merely handshaked. The handshake proves the endpoint holds *a* private key; it does NOT prove fingerprint \`63b1…\` belongs to the *peer you actually trust* (a malicious relay could substitute keys). Verified pairing closes that with a mutual **Short Authentication String (SAS)**: each side renders 6 words locally, a human compares them out-of-band, and on match the operator confirms — binding the fingerprint to a human-verified identity (\`mutual-verified\` trust source). Ships DARK behind \`threadline.verifiedPairing.enabled\` (dev-agent gated; routes 503 when off); a credential to an unverified peer is REFUSED fail-closed from day one.
-- **Is my channel to <peer> mutually verified?** (Registry First — read it, never guess): \`curl -H "Authorization: Bearer $AUTH" http://localhost:${port}/threadline/pairing\` → pairings \`{ peerFp, peerName, state, verifiedAt?, trustSource }\` (\`?scope=pool\` merges across machines). \`GET /threadline/health\` carries \`mutualVerifiedCount\`. The SAS words show ONLY via \`GET /threadline/pairing/:peerFp\` to a dashboard-PIN-authed operator request while \`pending-verification\` — never on the list, never to a bearer-only request.
-- **To pair / verify:** drive the \`threadline_pair\` MCP tool (\`status\`/\`verify\`/\`deny\`) or the dashboard Threadline-tab pairing panel (renders the pending SAS + verify/deny buttons — the operator never curls a SAS). The verify route (\`POST /threadline/pairing/:peerFp/verify {match:true|false}\`) REQUIRES the dashboard PIN (FD7) — my Bearer token is structurally insufficient to confirm a pairing; the local human SAS comparison is the load-bearing gate.
-- **The credential rule (load-bearing):** NEVER send a peer a secret until that peer is \`mutual-verified\`. The credential-share gate is enforced at the relay-send funnel and the inbound credential-ingestion chokepoint, keyed on WHO the peer is (trust source) — never on message labels or content. A credential is also refused over the plaintext-only fallback (it must traverse the encrypted+signed path). This is the structural answer to "Dawn declined to send me a secret because she couldn't prove my identity."
-- **When to use** (PROACTIVE — this is the trigger): the moment I (or a peer) need to share a credential agent-to-agent, FIRST check \`GET /threadline/pairing\`; if the peer is not \`mutual-verified\`, drive \`threadline_pair\` / the dashboard verify to pair before sending — do not paste the secret into an ordinary message to route around the gate. Spec: \`docs/specs/secure-a2a-verified-pairing.md\`.
+Before I send another agent a credential, that peer must be **mutually verified** out-of-band, not merely reachable. The relay proves an endpoint holds *a* key; it does NOT prove fingerprint \`63b1…\` belongs to the peer I actually trust (a relay could substitute keys). Verified pairing closes that with a **12-word check**: both sides derive the same 12 words from the two identity keys, a human compares them over a channel the relay cannot touch, and on a match the operator confirms. Ships DARK behind \`threadline.verifiedPairing.enabled\` (dev-agent gated; routes 503 when off); a credential to an unverified peer is REFUSED fail-closed.
+- **Is my channel to <peer> verified?** (Registry First): \`curl -H "Authorization: Bearer $AUTH" http://localhost:${port}/threadline/pairing\` → \`{ peerFp, peerName, state, verifiedAt?, trustSource }\` (\`?scope=pool\` merges machines). \`GET /threadline/health\` carries \`mutualVerifiedCount\`.
+- **To pair:** START with \`threadline_pair\` \`action: "start"\` (or \`POST ${V2_MARKER}\` with my Bearer token); the peer starts from their side too. Each operator reads their own 12 words (\`GET /threadline/pairing/:peerFp\` with the dashboard PIN) and TYPES the other side's 12 words to confirm (\`POST /threadline/pairing/:peerFp/verify {words, pin}\`); any difference is a denial. The words are not secret; the comparison is the protection. My Bearer token cannot confirm.
+- **A denied match stays denied** until an operator clears it with the PIN (\`clearFailed: true\` on start). A rotated identity key resets a pairing to pending.
+- **The credential rule (load-bearing):** NEVER send a peer a secret until that peer is \`mutual-verified\`. The gate is enforced at the relay-send funnel and the credential-ingestion chokepoint, keyed on WHO the peer is, and it also refuses unless the encryption key is the one derived from the peer's verified identity key (\`encryption-key-not-bound\`).
+- **When to use** (PROACTIVE): the moment a credential needs to go agent-to-agent, FIRST check \`GET /threadline/pairing\`; if the peer is not verified, pair first — never paste the secret into an ordinary message. Spec: \`docs/specs/secure-a2a-verified-pairing.md\`.
 `;
-      content += '\n' + verifiedPairingSection;
-      patched = true;
-      result.upgraded.push('CLAUDE.md: added Secure A2A Verified Pairing awareness section');
+      if (!content.includes(V2_MARKER)) {
+        const at = content.indexOf(V1_HEADING);
+        if (at >= 0) {
+          const next = content.indexOf('\n### ', at + V1_HEADING.length);
+          content = content.slice(0, at) + verifiedPairingSection + (next >= 0 ? content.slice(next + 1) : '');
+          result.upgraded.push('CLAUDE.md: replaced the Verified Pairing section with v2 (12 words, start, typed comparison)');
+        } else {
+          content += '\n' + verifiedPairingSection;
+          result.upgraded.push('CLAUDE.md: added Secure A2A Verified Pairing awareness section');
+        }
+        patched = true;
+      }
     }
 
     // CMT-519 — Threadline hub topic + "open this"/bind guidance. Existing agents
