@@ -66,7 +66,12 @@ describe('Verified pairing v2 — production path is alive', () => {
 
   async function bootSide(name: string, auth: string, relayUrl: string, port: number): Promise<Side> {
     const project = createTempProject();
-    const boot = await bootstrapThreadline({ agentName: name, stateDir: project.stateDir, projectDir: project.dir, port, relayEnabled: true, relayUrl });
+    // The same live config reader server.ts passes (spec §3.10); without it the inbound
+    // gate treats verified pairing as off and never processes a receipt.
+    const boot = await bootstrapThreadline({
+      agentName: name, stateDir: project.stateDir, projectDir: project.dir, port, relayEnabled: true, relayUrl,
+      getVerifiedPairingConfig: () => ({ enabled: true, dryRun: true, credentialShareEnforced: false }),
+    });
     expect(boot.relayClient?.connectionState).toBe('connected');
     expect(boot.trustManager).toBeDefined();
     const trust = createUnifiedTrustSystem(boot.trustManager!, { stateDir: project.stateDir });
@@ -152,13 +157,18 @@ describe('Verified pairing v2 — production path is alive', () => {
     expect(bare.body?.pairing?.sasWords).toBeUndefined();
   });
 
-  it('typing the other side\'s words confirms both sides, and the real binding check holds', async () => {
+  it('typing the other side\'s words confirms both sides, each side\'s receipt reaches the other, and the real binding check holds', async () => {
     const wa = await words(a, b);
     const wb = await words(b, a);
-    expect(await call(a, 'POST', `/threadline/pairing/${b.fp}/verify`, { words: wb, pin: PIN })).toMatchObject({ status: 200, body: { state: 'mutual-verified' } });
-    expect(await call(b, 'POST', `/threadline/pairing/${a.fp}/verify`, { words: wa, pin: PIN })).toMatchObject({ status: 200, body: { state: 'mutual-verified' } });
+    expect(await call(a, 'POST', `/threadline/pairing/${b.fp}/verify`, { words: wb, pin: PIN })).toMatchObject({ status: 200, body: { state: 'mutual-verified', receiptSent: true } });
+    expect(await call(b, 'POST', `/threadline/pairing/${a.fp}/verify`, { words: wa, pin: PIN })).toMatchObject({ status: 200, body: { state: 'mutual-verified', receiptSent: true } });
     const profile = a.boot.trustManager!.getProfileByFingerprint(b.fp)!;
     expect(profile.pairingState).toBe('mutual-verified');
+    // Each confirm sent ONE signed receipt over the relay, and the other side accepted it.
+    await vi.waitFor(() => {
+      expect(a.boot.trustManager!.getProfileByFingerprint(b.fp)!.peerAcked).toBe(true);
+      expect(b.boot.trustManager!.getProfileByFingerprint(a.fp)!.peerAcked).toBe(true);
+    }, { timeout: 10_000 });
     expect(a.boot.relayClient!.isChannelBoundToPairing(b.fp, profile.peerIdentityPub!, profile.pairingId ?? null)).toBe(true);
   });
 

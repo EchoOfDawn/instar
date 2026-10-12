@@ -18713,7 +18713,21 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(409).json({ error: 'could not confirm pairing (state/epoch mismatch or not pending) — re-handshake required' });
       return;
     }
-    res.json({ ok: true, peerFp, state: 'mutual-verified' });
+    // Tell the peer this side confirmed (spec §3.4): ONE signed receipt, encrypted to the
+    // pinned key. Best effort — the receipt only sets the peer's optional peerAcked flag,
+    // so a send failure never undoes or blocks the confirmation.
+    let receiptSent = false;
+    try {
+      const confirmed = trustManager.getProfileByFingerprint(peerFp);
+      const relay = ctx.threadlineRelayClient;
+      if (relay && typeof relay.sendPairVerifyReceipt === 'function' && confirmed?.peerIdentityPub && confirmed.sasFingerprint) {
+        relay.sendPairVerifyReceipt(peerFp, confirmed.peerIdentityPub, { pairingId, sasFingerprint: confirmed.sasFingerprint });
+        receiptSent = true;
+      }
+    } catch (err) {
+      console.warn(`[pairing] receipt to ${peerFp.slice(0, 12)} not sent: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    res.json({ ok: true, peerFp, state: 'mutual-verified', receiptSent });
   });
 
   // ── Negotiator lease state (Robustness Phase 1, FD-9) ──────────────────

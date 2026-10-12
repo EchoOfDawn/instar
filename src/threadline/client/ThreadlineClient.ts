@@ -16,6 +16,7 @@ import { MessageEncryptor, type PlaintextMessage } from './MessageEncryptor.js';
 import { AUTO_ACK_TYPE, encodePlaintextPayload } from '../autoAck.js';
 import { RelayClient } from './RelayClient.js';
 import { derivePairingIdV2, edPublicToX25519, isX25519BoundToIdentity } from '../ThreadlineCrypto.js';
+import { buildPairVerifyReceipt, PAIR_VERIFY_OP } from '../PairVerifyReceipt.js';
 import type { PeerPresenceRead } from '../peerDark.js';
 import { DEFAULT_RELAY_URL } from '../constants.js';
 import {
@@ -514,6 +515,38 @@ export class ThreadlineClient extends EventEmitter {
     callerMessageId?: string,
     resend?: boolean,
   ): { messageId: string; threadId: string } {
+    return this.sendToPinned(recipientId, pinnedIdentityPubHex, resend ? { content, resend: true } : { content }, threadId, callerMessageId);
+  }
+
+  /**
+   * Send the signed `pair-verify` receipt after this side's operator confirmed the words
+   * (spec §3.4). The receipt is signed with our identity key and travels encrypted to the
+   * peer's PINNED key, the same route as a credential: the receiver reads it from the
+   * decrypted content, which the plaintext path would flatten. It only ever sets the
+   * peer's optional `peerAcked` flag.
+   */
+  sendPairVerifyReceipt(
+    recipientId: AgentFingerprint,
+    pinnedIdentityPubHex: string,
+    args: { pairingId: string; sasFingerprint: string },
+  ): string {
+    if (!this.identity) throw new Error('Not connected');
+    const receipt = buildPairVerifyReceipt(this.identity.privateKey, {
+      pairingId: args.pairingId,
+      ownFp: this.identity.fingerprint,
+      peerFp: String(recipientId),
+      sasFingerprint: args.sasFingerprint,
+    });
+    return this.sendToPinned(recipientId, pinnedIdentityPubHex, { content: PAIR_VERIFY_OP, ...receipt }).messageId;
+  }
+
+  private sendToPinned(
+    recipientId: AgentFingerprint,
+    pinnedIdentityPubHex: string,
+    message: PlaintextMessage,
+    threadId?: string,
+    callerMessageId?: string,
+  ): { messageId: string; threadId: string } {
     if (!this.encryptor || !this.relayClient) {
       throw new Error('Not connected');
     }
@@ -521,7 +554,6 @@ export class ThreadlineClient extends EventEmitter {
     if (pinned.length !== 32 || pinned.subarray(0, 16).toString('hex') !== String(recipientId).toLowerCase()) {
       throw new Error('Pinned identity key does not match the recipient fingerprint');
     }
-    const message: PlaintextMessage = resend ? { content, resend: true } : { content };
     const tId = threadId
       ?? this.peekClientAffinity(recipientId)
       ?? `thread-${this.nowFn()}-${Math.random().toString(36).slice(2, 8)}`;

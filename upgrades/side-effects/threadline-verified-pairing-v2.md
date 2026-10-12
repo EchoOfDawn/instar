@@ -107,7 +107,7 @@ Echo's review of PR #2173 found five blockers. Already fixed in code:
 
 - **Credential path encrypts to the derived key (built 2026-10-11).** The production-path E2E (real bootstrap, in-process RelayServer, nothing hand-built) showed that after a full mutual verification a credential was refused with `credential-requires-encrypted-path`: the real clients never cache an X25519 key for each other (a start caches the identity key only; relay discovery is keyless). `ThreadlineClient.sendCredentialToPinned` now encrypts to the pinned identity key and its derived X25519 key; the gate's second check requires that send; the relay-send route uses it for every credential. Over 50 random keys the derived key equals the agent's own X25519 key.
 
-Still open, pending Echo's spec review: sending the receipt after a confirm.
+- **Receipt sender (built 2026-10-12).** After an operator confirms, the verify route sends one signed `pair-verify` receipt, encrypted to the peer's pinned key (`ThreadlineClient.sendPairVerifyReceipt`). It is best effort: a failure is logged and never undoes the confirmation. The production-path E2E shows both receipts accepted over a real relay (`peerAcked` set on each side). Three breakages (no send, wrong signer, plaintext send) each fail it. The extra cost is one message per confirm. A receiver whose verified-pairing is off ignores it (an unknown control message is dropped, as today).
 
 ## Conclusion
 
