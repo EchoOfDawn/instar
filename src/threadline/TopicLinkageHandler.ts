@@ -44,6 +44,7 @@ import type { MessageStore } from '../messaging/MessageStore.js';
 import type { TelegramOriginService } from '../messaging/telegram-origin/TelegramOriginService.js';
 import { withThreadlineForwardedAuthor } from './TelegramOriginAttribution.js';
 import { TOPIC_REPLY_BUDGET_MS, type TopicOwnerAskResult } from './relayForward.js';
+import type { TopicRespawnResult } from './topicRespawnHook.js';
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -69,6 +70,21 @@ export interface TopicLinkageDeps {
     | null;
   /** Returns the live tmux session name registered for a topic, if any. */
   getSessionForTopic?: (topicId: number) => string | null;
+  /**
+   * ACT-091: wake the topic's session when nothing live holds it (reaped or
+   * dead) — the same respawn path an inbound Telegram message takes, so the
+   * session resumes its conversation (`--resume`) with `text` as its first
+   * message. Resolves `respawned: true` ONLY when the payload reached the new
+   * session. Absent ⇒ the legacy `resume-pending` (no wake, no replay).
+   */
+  respawnTopicSession?: (args: { topicId: number; text: string }) => Promise<TopicRespawnResult>;
+  /**
+   * ACT-091: is a spawn for this topic in flight right now? A session can be
+   * `alive` (tmux up, process started) while it is still booting; a reply typed
+   * into it then is unconfirmed. When true the reply goes through
+   * `respawnTopicSession`, which waits for the spawn and then types it in.
+   */
+  isTopicSpawning?: (topicId: number) => boolean;
   /** Local-agent name, for sender filtering. */
   localAgent: string;
   /**
@@ -130,12 +146,24 @@ export interface CaptureOriginResult {
   threadResumeStamped: boolean;
 }
 
+/**
+ * How a topic-bound reply was handed over:
+ *  - `live-inject`    — typed into the topic's live session and consumed;
+ *  - `respawn-inject` — the topic's session was dead/reaped, so it was
+ *                       respawned (resuming its conversation) with the reply as
+ *                       its first message (ACT-091);
+ *  - `resume-pending` — nothing live received it and no respawn path is wired
+ *                       (legacy; the reply sits in the hub only);
+ *  - `failure-visible`— a hand-off was attempted and failed; always surfaced.
+ */
+export type TopicDeliveryMode = 'live-inject' | 'respawn-inject' | 'resume-pending' | 'failure-visible';
+
 export type TopicRouteOutcome =
   | { kind: 'no-linkage' }
   | { kind: 'topic-expired'; reason: string }
   | {
       kind: 'routed';
-      deliveryMode: 'live-inject' | 'resume-pending' | 'failure-visible';
+      deliveryMode: TopicDeliveryMode;
       verdict: SalienceVerdict;
       reason: string;
       commitmentDelivered: boolean;
@@ -450,7 +478,7 @@ export class TopicLinkageHandler {
     });
 
     const sessionName = liveSessionName ?? threadEntry.originSessionName ?? null;
-    let deliveryMode: 'live-inject' | 'resume-pending' | 'failure-visible' = 'failure-visible';
+    let deliveryMode: TopicDeliveryMode = 'failure-visible';
 
     const payload = this.buildSessionPayload({
       threadId,
@@ -467,7 +495,10 @@ export class TopicLinkageHandler {
     // payload inline; otherwise fall through to the resume-pending mode where
     // the next user message into the topic (or beacon-driven resume) will
     // surface the awaited reply through the topic's existing wake path.
-    if (sessionName && this.deps.isSessionAlive(sessionName)) {
+    const spawning = (() => {
+      try { return this.deps.isTopicSpawning?.(topicId) === true; } catch { return false; /* @silent-fallback-ok — an unreadable spawn flag is "not spawning" */ }
+    })();
+    if (sessionName && !(spawning && this.deps.respawnTopicSession) && this.deps.isSessionAlive(sessionName)) {
       try {
         const ok = await this.deps.injectIntoSession(sessionName, payload);
         if (ok) {
@@ -476,6 +507,30 @@ export class TopicLinkageHandler {
       } catch (err) {
         console.warn(
           `[TopicLinkageHandler] Live inject failed for thread ${threadId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else if (this.deps.respawnTopicSession) {
+      // ACT-091: nothing live holds the topic (the session was idle-reaped or
+      // died). Leaving the reply as `resume-pending` lost it: the peer had been
+      // told a reply was coming, the payload reached no session, and nothing
+      // replayed it. Wake the topic's session through its normal respawn path
+      // with the reply as its first message. A refusal or failure is
+      // `failure-visible` (always surfaced), never a silent pending.
+      try {
+        const r = await this.deps.respawnTopicSession({ topicId, text: payload });
+        if (r.delivered) {
+          deliveryMode = r.mode;
+          console.log(
+            `[TopicLinkageHandler] Topic ${topicId} reply on thread ${threadId} delivered by ${r.mode}${r.sessionName ? ` into "${r.sessionName}"` : ''}`,
+          );
+        } else {
+          console.warn(
+            `[TopicLinkageHandler] Topic ${topicId} session not alive and respawn refused for thread ${threadId}: ${r.reason ?? 'unknown'} — surfacing`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[TopicLinkageHandler] Topic ${topicId} respawn failed for thread ${threadId}: ${err instanceof Error ? err.message : String(err)} — surfacing`,
         );
       }
     } else if (sessionName) {
@@ -503,7 +558,7 @@ export class TopicLinkageHandler {
     message: MessageEnvelope['message'];
     threadEntry: RouteReplyInput['threadEntry'];
     commitment: Commitment | null;
-    deliveryMode: 'live-inject' | 'resume-pending' | 'failure-visible';
+    deliveryMode: TopicDeliveryMode;
     verdictResult: { verdict: SalienceVerdict; reason: string };
   }): Promise<TopicRouteOutcome> {
     const { threadId, topicId, message, threadEntry, commitment, deliveryMode, verdictResult } = args;
@@ -533,6 +588,8 @@ export class TopicLinkageHandler {
     // actually gates the dormant-session surface (the classifier's first-reply
     // fallback still surfaces first contact, so a genuine first answer is never
     // hidden even when the classifier is unavailable).
+    // `respawn-inject` is a confirmed hand-off into the (respawned) topic
+    // session, so it behaves like `live-inject`: no surface, commitment resolves.
     const shouldSurface =
       deliveryMode === 'failure-visible' ||
       (deliveryMode === 'resume-pending' && verdictResult.verdict === 'user-visible');
@@ -594,7 +651,7 @@ export class TopicLinkageHandler {
     // configured) leaves the commitment OPEN so PromiseBeacon keeps heartbeating;
     // the 7-day TTL + expireCommitments() sweep is the backstop. This is the fix
     // for the 2026-05-25 premature-resolution incident.
-    const surfacedToUser = deliveryMode === 'live-inject' || telegramSent;
+    const surfacedToUser = deliveryMode === 'live-inject' || deliveryMode === 'respawn-inject' || telegramSent;
     let commitmentDelivered = false;
     if (commitment && surfacedToUser) {
       try {
@@ -859,7 +916,7 @@ export class TopicLinkageHandler {
   private buildTelegramSurface(args: {
     message: MessageEnvelope['message'];
     threadEntry: RouteReplyInput['threadEntry'];
-    deliveryMode: 'live-inject' | 'resume-pending' | 'failure-visible';
+    deliveryMode: TopicDeliveryMode;
   }): string {
     const { message, threadEntry, deliveryMode } = args;
     const subject = threadEntry.subject ?? message.subject ?? 'threadline conversation';
@@ -868,7 +925,7 @@ export class TopicLinkageHandler {
     const preview = truncated ? body.slice(0, TELEGRAM_BODY_CAP) + '… [truncated]' : body;
 
     const footer =
-      deliveryMode === 'live-inject'
+      deliveryMode === 'live-inject' || deliveryMode === 'respawn-inject'
         ? `(You asked for this here — picking it back up now.)`
         : deliveryMode === 'resume-pending'
           ? `(You asked for this here — I'll pick it back up the next time we interact in this topic.)`

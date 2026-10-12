@@ -27,6 +27,15 @@ export const AUTO_ACK_TYPE = 'ack';
 export const DEFAULT_AUTO_ACK_MESSAGE = 'Message received. Composing response...';
 
 /**
+ * ACT-091: the acknowledgement for a message that was received and, by the
+ * warrants-reply gate's verdict, will NOT be answered. It promises nothing, so
+ * the sender's delivery tracker closes the loop without reading a reply into
+ * it. Sent with the `ack` wire type; an older peer (text-only recognition)
+ * sees it as content, exactly as it sees a configured custom ack sentence.
+ */
+export const NO_REPLY_ACK_MESSAGE = 'Message received.';
+
+/**
  * Is this inbound an automatic acknowledgement? Structural only — no reading
  * of what a message means:
  *
@@ -122,6 +131,13 @@ export interface RelayAckStageInput {
   senderFingerprint: string;
   threadId?: string;
   ticket: AdmissionTicket | null;
+  /**
+   * ACT-091: hold our own ack until routing reports a live delivery. Set for a
+   * topic-bound reply, whose hand-off can reach no live session; the caller
+   * then calls `settleDeferredRelayAck` with the routing outcome. An inbound
+   * ack is still consumed here either way.
+   */
+  deferSend?: boolean;
 }
 
 /**
@@ -138,6 +154,12 @@ export function runRelayAckStage(deps: RelayAckStageDeps, input: RelayAckStageIn
     input.ticket?.recordNoReply();
     return 'ack-consumed';
   }
+  if (!input.deferSend) sendRelayAckIfAllowed(deps, input, deps.autoAckMessage ?? DEFAULT_AUTO_ACK_MESSAGE);
+  return 'continue';
+}
+
+/** Send our own ack when policy allows it (trust, type, config, rate limit). */
+function sendRelayAckIfAllowed(deps: RelayAckStageDeps, input: RelayAckStageInput, text: string): boolean {
   if (
     input.trustLevel !== 'untrusted'
     && input.msgType !== 'status'
@@ -145,12 +167,33 @@ export function runRelayAckStage(deps: RelayAckStageDeps, input: RelayAckStageIn
     && !deps.isAckRateLimited(input.senderFingerprint)
   ) {
     try {
-      deps.sendAck(input.senderFingerprint, deps.autoAckMessage ?? DEFAULT_AUTO_ACK_MESSAGE, input.threadId);
+      deps.sendAck(input.senderFingerprint, text, input.threadId);
+      return true;
     } catch (ackErr) {
       console.error(`[relay] Auto-ack failed: ${ackErr instanceof Error ? ackErr.message : ackErr}`);
     }
   }
-  return 'continue';
+  return false;
+}
+
+/**
+ * ACT-091: the second half of a deferred ack. The default ack text promises a
+ * reply ("Composing response..."), so it goes out ONLY when routing handed the
+ * message to a live consumer. A message the warrants-reply gate decided not to
+ * answer (`noReply`) is a terminal, deliberate outcome: it gets the
+ * non-promising NO_REPLY_ACK_MESSAGE, so the sender's tracker records it as
+ * received instead of reporting a stuck channel. Anything else — delivered to
+ * no live session — gets no ack at all.
+ */
+export function settleDeferredRelayAck(
+  deps: RelayAckStageDeps,
+  input: RelayAckStageInput,
+  outcome: { delivered: boolean; noReply?: boolean },
+): 'sent' | 'sent-no-reply' | 'skipped-undelivered' | 'skipped-policy' {
+  if (input.isAutoAck) return 'skipped-policy';
+  if (outcome.noReply) return sendRelayAckIfAllowed(deps, input, NO_REPLY_ACK_MESSAGE) ? 'sent-no-reply' : 'skipped-policy';
+  if (!outcome.delivered) return 'skipped-undelivered';
+  return sendRelayAckIfAllowed(deps, input, deps.autoAckMessage ?? DEFAULT_AUTO_ACK_MESSAGE) ? 'sent' : 'skipped-policy';
 }
 
 // ── Plaintext wire format (shared by the sender and the receiver) ──────

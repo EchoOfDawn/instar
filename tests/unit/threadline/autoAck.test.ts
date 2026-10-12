@@ -20,6 +20,8 @@ import {
   autoAckBodyRecognition,
   looksLikeAutoAckText,
   runRelayAckStage,
+  settleDeferredRelayAck,
+  NO_REPLY_ACK_MESSAGE,
   type RelayAckStageDeps,
 } from '../../../src/threadline/autoAck.js';
 import { InboundIdLedger } from '../../../src/threadline/InboundIdLedger.js';
@@ -251,5 +253,59 @@ describe('the wire format', () => {
   it('sendAck refuses when not connected (the stage swallows it)', () => {
     const client = new ThreadlineClient({ name: 'unit', stateDir: '.' } as never);
     expect(() => client.sendAck(PEER, 'x')).toThrow('Not connected');
+  });
+});
+
+describe('deferred relay ack (ACT-091 — no reply promised for an undelivered message)', () => {
+  function deps(over: Partial<RelayAckStageDeps> = {}) {
+    return { autoAckEnabled: true, isAckRateLimited: () => false, sendAck: vi.fn(), recordDelivery: vi.fn(), ...over } as RelayAckStageDeps & { sendAck: ReturnType<typeof vi.fn> };
+  }
+  const input = (over: Record<string, unknown> = {}) => ({
+    isAutoAck: false, trustLevel: 'verified', msgType: 'chat', senderFingerprint: PEER, threadId: 'thread-1', ticket: null, deferSend: true, ...over,
+  });
+
+  it('deferSend: the stage continues but sends nothing yet', () => {
+    const d = deps();
+    expect(runRelayAckStage(d, input())).toBe('continue');
+    expect(d.sendAck).not.toHaveBeenCalled();
+  });
+
+  it('settled as delivered → the ack goes out once', () => {
+    const d = deps();
+    runRelayAckStage(d, input());
+    expect(settleDeferredRelayAck(d, input(), { delivered: true })).toBe('sent');
+    expect(d.sendAck).toHaveBeenCalledTimes(1);
+    expect(d.sendAck).toHaveBeenCalledWith(PEER, DEFAULT_AUTO_ACK_MESSAGE, 'thread-1');
+  });
+
+  it('settled as NOT delivered → no ack (the peer is not told a reply is coming)', () => {
+    const d = deps();
+    runRelayAckStage(d, input());
+    expect(settleDeferredRelayAck(d, input(), { delivered: false })).toBe('skipped-undelivered');
+    expect(d.sendAck).not.toHaveBeenCalled();
+  });
+
+  it('a warrants-gate no-reply exit → the non-promising "Message received." ack, once (Dawn\'s point 2: no stuck channel)', () => {
+    const d = deps();
+    runRelayAckStage(d, input());
+    expect(settleDeferredRelayAck(d, input(), { delivered: false, noReply: true })).toBe('sent-no-reply');
+    expect(d.sendAck).toHaveBeenCalledTimes(1);
+    expect(d.sendAck).toHaveBeenCalledWith(PEER, NO_REPLY_ACK_MESSAGE, 'thread-1');
+    expect(NO_REPLY_ACK_MESSAGE).not.toMatch(/compos|respon/i); // promises nothing
+    expect(looksLikeAutoAckText(NO_REPLY_ACK_MESSAGE)).toBe(true); // never handed to a reply waiter as "the reply"
+  });
+
+  it('a delivered message still obeys ack policy (untrusted, status, disabled, rate-limited, an inbound ack)', () => {
+    for (const [over, i] of [
+      [{}, { trustLevel: 'untrusted' }],
+      [{}, { msgType: 'status' }],
+      [{ autoAckEnabled: false }, {}],
+      [{ isAckRateLimited: () => true }, {}],
+      [{}, { isAutoAck: true }],
+    ] as const) {
+      const d = deps(over as Partial<RelayAckStageDeps>);
+      expect(settleDeferredRelayAck(d, input(i as Record<string, unknown>), { delivered: true })).toBe('skipped-policy');
+      expect(d.sendAck).not.toHaveBeenCalled();
+    }
   });
 });
