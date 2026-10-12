@@ -360,6 +360,13 @@ export function buildWriteDomainRegistry(opts: { machineId: string | null }): Wr
   reg.add({ kind: 'route', method: 'POST', pathPrefix: '/jobs/:slug/enable', domain: 'cluster-shared' });
   reg.add({ kind: 'route', method: 'POST', pathPrefix: '/jobs/:slug/override', domain: 'cluster-shared' });
   reg.add({ kind: 'route', method: 'POST', pathPrefix: '/jobs/:slug/unfork', domain: 'cluster-shared' });
+  // Secure A2A verified pairing (docs/specs/secure-a2a-verified-pairing.md §3.2): starting a
+  // pairing writes the trust profile and the pending-words store. It only does anything on
+  // the machine that holds the Threadline relay identity (it answers 503 elsewhere), and the
+  // verified result replicates separately (ThreadlinePairingReplicatedStore). Classified
+  // cluster-shared (single writer = the lease holder): the conservative default, with no
+  // machine-local convergence claim to defend.
+  reg.add({ kind: 'route', method: 'POST', pathPrefix: '/threadline/pairing/:peerFp/start', domain: 'cluster-shared' });
   reg.add({ kind: 'route', method: 'POST', pathPrefix: '/attention', domain: 'machine-local', story: attentionStory });
   reg.add({ kind: 'route', method: 'PATCH', pathPrefix: '/attention', domain: 'machine-local', story: attentionStory });
   const subscriptionReloginStory: ConvergenceStory = {
