@@ -132,10 +132,10 @@ export interface RelayAckStageInput {
   threadId?: string;
   ticket: AdmissionTicket | null;
   /**
-   * ACT-091: hold our own ack until routing reports a live delivery. Set for a
-   * topic-bound reply, whose hand-off can reach no live session; the caller
-   * then calls `settleDeferredRelayAck` with the routing outcome. An inbound
-   * ack is still consumed here either way.
+   * ACT-091: hold our own ack until routing reports its outcome. The relay
+   * handler sets it for EVERY inbound message (any hand-off can reach no live
+   * consumer, not only a topic-bound reply's) and settles through
+   * `createRelayAckSettler`. An inbound ack is still consumed here either way.
    */
   deferSend?: boolean;
 }
@@ -194,6 +194,121 @@ export function settleDeferredRelayAck(
   if (outcome.noReply) return sendRelayAckIfAllowed(deps, input, NO_REPLY_ACK_MESSAGE) ? 'sent-no-reply' : 'skipped-policy';
   if (!outcome.delivered) return 'skipped-undelivered';
   return sendRelayAckIfAllowed(deps, input, deps.autoAckMessage ?? DEFAULT_AUTO_ACK_MESSAGE) ? 'sent' : 'skipped-policy';
+}
+
+/**
+ * Where the relay inbound handler's routing ended (ACT-091). Each terminal exit
+ * of the handler names exactly one:
+ *
+ *  - `pipe-spawned`       — a pipe session was created with the message as its
+ *                           prompt. A live consumer has it.
+ *  - `listener-delivered` — the message was appended to the warm-listener inbox
+ *                           and `ListenerSessionManager.hasLiveReader()` is
+ *                           still true: a reader proved itself alive within the
+ *                           freshness bound, so a live consumer has it.
+ *  - `listener-queued`    — the message was appended to the inbox but no live
+ *                           reader is proven at that moment (the heartbeat went
+ *                           stale between the routing check and the write). The
+ *                           write succeeds with nobody reading, so it is a queue
+ *                           write, NOT a delivery.
+ *  - `router-delivered`   — `ThreadlineRouter` reported `delivered === true`,
+ *                           or its `deliveryPending` (a reply typed into a
+ *                           busy session as queued input) resolved delivered.
+ *                           THE RULE: the promising ack is sent only once the
+ *                           injected text has actually left the prompt.
+ *  - `router-undelivered` — the router accepted, queued, refused or failed
+ *                           without a live session receiving the message. This
+ *                           includes a capacity refusal the spawn manager
+ *                           QUEUED (`queued: true`, e.g. "Session limit reached
+ *                           (5/5)"). Deliberately no ack, and no separate
+ *                           "queued" receipt: see `describeUndeliveredRouterResult`.
+ *  - `no-reply`           — the warrants-reply gate decided not to answer
+ *                           (a no-reply verdict or an exhausted loop budget).
+ */
+export type RelayRoutingOutcome =
+  | 'pipe-spawned'
+  | 'listener-delivered'
+  | 'listener-queued'
+  | 'router-delivered'
+  | 'router-undelivered'
+  | 'no-reply';
+
+export type RelayAckSettlement =
+  | ReturnType<typeof settleDeferredRelayAck>
+  /** The stage already sent (or consumed) the ack; there is nothing to settle. */
+  | 'not-deferred'
+  /** `settle` was already called for this message; nothing more is sent. */
+  | 'already-settled';
+
+/**
+ * The log wording for a router result that reached no live session.
+ *
+ * DECISION (ACT-091, queued spawns): a capacity refusal that the spawn manager
+ * queued (`queued: true`; only reported when `SpawnRequestManager`'s queue
+ * actually admitted the payload) keeps the message for a later spawn. It still
+ * gets NO ack, and we do not send a third fixed "received, queued" text:
+ *
+ *  - The queue is in memory, bounded per agent and globally, and expires entries
+ *    after 10 minutes, and a later arrival can evict an older entry. "Queued" is
+ *    a hope of a later session, not a hand-off to one, so a receipt would claim
+ *    more than we know.
+ *  - A new ack text is recognised as an ack only through the `ack` wire type.
+ *    `isAutoAckInbound` matches untyped text only when it is exactly
+ *    DEFAULT_AUTO_ACK_MESSAGE, and `looksLikeAutoAckText` (prefix "Message
+ *    received." / "Message received,") only spares a reply waiter and stops
+ *    nothing. A peer from before the wire type routes ANY ack text to a session
+ *    as a message, so a queued receipt would spend a session on that peer at the
+ *    moment our own side is out of sessions.
+ *
+ * If the queued message later reaches a session, that session's reply is the
+ * sender's acknowledgement. The wording below names the queued case so the log
+ * says "queued", not "lost".
+ */
+export function describeUndeliveredRouterResult(result: { queued?: boolean; error?: string }): string {
+  if (result.queued === true) {
+    const why = result.error ? `: ${result.error.replace(/^Spawn denied:\s*/, '')}` : '';
+    return `queued for a later session spawn${why} — no live session has it yet`;
+  }
+  return 'no live session received the message';
+}
+
+/** Did a live consumer receive the message on this outcome? */
+export function relayOutcomeDelivered(outcome: RelayRoutingOutcome): boolean {
+  return outcome === 'pipe-spawned' || outcome === 'listener-delivered' || outcome === 'router-delivered';
+}
+
+export interface RelayAckSettler {
+  /** Settle the deferred ack with the routing outcome. First call wins. */
+  settle(outcome: RelayRoutingOutcome): RelayAckSettlement;
+  /** The outcome `settle` was called with, or null while routing is in flight. */
+  readonly outcome: RelayRoutingOutcome | null;
+}
+
+/**
+ * ACT-091: one deferred ack for one inbound relay message. The promising ack
+ * ("Composing response...") goes out only for an outcome where a live consumer
+ * has the message; `no-reply` gets the non-promising NO_REPLY_ACK_MESSAGE; a
+ * queue write or an undelivered router result gets no ack, so the sender's
+ * delivery tracker keeps the message as unacknowledged — which is true. A
+ * handler exit that never calls `settle` (a throw) also sends nothing.
+ *
+ * One-shot: a second `settle` sends nothing, so a path that falls through to
+ * another hand-off after settling can never ack twice.
+ */
+export function createRelayAckSettler(deps: RelayAckStageDeps, input: RelayAckStageInput): RelayAckSettler {
+  let settled: RelayRoutingOutcome | null = null;
+  return {
+    get outcome() { return settled; },
+    settle(outcome: RelayRoutingOutcome): RelayAckSettlement {
+      if (settled !== null) return 'already-settled';
+      settled = outcome;
+      if (!input.deferSend) return 'not-deferred';
+      return settleDeferredRelayAck(deps, input, {
+        delivered: relayOutcomeDelivered(outcome),
+        noReply: outcome === 'no-reply',
+      });
+    },
+  };
 }
 
 // ── Plaintext wire format (shared by the sender and the receiver) ──────

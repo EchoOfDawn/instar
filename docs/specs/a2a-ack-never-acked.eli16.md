@@ -36,6 +36,25 @@ whole new working session just to answer a receipt.
    word. A real message that merely begins with "Message received." is handled
    as a real message.
 3. The two other ways a message can arrive get the same rule.
+4. Our own receipt says "Composing response...", which is a promise. It is now
+   sent only after a running session actually has the message, on every kind
+   of conversation. A message we decide not to answer gets a plain "Message
+   received." A message that reached no running session gets no receipt, so
+   the sender's records show it as not yet acknowledged, which is true.
+5. There was a third place a message could go: a waiting file meant for a
+   lightweight "listener" session. Nothing ever started that session, so short
+   messages from trusted agents were written to the file and never read. Now
+   the file is used only when a listener has recently proved it is running.
+   Otherwise the message goes to a normal session, as every other message does.
+6. One more honest check. When a reply is typed into a session that is in the
+   middle of a task, the session keeps it waiting at its input line and reads
+   it when it next pauses. The old check mistook that for "stuck", and told the
+   sender nothing although the reply did arrive seconds later. Now that case is
+   treated as "not sure yet": nothing is promised, and the input line is
+   watched (for up to ten minutes) until the text has really been taken. Only
+   then does the "composing response" receipt go out. If the text is still
+   sitting there when the session goes quiet, or the time runs out, no receipt
+   is sent and the reply is posted in the topic instead.
 
 The "does this deserve a reply?" check itself is not changed. A receipt never
 reaches it any more, so it can no longer mistake one for someone reaching out.

@@ -264,7 +264,15 @@ import { ConversationStore } from '../threadline/ConversationStore.js';
 import { ThreadLog } from '../threadline/ThreadLog.js';
 import { ThreadMessageRecorder } from '../threadline/recordThreadMessage.js';
 import { recordInboundAck } from '../threadline/recordInboundAck.js';
-import { isAutoAckInbound, autoAckRecognition, looksLikeAutoAckText, createAckRateLimiter, runRelayAckStage, settleDeferredRelayAck } from '../threadline/autoAck.js';
+import { isAutoAckInbound, autoAckRecognition, looksLikeAutoAckText, createAckRateLimiter, runRelayAckStage, createRelayAckSettler, describeUndeliveredRouterResult } from '../threadline/autoAck.js';
+import { type LiveInjectOutcome } from '../threadline/TopicLinkageHandler.js';
+import type { InjectionConfirmation } from '../core/SessionManager.js';
+
+/** ACT-091: the session manager's observed paste → the topic handler's inject outcome (starts the busy watch lazily). */
+function liveInjectOutcomeFromObservation(r: InjectionConfirmation): LiveInjectOutcome {
+  if (r.state === 'queued-busy') return { state: 'queued-busy', settled: r.settle() };
+  return { state: r.state };
+}
 import { createThreadlineTopicRespawn } from '../threadline/topicRespawnHook.js';
 import { WarrantsReplyGate, evaluateAndRecordInbound } from '../threadline/WarrantsReplyGate.js';
 import { CollaborationSurfacer } from '../threadline/CollaborationSurfacer.js';
@@ -3327,7 +3335,7 @@ export function wireTelegramRouting(
       },
       registeredSession: (topicId) => telegram.getSessionForTopic(topicId),
       isSessionAlive: (name) => sessionManager.isSessionAlive(name),
-      injectConfirmed: (name, text) => sessionManager.injectPasteNotificationConfirmed(name, text),
+      injectConfirmed: async (name, text) => liveInjectOutcomeFromObservation(await sessionManager.injectPasteNotificationObserved(name, text)),
       leaseGate: (topicId) => g3ShouldSpawnLocally(topicId),
       classifyDeath: (name) => {
         try {
@@ -17950,9 +17958,11 @@ export async function startServer(options: StartOptions): Promise<void> {
           // Confirm the inject actually submitted (not left stuck at the prompt
           // by the paste-end race). A bare dispatch returning true is the A2 bug:
           // a stalled inject must NOT count as delivered, so the Telegram fallback
-          // surfaces the reply instead.
+          // surfaces the reply instead. A paste into a MID-TURN session is
+          // reported `queued-busy` (provisional) — the handler finishes the
+          // route from the late verdict (ACT-091).
           try {
-            return await sessionManager.injectPasteNotificationConfirmed(sessionName, text);
+            return liveInjectOutcomeFromObservation(await sessionManager.injectPasteNotificationObserved(sessionName, text));
           } catch { return false; }
         },
         isSessionAlive: (sessionName: string) => {
@@ -18523,14 +18533,18 @@ export async function startServer(options: StartOptions): Promise<void> {
           // the implicit delivery ack + the ledger disposition `no-reply` and the
           // handler RETURNS here, before the auto-ack send, the inbox append, the
           // Telegram mirror and the gate. Any other message gets our own ack
-          // (post-trust-verification, never for status messages, rate-limited).
+          // (post-trust-verification, never for status messages, rate-limited)
+          // once routing has an outcome — see relayAck below.
           const recordRelayDelivery = () => recordInboundAck(
             { a2aDeliveryTracker },
             { threadId: msg.threadId, senderFingerprint, senderName: senderName ?? null },
           );
-          // ACT-091: a topic-bound reply can reach no live session (its topic
-          // session was reaped), so its ack — which promises a reply — waits for
-          // the routing outcome (settleDeferredRelayAck below).
+          // ACT-091: any hand-off can reach no live consumer (a reaped topic
+          // session, a refused or queued spawn, a listener gone stale), so
+          // our ack — which promises a reply — waits for the routing outcome on
+          // EVERY path. Each terminal exit below calls relayAck.settle(...) just
+          // before it returns; an exit that settles nothing (a throw) sends no
+          // ack, which is the honest result when nothing received the message.
           const isTopicBoundReply =
             !!msg.threadId && threadResumeMap.get(msg.threadId)?.originTopicId !== undefined;
           const relayAckDeps = {
@@ -18542,8 +18556,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           };
           const relayAckInput = {
             isAutoAck, trustLevel, msgType, senderFingerprint, threadId: msg.threadId, ticket: ledgerTicket,
-            deferSend: isTopicBoundReply,
+            deferSend: true,
           };
+          const relayAck = createRelayAckSettler(relayAckDeps, relayAckInput);
           const ackStage = runRelayAckStage(relayAckDeps, relayAckInput);
           if (ackStage === 'ack-consumed') {
             console.log(`[relay] delivery ack from ${senderName} (thread: ${msg.threadId ?? 'none'}, by ${autoAckRecognition({ type: msgType, text: textContent })}) recorded — not acked, not routed`);
@@ -18626,10 +18641,11 @@ export async function startServer(options: StartOptions): Promise<void> {
                 if (decision.verdict.budgetExhausted) ledgerTicket?.recordRefused('loop-budget');
                 else ledgerTicket?.recordNoReply();
                 console.log(`[relay] warrants-reply gate suppressed reply (${decision.verdict.signal}) for ${senderName} thread ${gateThreadId.slice(0, 8)}`);
-                // ACT-091: a deferred ack on a terminal no-reply exit becomes the
-                // non-promising "Message received." — received, deliberately not
-                // answered — so the sender's tracker never reads a stuck channel.
-                if (relayAckInput.deferSend) settleDeferredRelayAck(relayAckDeps, relayAckInput, { delivered: false, noReply: true });
+                // ACT-091: the ack on a terminal no-reply exit (a no-reply verdict
+                // or an exhausted loop budget) is the non-promising "Message
+                // received." — received, deliberately not answered — so the
+                // sender's tracker never reads a stuck channel.
+                relayAck.settle('no-reply');
                 // On budget exhaustion, surface ONE status notice — never silently
                 // drop. CMT-519: route it to the SILENT Threadline hub (not a
                 // per-event attention topic, not the parent topic the operator is
@@ -18668,8 +18684,9 @@ export async function startServer(options: StartOptions): Promise<void> {
 
           // Phase 2a: Pipe-mode session for simple queries (lightweight, auto-exit)
           // Rapid-fire same-thread guard: if an active pipe session already exists for this
-          // thread, fall through to the listener/cold-spawn path so messages queue serially
-          // via ListenerSessionManager.writeToInbox instead of killing the prior tmux session.
+          // thread, fall through to the listener/router path instead of killing the prior
+          // tmux session. With no proven listener reader that is the router, which does not
+          // know about the pipe session: a second session may answer on the same thread.
           if (
             pipeSpawner &&
             msg.threadId &&
@@ -18704,6 +18721,9 @@ export async function startServer(options: StartOptions): Promise<void> {
                   if (result.spawned) {
                     ledgerTicket?.recordHandoff('pipe');
                     console.log(`[relay] Pipe session spawned for ${senderName} (thread: ${msg.threadId.slice(0, 8)})`);
+                    // ACT-091: the pipe session exists and the message is its
+                    // prompt — a live consumer has it, so the ack goes out now.
+                    relayAck.settle('pipe-spawned');
                     return;
                   }
                 }
@@ -18714,6 +18734,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           }
 
           // Phase 2b: Route to warm listener if available and appropriate.
+          // shouldUseListener is false unless a live inbox reader is PROVEN (a
+          // fresh heartbeat); with none, the message falls through to the router
+          // below instead of being written to a file nothing reads.
           // EXCEPT topic-bound replies: a reply on a thread bound to a Telegram
           // topic must reach handleInboundMessage → TopicLinkageHandler so it
           // surfaces in the bound topic. The listener inbox is a side-channel
@@ -18726,6 +18749,15 @@ export async function startServer(options: StartOptions): Promise<void> {
             listenerManager.writeToInbox({ from: senderFingerprint, senderName, trustLevel, threadId: msg.threadId ?? getSyntheticThreadId(senderFingerprint), text: ledgerNotice ? `[server notice: ${ledgerNotice}]\n\n${textContent}` : textContent });
             ledgerTicket?.recordHandoff('listener');
             console.log(`[relay] Routed to listener inbox from ${senderName} (trust: ${trustLevel})`);
+            // ACT-091: shouldUseListener is true only while a reader's heartbeat
+            // is fresh (ListenerSessionManager.hasLiveReader), so this hand-off
+            // reaches a proven live reader and gets the promising ack. Re-read
+            // after the write: if the heartbeat went stale in between, the write
+            // is only a queue entry and the ack is withheld.
+            const listenerAck = relayAck.settle(listenerManager.hasLiveReader() ? 'listener-delivered' : 'listener-queued');
+            if (listenerAck === 'skipped-undelivered') {
+              console.warn(`[relay] Auto-ack withheld for ${senderName} (thread: ${msg.threadId ?? 'none'}) — queued in the listener inbox; no live listener is proven`);
+            }
             return;
           }
 
@@ -18768,13 +18800,30 @@ export async function startServer(options: StartOptions): Promise<void> {
           if (result.error) console.warn(`[relay] Router error: ${result.error}`);
           if (result.spawned) console.log(`[relay] Spawned session for ${senderName} (trust: ${trustLevel}, thread: ${result.threadId})`);
           if (result.resumed) console.log(`[relay] Resumed session for ${senderName} (thread: ${result.threadId})`);
-          if (result.handled && result.delivered === false) {
+          if (result.handled && result.delivered === false && !result.deliveryPending) {
             console.warn(`[relay] Message from ${senderName} (thread: ${result.threadId}) accepted but not delivered to a live session${result.queued ? ' (queued)' : ''}`);
           }
-          if (relayAckInput.deferSend) {
-            const ackOutcome = settleDeferredRelayAck(relayAckDeps, relayAckInput, { delivered: result.delivered === true });
+          // ACT-091: the last exit — the ack follows the router's own report of
+          // a live hand-off (cold spawn, resumed/warm session, topic session).
+          // A capacity refusal the spawn manager queued (`queued: true`) is
+          // still undelivered: no ack, logged as queued — the decision and its
+          // reasons are at describeUndeliveredRouterResult.
+          if (result.deliveryPending) {
+            // The reply was typed into a live session that is mid-turn, so it
+            // sits as queued input: not delivered YET. The ack is settled from
+            // the late verdict (bounded by the session manager's watch
+            // ceiling), through the same one-shot settler — the promising ack
+            // is sent only once the text has actually left the prompt.
+            console.log(`[relay] Delivery to ${senderName} (thread: ${result.threadId}) pending — queued in a busy live session; the ack waits for the text to leave the prompt`);
+            void result.deliveryPending.then(({ delivered, reason }) => {
+              const late = relayAck.settle(delivered ? 'router-delivered' : 'router-undelivered');
+              if (delivered) console.log(`[relay] Queued reply for ${senderName} (thread: ${result.threadId}) left the prompt (${reason}) — delivered${late === 'sent' ? ', ack sent' : ''}`);
+              else console.warn(`[relay] Auto-ack withheld for ${senderName} (thread: ${result.threadId}) — queued text never left the prompt (${reason})`);
+            });
+          } else {
+            const ackOutcome = relayAck.settle(result.delivered === true ? 'router-delivered' : 'router-undelivered');
             if (ackOutcome === 'skipped-undelivered') {
-              console.warn(`[relay] Auto-ack withheld for ${senderName} (thread: ${result.threadId}) — no live session received the message`);
+              console.warn(`[relay] Auto-ack withheld for ${senderName} (thread: ${result.threadId}) — ${describeUndeliveredRouterResult(result)}`);
             }
           }
         }
