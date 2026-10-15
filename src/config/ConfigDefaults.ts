@@ -2249,6 +2249,15 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
   // (a baked-in false would dark dev agents too — the #1001 shape the dark-gate
   // lint forbids for a dev-gated block). mintBreaker carries the §3.3 pinned
   // defaults (existence-checked add-missing on update — Migration Parity).
+  // Parallel-Work Awareness — action-derived activity notes (CMT-810). The code
+  // default is ON (absent = on); the explicit block surfaces the kill switch. The
+  // write only happens on the action-claim observe path, which the Stop hook posts
+  // to only when actionClaim.enabled is on — so a fleet agent with the action-claim
+  // sentinel dark sees no new behavior from this block alone.
+  parallelWork: {
+    actionNotes: { enabled: true, windowHours: 24 },
+  },
+
   conversationIdentity: {
     recording: {
       enabled: true,

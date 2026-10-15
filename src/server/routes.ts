@@ -20,7 +20,7 @@ import type { Request as ExpressRequest, Response as ExpressResponse } from 'exp
 import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, timingSafeEqual, randomBytes, randomUUID } from 'node:crypto';
 import { governor as selfActionGovernorSurface } from '../monitoring/selfaction/governor.js';
-import { classifyActionClaim } from '../core/action-claim.js';
+import { classifyActionClaim, classifyApprovalRequest, excerptAround } from '../core/action-claim.js';
 import { sharedG3SoakLedger, decideLeaseGatedSpawn } from '../core/leaseGatedSpawn.js';
 import { getHostSpawnSemaphore, configuredSpawnAcquireMs, configuredSpawnWaitersMax } from '../core/hostSpawnSemaphore.js';
 import { jailValidateRelPath } from '../core/WorkingSetArtifactReplicatedStore.js';
@@ -1563,6 +1563,10 @@ export interface RouteContext {
   feedbackDrainPosture?: { state: 'dark' | 'unavailable' | 'live'; reason: 'intentionally-fleet-dark' | 'misclassified-development-install' | 'enabled-missing-canonical-data-directory' | 'enabled-missing-operated-host-owner' | 'initialization-failure' | 'live-healthy' };
   /** Cross-topic activity index (Parallel-Work Awareness Phase A). Backs GET /parallel-work/activities. */
   parallelActivityIndex?: import('../core/ParallelActivityIndex.js').ParallelActivityIndex | null;
+  /** Action-derived activity notes (CMT-810). Written by the action-claim observe path; read by the index. */
+  topicActionNotes?: import('../core/TopicActionNoteStore.js').TopicActionNoteStore | null;
+  /** The overlap councilor when constructed (dev-gated). Backs GET /parallel-work/sentinel. */
+  parallelWorkSentinel?: import('../monitoring/ParallelWorkSentinel.js').ParallelWorkSentinel | null;
   /** The shared intelligence provider (an IntelligenceRouter when per-component routing is wired). Backs GET /intelligence/routing. */
   intelligence?: import('../core/types.js').IntelligenceProvider | null;
   /** Framework-Onboarding Mentor System issue ledger (read-only observability;
@@ -2508,6 +2512,52 @@ export const OPERATOR_ONLY_SESSION_KEYS: ReadonlyArray<string> = [
 ];
 
 export function createRoutes(ctx: RouteContext): Router {
+  // ── CMT-810: action-derived activity notes (Parallel-Work Awareness) ──────
+  // Called from EVERY path that observes a finished outbound turn for a topic.
+  // Writes ONE durable note when the turn makes a concrete action claim
+  // ("I'll restart it") OR asks the operator to approve one ("may I restart the
+  // Studio?"), so GET /parallel-work/activities shows it to every other session
+  // at the moment it happens — not after the next conversational intent
+  // extraction. Signal-only: never throws, never gates, never changes the reply.
+  const recordParallelActivityNote = (
+    message: unknown,
+    topicId: unknown,
+    source: string,
+  ): { kind: 'action-claim' | 'approval-request'; verb: string; deduped: boolean } | null => {
+    try {
+      if (!ctx.topicActionNotes) return null;
+      if (typeof message !== 'string' || !message || typeof topicId !== 'number' || !Number.isSafeInteger(topicId)) return null;
+      const enabled = ctx.liveConfig?.get<boolean | undefined>('parallelWork.actionNotes.enabled', undefined)
+        ?? (ctx.config as { parallelWork?: { actionNotes?: { enabled?: boolean } } }).parallelWork?.actionNotes?.enabled
+        ?? true;
+      if (enabled === false) return null;
+      // bounded-input-reviewed: feeds two deterministic regex classifiers (never a prompt); 16KB mirrors the Stop hook's own payload clamp, and a claim/request past 16KB of reply text is not a decision input.
+      const text = message.slice(0, 16384);
+      const claim = classifyActionClaim(text);
+      const approval = classifyApprovalRequest(text);
+      let kind: 'action-claim' | 'approval-request';
+      let verb: string;
+      let matched: string;
+      if (approval.isApprovalRequest && approval.request) {
+        // An approval REQUEST outranks a claim in the same turn: "May I restart it?
+        // I'll push the fix first" is, to a sibling session, a pending restart.
+        kind = 'approval-request'; verb = approval.request.normalizedVerb; matched = approval.request.matched;
+      } else if (claim.isActionClaim && claim.claim) {
+        kind = 'action-claim'; verb = claim.claim.normalizedClaimVerb; matched = claim.claim.matched;
+      } else {
+        return null;
+      }
+      const excerpt = scrubCorrectionSecrets(excerptAround(text, matched));
+      const r = ctx.topicActionNotes.record(topicId, { kind, verb, excerpt, source });
+      return r ? { kind, verb, deduped: r.deduped } : null;
+    } catch {
+      // @silent-fallback-ok: the note is observability layered on a signal-only
+      // observer; the observe response (and the commitment lane) must proceed
+      // unchanged whether or not the note could be written.
+      return null;
+    }
+  };
+
   const router = Router();
   mountOriginDisplayPreferences(router, ctx);
   mountTelegramOriginRoutes(router, { runtime: () => ctx.telegramOrigin,
@@ -14603,6 +14653,24 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
     res.json(ctx.cutoverReadiness.importDryRunStatus());
+  });
+
+  // ── Parallel-Work Awareness, Phase B runtime (CMT-810 Defect 2) ──
+  // Is the overlap councilor genuinely ticking? 503 when not constructed (dark on
+  // this agent), else the live counters. Read-only; the same lastTickAt feeds the
+  // GuardRegistry getter that lets GET /guards grade the sentinel on-confirmed.
+  router.get('/parallel-work/sentinel', (_req, res) => {
+    if (!ctx.parallelWorkSentinel) {
+      res.status(503).json({ error: 'parallel-work sentinel is not constructed on this agent (monitoring.parallelWorkSentinel is dark)' });
+      return;
+    }
+    const stats = ctx.parallelWorkSentinel.stats();
+    res.json({
+      ...stats,
+      lastTickAtIso: stats.lastTickAt > 0 ? new Date(stats.lastTickAt).toISOString() : null,
+      tickAgeMs: stats.lastTickAt > 0 ? Math.max(0, Date.now() - stats.lastTickAt) : null,
+      cadenceMinutes: ctx.config.monitoring?.parallelWorkSentinel?.cadenceMinutes ?? 15,
+    });
   });
 
   // ── Parallel-Work Awareness (docs/specs/parallel-activity-coherence.md, Phase A) ──
@@ -28955,6 +29023,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
   const registerUnifiedFutureClaims = (input: {
     message: string; topicId?: number; rawBindToken?: string; arbitration?: ClaimClauseArbitration;
   }): { registered: number; reason?: string } => {
+    // CMT-810: awareness note first — independent of whether a commitment registers.
+    recordParallelActivityNote(input.message, input.topicId, 'completion-claim-observe');
     if (!ctx.commitmentTracker || typeof input.topicId !== 'number' || !Number.isSafeInteger(input.topicId)) {
       return { registered: 0, reason: 'no-commitment-tracker-or-topic' };
     }
@@ -32744,13 +32814,18 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const acGet = <T>(leaf: string, dflt: T): T =>
       (ctx.liveConfig?.get<T | undefined>(`actionClaim.${leaf}`, undefined) ??
         ctx.liveConfig?.get<T>(`messaging.actionClaim.${leaf}`, dflt)) as T;
+    // CMT-810: the parallel-awareness note is written FIRST and INDEPENDENTLY of
+    // every commitment-lane outcome below (disabled / no tracker / no claim /
+    // bind refused / per-topic cap / dry-run) — a sibling session's awareness
+    // must not depend on whether a follow-through commitment happened to open.
+    const activityNote = recordParallelActivityNote(req.body?.message, req.body?.topicId, 'action-claim-observe');
     const enabled = acGet<boolean>('enabled', false) ?? false;
     if (!enabled) {
-      res.json({ observed: false, registered: false, reason: 'feature-disabled' });
+      res.json({ observed: false, registered: false, reason: 'feature-disabled', activityNote });
       return;
     }
     if (!ctx.commitmentTracker) {
-      res.json({ observed: false, registered: false, reason: 'no-commitment-tracker' });
+      res.json({ observed: false, registered: false, reason: 'no-commitment-tracker', activityNote });
       return;
     }
     const { message, topicId } = req.body ?? {};
@@ -32762,7 +32837,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       && resolveDevAgentGate(ctx.config.monitoring?.completionClaimVerification?.enabled, ctx.config)
       && ctx.config.monitoring?.completionClaimVerification?.dryRun === false;
     if (completionLive && ctx.completionClaimVerifier!.getRecentAuthoritativeArbitration(message)?.authoritative) {
-      res.json({ observed: true, registered: false, reason: 'shared-arbiter-authoritative' });
+      res.json({ observed: true, registered: false, reason: 'shared-arbiter-authoritative', activityNote });
       return;
     }
     const numericTopicId = Number.isSafeInteger(topicId) ? topicId : undefined;
@@ -32783,7 +32858,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         ctx.config,
       );
       if (!slackLaneLive) {
-        res.json({ observed: true, registered: false, reason: 'slack-lane-dark' });
+        res.json({ observed: true, registered: false, reason: 'slack-lane-dark', activityNote });
         return;
       }
       slackDryRun = acGet<boolean>('slack.dryRun', true) ?? true;
@@ -32806,7 +32881,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       // 500-char slice record() will auto-arm from (consistency, see above).
       const timed = CommitmentTracker.detectTimePromise(agentResponse);
       if (!timed) {
-        res.json({ observed: true, registered: false, reason: 'no-claim' });
+        res.json({ observed: true, registered: false, reason: 'no-claim', activityNote });
         return;
       }
       lane = 'time';
@@ -32850,7 +32925,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       );
     const alreadyOpen = openForTopic.some((c) => c.externalKey === externalKey);
     if (!alreadyOpen && openForTopic.length >= cap) {
-      res.json({ observed: true, registered: false, reason: 'per-topic-cap', lane, ...(verb ? { verb } : {}), cap });
+      res.json({ observed: true, registered: false, reason: 'per-topic-cap', lane, ...(verb ? { verb } : {}), cap, activityNote });
       return;
     }
     const expiresHrs = acGet<number>('expiresHours', 6) ?? 6;
@@ -32880,7 +32955,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       } catch {
         /* audit is observability */
       }
-      res.json({ observed: true, registered: false, dryRun: true, wouldRegister: true, lane, ...(verb ? { verb } : {}), externalKey });
+      res.json({ observed: true, registered: false, dryRun: true, wouldRegister: true, lane, ...(verb ? { verb } : {}), externalKey, activityNote });
       return;
     }
 
@@ -32908,6 +32983,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         commitmentId: commitment.id,
         externalKey,
         beaconEnabled: commitment.beaconEnabled ?? false,
+        activityNote,
       });
     } catch (err) {
       // Signal-only: never surface a failure as a block. Audit via the 500-free path.

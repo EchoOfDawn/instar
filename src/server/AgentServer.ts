@@ -215,6 +215,7 @@ import { TokenLedgerPoller } from '../monitoring/TokenLedgerPoller.js';
 import { ResourceLedger } from '../monitoring/ResourceLedger.js';
 import { ResourceLedgerPoller } from '../monitoring/ResourceLedgerPoller.js';
 import { ParallelActivityIndex, runningTopicIds } from '../core/ParallelActivityIndex.js';
+import { TopicActionNoteStore } from '../core/TopicActionNoteStore.js';
 import { ParallelWorkSentinel } from '../monitoring/ParallelWorkSentinel.js';
 import { ResourceSampler } from '../monitoring/ResourceSampler.js';
 import { ProcessFootprintMonitor, defaultListProcesses } from '../monitoring/ProcessFootprintMonitor.js';
@@ -480,8 +481,10 @@ export class AgentServer {
   private feedbackDrainPosture: FeedbackDrainPosture = { state: 'unavailable', reason: 'initialization-failure' };
   private feedbackDefaultsSelfHealEvidence = { successful: 0, samples: 0 };
   private parallelActivityIndex: ParallelActivityIndex | null = null;
+  private topicActionNotes: TopicActionNoteStore | null = null;
   private parallelWorkSentinel: ParallelWorkSentinel | null = null;
   private parallelWorkSentinelTimer: ReturnType<typeof setInterval> | null = null;
+  private parallelWorkSentinelInitialTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Attach late-bound advisory work intake after the large server bootstrap. */
   setWorkQueue(workQueue: WorkQueueRegistry): void {
@@ -1486,13 +1489,25 @@ export class AgentServer {
           } catch { /* best-effort */ }
           return new Set<number>();
         };
+        // CMT-810: the ACTION-derived write path. Notes are written by the
+        // action-claim observe route the moment a turn claims an action or asks the
+        // operator to approve one; the index reads them so a topic's focus is current
+        // even while its conversational intent refs lag (the 2026-10-14 incident:
+        // a 14:34 restart request behind a 14:13 goal, for two hours).
+        const notesCfg = (options.config as { parallelWork?: { actionNotes?: { windowHours?: number } } })
+          .parallelWork?.actionNotes;
+        const windowHours = typeof notesCfg?.windowHours === 'number' && notesCfg.windowHours > 0 ? notesCfg.windowHours : 24;
+        this.topicActionNotes = new TopicActionNoteStore({ stateDir: options.config.stateDir });
         this.parallelActivityIndex = new ParallelActivityIndex({
           stateDir: options.config.stateDir,
           isRunning: (topicId) => runningTopics().has(topicId),
+          actionNotes: this.topicActionNotes,
+          actionNoteWindowMs: windowHours * 60 * 60 * 1000,
         });
       } catch (err) {
         console.warn('[instar] parallel-activity-index init failed (non-fatal):', err);
         this.parallelActivityIndex = null;
+        this.topicActionNotes = null;
       }
     }
 
@@ -1526,6 +1541,20 @@ export class AgentServer {
           try { this.parallelWorkSentinel?.tick(Date.now()); } catch { /* never throw from the cadence */ }
         }, cadenceMs);
         if (typeof this.parallelWorkSentinelTimer.unref === 'function') this.parallelWorkSentinelTimer.unref();
+        // CMT-810 (Defect 2): make the sentinel VERIFIABLE. Register its runtime
+        // getter so GET /guards grades it on-confirmed from a real lastTickAt instead
+        // of on-unverified/not-instrumented forever — and run an early first tick so
+        // the row does not read on-stale for a whole cadence after every boot.
+        options.guardRegistry?.register('monitoring.parallelWorkSentinel.enabled', () =>
+          this.parallelWorkSentinel?.guardStatus() ?? { enabled: false });
+        const initialDelaySec = options.config.monitoring?.parallelWorkSentinel?.initialTickDelaySeconds ?? 30;
+        if (initialDelaySec > 0) {
+          const first = setTimeout(() => {
+            try { this.parallelWorkSentinel?.tick(Date.now()); } catch { /* never throw from the cadence */ }
+          }, initialDelaySec * 1000);
+          if (typeof first.unref === 'function') first.unref();
+          this.parallelWorkSentinelInitialTimer = first;
+        }
       } catch (err) {
         console.warn('[instar] parallel-work-sentinel init failed (non-fatal):', err);
         this.parallelWorkSentinel = null;
@@ -4655,6 +4684,8 @@ export class AgentServer {
       feedbackTriage: this.feedbackTriage,
       feedbackExecute: this.feedbackExecute,
       parallelActivityIndex: this.parallelActivityIndex,
+      topicActionNotes: this.topicActionNotes,
+      parallelWorkSentinel: this.parallelWorkSentinel,
       frameworkIssueLedger: this.frameworkIssueLedger,
       mentorRunner: this.mentorRunner,
       dashboardInsightEngine: this.dashboardInsightEngine,
@@ -6838,6 +6869,10 @@ export class AgentServer {
     // Stop the AutonomousLivenessReconciler tick loop (clears its unref'd timer).
     try { this.routeContext?.autonomousLivenessReconciler?.stop(); } catch { /* best-effort */ }
     try { this.routeContext?.autonomousThroughputFloor?.stop(); } catch { /* best-effort */ }
+    if (this.parallelWorkSentinelInitialTimer) {
+      try { clearTimeout(this.parallelWorkSentinelInitialTimer); } catch { /* best-effort */ }
+      this.parallelWorkSentinelInitialTimer = null;
+    }
     if (this.parallelWorkSentinelTimer) {
       try { clearInterval(this.parallelWorkSentinelTimer); } catch { /* best-effort */ }
       this.parallelWorkSentinelTimer = null;
@@ -6972,6 +7007,11 @@ export class AgentServer {
   /** Wiring-integrity accessor: the ParallelWorkSentinel when constructed (enabled), else null. */
   getParallelWorkSentinel(): ParallelWorkSentinel | null {
     return this.parallelWorkSentinel;
+  }
+
+  /** Wiring-integrity accessor: the action-derived activity note store (CMT-810), else null. */
+  getTopicActionNoteStore(): TopicActionNoteStore | null {
+    return this.topicActionNotes;
   }
 
   /**

@@ -349,10 +349,12 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'parallelWork',
     prefixes: ['/parallel-work'],
-    description: 'Parallel-Work Awareness — a cross-topic read index over the Topic-Intent layer: every topic, its current focus, high-specificity tags, and whether a session is live on it. Lets the agent see what all its hands are doing across topics/sessions (the overlap-councilor read surface; the proactive ParallelWorkSentinel is Phase B, ships dark). Signal-only; never gates.',
+    description: 'Parallel-Work Awareness — a cross-topic read index over the Topic-Intent layer PLUS action-derived activity notes (CMT-810): every topic, its current focus, high-specificity tags, its lastAction (the concrete action it last claimed or asked the operator to approve — written automatically by the action-claim observer the moment the turn finishes), and whether a session is live on it. Lets the agent see what all its hands are doing across topics/sessions before advising the operator (the overlap-councilor read surface; the proactive ParallelWorkSentinel is Phase B, dev-gated, with a verifiable runtime at /parallel-work/sentinel). Signal-only; never gates.',
     build: ({ ctx }) => ({
       configured: !!ctx.parallelActivityIndex,
-      endpoints: ['GET /parallel-work/activities'],
+      actionNotes: !!ctx.topicActionNotes,
+      sentinelConstructed: !!ctx.parallelWorkSentinel,
+      endpoints: ['GET /parallel-work/activities', 'GET /parallel-work/sentinel'],
     }),
   },
   {

@@ -779,10 +779,17 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     kind: 'config',
     configPath: 'monitoring.parallelWorkSentinel.enabled',
     defaultEnabled: false,
+    // Default cadence (monitoring.parallelWorkSentinel.cadenceMinutes, 15). The
+    // staleness threshold is 5× this, so an operator cadence above 75 min reads
+    // on-stale between ticks — honest: the guard then genuinely runs that rarely.
+    expectedTickMs: 15 * 60_000,
     process: 'server',
-    expectRuntime: false,
+    // expectRuntime honesty: TRUE only because AgentServer registers
+    // ParallelWorkSentinel.guardStatus() at construction (CMT-810, Defect 2 —
+    // before that the row read on-unverified/not-instrumented forever).
+    expectRuntime: true,
     component: 'ParallelWorkSentinel',
-    description: 'Cross-topic overlap councilor (dev-gated, Phase B).',
+    description: 'Cross-topic overlap councilor (dev-gated, Phase B). Ticks on a cadence over the parallel-activity index; lastTickAt confirms it is genuinely running.',
   },
   {
     key: 'monitoring.resourceLedger.enabled',
