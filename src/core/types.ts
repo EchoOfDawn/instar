@@ -3851,6 +3851,21 @@ export interface InstarConfig {
    * resolveDevAgentGate decides — LIVE on a development agent, DARK on the
    * fleet — with `dryRun: true` FIRST (delivery is externally visible).
    */
+  /**
+   * Parallel-Work Awareness — action-derived activity notes (CMT-810; extends
+   * docs/specs/parallel-activity-coherence.md Phase A). When the action-claim observer
+   * classifies a concrete action claim or an operator-approval request for a topic, a
+   * durable note is written for that topic and the cross-topic activity index surfaces
+   * it immediately as the topic's focus/tags/lastAction. Signal-only; never gates.
+   */
+  parallelWork?: {
+    actionNotes?: {
+      /** Kill switch (default: true — absent means on). Read live. */
+      enabled?: boolean;
+      /** How long a note keeps shaping a topic's focus/tags, in hours (default 24). */
+      windowHours?: number;
+    };
+  };
   conversationIdentity?: {
     /** §3.1 fleet workspace pin (source 1 — authoritative when present): the ONE
      *  Slack teamId this fleet mints concrete-workspace ids for. */
@@ -6059,6 +6074,12 @@ export interface MonitoringConfig {
     enabled: boolean;
     /** Cadence between overlap scans, in minutes (default 15). */
     cadenceMinutes?: number;
+    /**
+     * Delay before the FIRST tick after construction, in seconds (default 30). Without
+     * it the guard-posture row reads on-stale for a whole cadence after every boot
+     * (CMT-810). 0 disables the early tick (first tick waits a full cadence).
+     */
+    initialTickDelaySeconds?: number;
   };
   /**
    * tmux Event-Loop Resilience, Increment 1 (docs/specs/tmux-event-loop-resilience-spec.md).

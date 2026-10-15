@@ -9912,6 +9912,27 @@ See what ALL your hands are doing across topics/sessions at once (like a king wi
       result.upgraded.push('CLAUDE.md: added Parallel-Work Awareness');
     }
 
+    // CMT-810 (2026-10-14) — action-derived activity notes. Existing agents must learn
+    // that the cross-topic index now carries what each topic last DID or ASKED TO DO
+    // (restart / push / approval requests), written automatically, so a sibling
+    // session reads `lastAction` before advising the operator about the same
+    // machine. Content-sniffed on the `lastAction` field name for idempotency.
+    if (content.includes('Parallel-Work Awareness') && !content.includes('lastAction')) {
+      const anchor = 'Spec: `docs/specs/parallel-activity-coherence.md`.';
+      const bullet = `
+- **Action-derived awareness (CMT-810)**: the index is no longer written only from conversation. The moment one of your turns makes a concrete action claim ("I'll restart it") or asks the operator to approve one ("may I restart the Studio?"), a note is written for that topic automatically and the index shows it as the topic's \`focus\` + tags + a \`lastAction\` field (\`{ kind: action-claim | approval-request, verb, excerpt, at }\`). **Before you advise the operator about a machine, deployment, or restart, read the index** — if another topic's \`lastAction\` already names that action, say so instead of contradicting it (the 2026-10-14 incident: two sessions gave opposite restart advice the same afternoon). Is the overlap councilor genuinely running? \`GET /parallel-work/sentinel\` (503 = dark on this agent); \`GET /guards\` grades \`monitoring.parallelWorkSentinel.enabled\` on-confirmed from its real last tick. Kill switch: \`parallelWork.actionNotes.enabled: false\` (read live).`;
+      const at = content.indexOf(anchor);
+      if (at >= 0) {
+        const lineEnd = content.indexOf('\n', at);
+        const insertAt = lineEnd >= 0 ? lineEnd : content.length;
+        content = content.slice(0, insertAt) + bullet + content.slice(insertAt);
+      } else {
+        content += '\n' + bullet + '\n';
+      }
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added Parallel-Work Awareness action-derived notes (CMT-810)');
+    }
+
     // Per-Component Framework Routing (2026-06-03) — Agent Awareness + Migration
     // Parity: existing agents must learn they can route internal components
     // (sentinels/gates) to a different framework (e.g. sentinels on Codex) to
@@ -12804,6 +12825,20 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
         config.sessions = sessions;
         patched = true;
         result.upgraded.push('config.json: added sessions.retainedClaudeBinary default (enabled: true)');
+      }
+    }
+
+    // CMT-810 parallel-session awareness: surface the action-notes kill switch.
+    // The code default is ON (absent = on); this only writes the explicit block
+    // when `parallelWork.actionNotes` is missing, so an operator's `enabled: false`
+    // or a custom window is never overwritten. Idempotent.
+    {
+      const pw: Record<string, unknown> = (config.parallelWork && typeof config.parallelWork === 'object') ? config.parallelWork as Record<string, unknown> : {};
+      if (!pw.actionNotes || typeof pw.actionNotes !== 'object') {
+        pw.actionNotes = { enabled: true, windowHours: 24 };
+        config.parallelWork = pw;
+        patched = true;
+        result.upgraded.push('config.json: added parallelWork.actionNotes default (enabled: true, windowHours: 24)');
       }
     }
 
