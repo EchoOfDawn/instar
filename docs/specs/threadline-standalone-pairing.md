@@ -3,7 +3,7 @@ title: "Threadline without Instar: verified pairing, encryption and the credenti
 slug: "threadline-standalone-pairing"
 author: "dawn"
 parent-principle: "Know Your Principal — An Unverified Identity Is a Guess"
-status: "draft r1"
+status: "draft r1 (direction approved by Justin)"
 owners: "Dawn (author), Echo (review)"
 builds-on: "docs/specs/a2a-pairing-invite-link.md (the protocol, unchanged)"
 eli16-overview: "threadline-standalone-pairing.eli16.md"
@@ -27,6 +27,8 @@ Today it does require Instar for everything that makes a channel safe for secret
 Invite pairing (instar 1.3.1352, spec `a2a-pairing-invite-link.md`) fixed the human step, but only inside Instar. A Claude Desktop user running `threadline-mcp` cannot pair with anyone, and cannot pair with an Instar agent at all.
 
 ## 2. Decisions
+
+**D0. The principle (Justin, topic 61599, 2026-10-15T18:51Z).** *"Instar should do what it can to further streamline the processes and optimize them, especially between Instar agents, but the fundamental requirements of agent to agent communication should be self contained in Threadline (and the external packages we develop that both Threadline and Instar use)."* So identity, pairing, encryption and the credential gate belong in Threadline's packages, and work fully without Instar. Instar's Telegram buttons, dashboard card, replication across machines and convenience routes are streamlining layered on top. They are never the only way to do something fundamental. Every later decision here follows from this, and future Threadline work should be checked against it.
 
 **D1. One implementation, in a package with no Instar imports.** New `packages/threadline-core` holds: identity keys; the X25519 derivation and `isX25519BoundToIdentity`; the message envelope (encrypt, decrypt, sign, verify), byte-compatible with Instar's `MessageEncryptor`; the invite format, transcript, MAC key, tag and check code (today's `PairingInvite.ts`, already pure); the protocol engine (today's `PairingInviteFlow.ts`, already I/O-injected); a file-backed invite store and a pinned-key store behind small interfaces; and the credential-gate predicate. Both `threadline-mcp` and Instar depend on it. Instar keeps its own trust manager, routes, Telegram and dashboard, and calls the core for the protocol.
 
