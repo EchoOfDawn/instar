@@ -119,6 +119,7 @@ Round 2 (re-verification against the refreshed worktree, 2026-10-14 17:00 PDT) �
 - Integration: `tests/integration/parallel-work-action-notes-route.test.ts` (observe → activities round-trip; kill switch; dedupe; scrub; `/parallel-work/sentinel`; `/guards` on-stale → on-confirmed).
 - E2E: `tests/e2e/parallel-work-action-notes-lifecycle.test.ts` (real `AgentServer` boot: store wired, 200 not 503, GuardRegistry registration, on-confirmed after a tick, source callsite pin).
 - Spec amendment: `docs/specs/parallel-activity-coherence.md` → "Amendment 2026-10-14"; ELI16 addendum in the companion.
+- Ratchets: `tests/unit/no-silent-fallbacks.test.ts` counted the five new fail-safe catches (store record/notes/listTopicIds, index safeLatestNote, route recordParallelActivityNote); each carries an in-brace `@silent-fallback-ok` naming why the degraded outcome (a missed note) is the honest one. `lint-bounded-judgment-input` is satisfied with an inline `bounded-input-reviewed` note on the 16KB clamp (regex classifiers, never a prompt).
 
 ---
 

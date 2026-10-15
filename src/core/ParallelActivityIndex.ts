@@ -203,6 +203,8 @@ export class ParallelActivityIndex {
     try {
       return this.opts.actionNotes?.latest(topicId, nowMs, this.opts.actionNoteWindowMs ?? ACTION_NOTE_WINDOW_MS) ?? null;
     } catch {
+      // @silent-fallback-ok: a broken notes provider must not blind the intent-backed
+      // row (same contract as safeRefs); the row is served without its action note.
       return null;
     }
   }

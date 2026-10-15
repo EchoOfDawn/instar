@@ -2548,7 +2548,10 @@ export function createRoutes(ctx: RouteContext): Router {
       const r = ctx.topicActionNotes.record(topicId, { kind, verb, excerpt, source });
       return r ? { kind, verb, deduped: r.deduped } : null;
     } catch {
-      return null; // observability must never break the observer path
+      // @silent-fallback-ok: the note is observability layered on a signal-only
+      // observer; the observe response (and the commitment lane) must proceed
+      // unchanged whether or not the note could be written.
+      return null;
     }
   };
 

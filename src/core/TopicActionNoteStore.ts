@@ -114,7 +114,10 @@ export class TopicActionNoteStore {
       this.write(file);
       return { note, deduped: false };
     } catch {
-      return null; // a failed write must never break the observer path
+      // @silent-fallback-ok: observability-only write on the Stop-hook path — a disk
+      // error here must never break the turn that fed it; the missed note is the
+      // honest outcome (the index simply does not show it), never a corrupt file.
+      return null;
     }
   }
 
@@ -123,6 +126,9 @@ export class TopicActionNoteStore {
     try {
       return this.read(topicId).notes;
     } catch {
+      // @silent-fallback-ok: a corrupt per-topic note file reads as "no notes" so the
+      // cross-topic index keeps answering for every other topic; the next record()
+      // rewrites the file whole.
       return [];
     }
   }
@@ -143,6 +149,8 @@ export class TopicActionNoteStore {
     try {
       names = fs.readdirSync(this.dir);
     } catch {
+      // @silent-fallback-ok: no notes directory yet (nothing observed) ⇒ no note-bearing
+      // topics — the correct answer, not a degraded one.
       return [];
     }
     const ids: number[] = [];
