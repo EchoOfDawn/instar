@@ -110,6 +110,13 @@ An independent review by GPT 5.4 and Gemini 3.1 Pro (Grok unreachable) found no 
 - `pairTools.ts`: `threadline_pair_status` names the audit file.
 - Evidence: `standalone-pairing.test.ts` (2: what is recorded and what never is, 0600; rotation and an unwritable dir). Breakages: 5 tried, 5 caught.
 
+## Fix: no lost messages while the inviter has not finished (added 2026-10-16)
+
+- Found while assessing step 9: an acceptor holds the inviter's key from the moment it approves, but the inviter holds no key for the acceptor until its person finishes. `pairing.ts` sent every message to a pinned peer encrypted, so a message in that window reached an inviter that could not open it (Instar: unknown-sender, dropped; standalone: refused). Now an `invite-accepted` pin that is NOT paused sends as before pairing (plaintext, reported `encrypted: false`); paired and paused pins stay encrypted (a paused pin was verified on both sides, so the peer can read it).
+- `threadline-core` `PeerProfile` gains optional `via` (type only; the store already wrote it).
+- Evidence: `standalone-pairing.test.ts` (a message in the window is delivered; after finish it is encrypted; after a pause it is still encrypted and delivered). Breakages: 2 tried, 2 caught.
+- Step 9 consequence: Instar's equivalent change (encrypt ordinary chat to pinned peers) must use the same rule, encrypting only to `mutual-verified` (or paused) pins, never to a pin still waiting for the inviter's Finish.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

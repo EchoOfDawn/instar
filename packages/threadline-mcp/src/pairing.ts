@@ -133,8 +133,8 @@ export class StandalonePairing {
   }
 
   /**
-   * Send an ordinary message. A peer with a pinned key is ALWAYS sent encrypted (never a silent
-   * downgrade). `credential: true` is refused unless the peer is mutual-verified and bound to our
+   * Send an ordinary message. A paired peer is ALWAYS sent encrypted (never a silent downgrade);
+   * an acceptor still waiting for the inviter's Finish sends as before pairing (see below). `credential: true` is refused unless the peer is mutual-verified and bound to our
    * current key, and then goes only to the key derived from the pin.
    */
   send(to: string, text: string, opts: { threadId?: string; credential?: boolean } = {}): { sent: true; threadId: string; encrypted: boolean } | { sent: false; reason: string } {
@@ -146,7 +146,12 @@ export class StandalonePairing {
       return { sent: true, encrypted: true, threadId: this.sendEncrypted(fp, d.peerIdentityPub, { content: text, type: 'chat', metadata: { credential: true } }, opts.threadId) };
     }
     const pin = this.keys.getProfileByFingerprint(fp);
-    if (pin?.peerIdentityPub) {
+    // An acceptor whose pairing the inviter has not finished yet holds the inviter's key, but the
+    // inviter does not hold ours yet: an encrypted message would be dropped as from an unknown
+    // sender. Until the Finish arrives we send as before pairing. A pin PAUSED after a leaked
+    // invite was verified on both sides, so the peer can still read it: that stays encrypted.
+    const awaitingFinish = pin?.pairingState === 'invite-accepted' && !String(pin.via ?? '').startsWith('paused:');
+    if (pin?.peerIdentityPub && !awaitingFinish) {
       return { sent: true, encrypted: true, threadId: this.sendEncrypted(fp, Buffer.from(pin.peerIdentityPub, 'hex'), { content: text, type: 'chat' }, opts.threadId) };
     }
     return { sent: true, encrypted: false, threadId: this.sendPlaintextTyped(fp, 'chat', text, opts.threadId) };

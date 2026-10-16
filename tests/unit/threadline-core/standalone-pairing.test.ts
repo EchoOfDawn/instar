@@ -120,6 +120,25 @@ describe('StandalonePairing', () => {
     expect(await B.p.receive(tampered as never)).toEqual({ kind: 'refused', reason: 'could not verify or decrypt with the pinned key' });
   });
 
+  it('while waiting for the inviter to finish, the acceptor sends as before pairing, so nothing is lost; a paused pin stays encrypted', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    const inv = A.p.flow.createInvite() as { ok: true; iid: string; message: string };
+    const r = await B.p.flow.receiveInvite(inv.message) as { iid: string };
+    B.p.flow.approveAccept(r.iid);
+    await pump(wire, [A, B]); // A now waits for its person; it holds no pin for B
+    expect(B.p.send(A.fp, 'are you there?')).toMatchObject({ sent: true, encrypted: false });
+    expect(await pump(wire, [A, B])).toEqual([expect.objectContaining({ kind: 'message', text: 'are you there?' })]);
+    A.p.flow.approveFinish(inv.iid);
+    await tick();
+    await pump(wire, [A, B]);
+    expect(B.p.send(A.fp, 'now paired')).toMatchObject({ encrypted: true });
+    expect(await pump(wire, [A, B])).toEqual([expect.objectContaining({ kind: 'message', encrypted: true })]);
+    B.p.keys.demoteInvitePairing(A.fp, 'second accept');
+    expect(B.p.send(A.fp, 'still private')).toMatchObject({ encrypted: true });
+    expect(await pump(wire, [A, B])).toEqual([expect.objectContaining({ kind: 'message', text: 'still private', encrypted: true })]);
+  });
+
   it('a captured encrypted envelope is accepted once; a replay of it is refused, and a forgery cannot burn its id', async () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire), B = agent('b', wire);

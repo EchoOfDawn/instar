@@ -25,6 +25,8 @@ export interface PeerProfile {
   pairingState?: string;
   pairingId?: string;
   verifiedAt?: string;
+  /** How the pin was set; `paused: <reason>` after a leaked invite was used twice. */
+  via?: string;
 }
 
 /** What the pairing engine needs from a trust store. Instar's AgentTrustManager fits this shape. */
