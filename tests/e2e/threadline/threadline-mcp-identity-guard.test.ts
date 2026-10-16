@@ -25,3 +25,23 @@ describe.skipIf(!hasDeps)('threadline-mcp identity guard', () => {
     expect(fs.readFileSync(path.join(sd, 'identity.json'), 'utf8')).toBe('{ "agentId": "trunc');
   });
 });
+
+describe.skipIf(!hasDeps)('threadline-mcp: two servers on one state directory', () => {
+  it('the second one does not own pairing and says so; the first does', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+    const sd = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-two-'));
+    const env = { ...process.env as Record<string, string>, THREADLINE_STATE_DIR: sd, THREADLINE_SEND_PORT: '1', THREADLINE_RELAY: 'ws://127.0.0.1:9/v1/connect' };
+    const start = async () => {
+      const c = new Client({ name: 'host', version: '1.0.0' }, { capabilities: { elicitation: {} } });
+      await c.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(pkg, 'dist', 'server.js')], env, stderr: 'pipe' }));
+      return c;
+    };
+    const first = await start();
+    const second = await start();
+    const text = async (c: InstanceType<typeof Client>) => JSON.stringify((await c.callTool({ name: 'threadline_pair_invite', arguments: {} })).content);
+    expect(await text(second)).toMatch(/owns pairing/);
+    expect(await text(first)).not.toMatch(/Pairing is unavailable/);
+    await second.close(); await first.close();
+  }, 60_000);
+});

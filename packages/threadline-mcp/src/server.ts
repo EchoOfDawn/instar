@@ -54,6 +54,7 @@ import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
 import { findInviteToken } from 'threadline-core';
 import { PairTools, type Elicit } from './pairTools.js';
 import { servePairSocket, runPairCli } from './pairSocket.js';
+import { acquireStateLock } from './stateLock.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -861,7 +862,9 @@ class RelayConnection {
       const r = this.pairing.send(to, text, { threadId, credential: opts.credential });
       if (!r.sent) throw new Error(r.reason === 'peer-not-mutually-verified'
         ? 'Refused: credentials only go to an agent you have paired with (threadline_pair_invite / threadline_pair_open).'
-        : r.reason === INVITE_IN_MESSAGE ? INVITE_REFUSAL : `Refused: ${r.reason}`);
+        : r.reason === INVITE_IN_MESSAGE ? INVITE_REFUSAL
+        : r.reason === 'not-pairing-owner' ? `Refused: credentials are sent only by the threadline-mcp that owns pairing here (${process.env.THREADLINE_STATE_DIR || 'the default state directory'}).`
+        : `Refused: ${r.reason}`);
       const kept = opts.credential ? `[credential, ${Buffer.byteLength(text, 'utf-8')} bytes]` : text;
       this.history.append(to, { id: crypto.randomUUID(), from: this.identity.agentId, to, text: kept, threadId: r.threadId, timestamp: new Date().toISOString(), direction: 'sent' });
       this.contacts.recordMessage(to, r.threadId);
@@ -1068,7 +1071,13 @@ async function main() {
     try { const u = new URL(RELAY_URL); return `${u.protocol === 'ws:' ? 'http:' : 'https:'}//${u.host}`; } catch { return null; }
   })();
   const pubKey = Buffer.from(identity.publicKey, 'base64');
+  // One instance per state directory owns pairing (Echo's review, SEC-5).
+  const stateLock = acquireStateLock(STATE_DIR);
+  if (!stateLock.held) process.stderr.write(`[threadline-mcp] Another threadline-mcp (pid ${stateLock.holderPid}) owns pairing for ${STATE_DIR}; this one will message but not pair or send credentials.\n`);
+  process.on('exit', () => stateLock.release());
+  const NOT_OWNER = `another threadline-mcp (pid ${stateLock.holderPid}) is running for this state directory and owns pairing. Use the app that started it, or give this one its own THREADLINE_STATE_DIR.`;
   const pairing = new StandalonePairing({
+    ownsPairing: stateLock.held,
     stateDir: STATE_DIR,
     identity: { fp: identity.agentId, publicKey: pubKey, privateKey: Buffer.from(identity.privateKey, 'base64') },
     ownName: () => ({ owner: process.env.THREADLINE_OWNER || os.userInfo().username, agent: profile.get().name }),
@@ -1100,7 +1109,7 @@ async function main() {
   const pairBase = {
     pairing,
     // Pairing ops travel on this server's own relay connection; through a listener proxy they cannot.
-    unavailable: () => (relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
+    unavailable: () => (!stateLock.held ? `Pairing is unavailable: ${NOT_OWNER}` : relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
     terminalEnabled: process.env.THREADLINE_PAIR_TERMINAL === '1',
     knownAgents: () => contacts.getAll().map((c) => ({ fingerprint: c.agentId, name: c.name })),
     resolvePeer: (nameOrFp: string) => {
@@ -1116,7 +1125,7 @@ async function main() {
   const pairSock = path.join(STATE_DIR, 'pair.sock');
   // Off unless the person turns it on in the host config: any process running as this user can
   // reach the socket, so a host that can ask the person directly never exposes it (spec D5).
-  if (process.env.THREADLINE_PAIR_TERMINAL === '1') {
+  if (process.env.THREADLINE_PAIR_TERMINAL === '1' && stateLock.held) {
     servePairSocket(pairSock, (e) => new PairTools({ ...pairBase, elicit: e }))
       .catch((err) => process.stderr.write(`[threadline-mcp] Terminal pairing unavailable (${pairSock}): ${err}\n`));
   }

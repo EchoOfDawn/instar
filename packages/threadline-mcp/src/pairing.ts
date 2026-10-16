@@ -44,6 +44,8 @@ export interface StandaloneDeps {
   /** HTTP base of the relay (for the public a2a card), or null to skip the relay-key check. */
   relayHttpBase: string | null;
   now?: () => Date;
+  /** False when another threadline-mcp owns pairing for this state directory (see stateLock.ts). */
+  ownsPairing?: boolean;
   fetchImpl?: typeof fetch;
 }
 
@@ -115,6 +117,11 @@ export class StandalonePairing {
       ownName: deps.ownName,
       now: this.now,
     });
+  }
+
+  /** Pins as they are on disk now: a non-owner re-reads them so a pairing the owner just made is honoured. */
+  private readKeys(): PinnedKeyStore {
+    return this.deps.ownsPairing === false ? new PinnedKeyStore(this.deps.stateDir, this.now, () => {}) : this.keys;
   }
 
   private seenFile(): string { return path.join(this.deps.stateDir, 'threadline', 'seen-messages.jsonl'); }
@@ -216,13 +223,15 @@ export class StandalonePairing {
     // An invite is handed over privately by a person, never relayed (spec D4): it works once,
     // and whoever sees it first is offered to the inviter's person.
     if (findInviteToken(text)) return { sent: false, reason: INVITE_IN_MESSAGE };
+    const keys = this.readKeys();
+    if (opts.credential && this.deps.ownsPairing === false) return { sent: false, reason: 'not-pairing-owner' };
     if (opts.credential) {
-      const d = credentialSendKey(this.keys, fp, this.deps.identity.publicKey.toString('hex'));
+      const d = credentialSendKey(keys, fp, this.deps.identity.publicKey.toString('hex'));
       this.audit({ kind: d.allow ? 'credential-sent' : 'credential-refused', to: fp, ...(d.allow ? {} : { reason: d.reason }) });
       if (!d.allow) return { sent: false, reason: d.reason };
       return { sent: true, encrypted: true, threadId: this.sendEncrypted(fp, d.peerIdentityPub, { content: text, type: 'chat', metadata: { credential: true } }, opts.threadId) };
     }
-    const pin = this.keys.getProfileByFingerprint(fp);
+    const pin = keys.getProfileByFingerprint(fp);
     // An acceptor whose pairing the inviter has not finished yet holds the inviter's key, but the
     // inviter does not hold ours yet: an encrypted message would be dropped as from an unknown
     // sender. Until the Finish arrives we send as before pairing. A pin PAUSED after a leaked
@@ -244,8 +253,9 @@ export class StandalonePairing {
 
   private async classify(env: WireEnvelope): Promise<Inbound> {
     const from = String(env.from || '').toLowerCase();
+    const keys = this.readKeys();
     if (env.signature && env.ephemeralPubKey) {
-      const pin = this.keys.getProfileByFingerprint(from);
+      const pin = keys.getProfileByFingerprint(from);
       if (!pin?.peerIdentityPub) return { kind: 'refused', reason: 'encrypted message from a sender with no pinned key' };
       let msg: PlaintextMessage;
       try {
@@ -263,11 +273,12 @@ export class StandalonePairing {
       if (this.seen.has(id)) return { kind: 'refused', reason: 'replayed message (already received)' };
       this.rememberSeen(id);
       if (msg.type && INVITE_OPS.has(msg.type)) {
+        if (this.deps.ownsPairing === false) return { kind: 'refused', reason: 'pairing message reached an instance that does not own pairing' };
         await this.flow.handleControl(msg.type, from, msg as unknown as Record<string, unknown>);
         return { kind: 'control' };
       }
       const credential = (msg.metadata as { credential?: unknown } | undefined)?.credential === true;
-      if (credential && !credentialAcceptFrom(this.keys, from, this.deps.identity.publicKey.toString('hex'))) return { kind: 'refused', reason: 'credential from a peer that is not mutual-verified' };
+      if (credential && !credentialAcceptFrom(keys, from, this.deps.identity.publicKey.toString('hex'))) return { kind: 'refused', reason: 'credential from a peer that is not mutual-verified' };
       if (credential) {
         // The timestamp is signed. Ordinary chat may legitimately arrive late (queued while we were
         // offline); a credential may not, so a captured one cannot be replayed under a new messageId later.
@@ -279,7 +290,7 @@ export class StandalonePairing {
       }
       // The downgrade high-water mark: ordinary chat only. Pairing ops and credentials are always
       // encrypted, even from peers that still send ordinary chat in plaintext.
-      if (!credential) this.markEncryptedChat(from);
+      if (!credential && this.deps.ownsPairing !== false) this.markEncryptedChat(from);
       return { kind: 'message', text: String(msg.content ?? ''), type: msg.type, encrypted: true, credential };
     }
     // Plaintext.
@@ -290,7 +301,7 @@ export class StandalonePairing {
     } catch { /* raw payload */ }
     if (type && INVITE_OPS.has(type)) {
       // Only the accept travels in plaintext; any other invite op in plaintext is dropped.
-      if (type === OP_ACCEPT) {
+      if (type === OP_ACCEPT && this.deps.ownsPairing !== false) {
         let payload: Record<string, unknown> = {};
         try { payload = JSON.parse(text); } catch { /* malformed: the engine refuses it */ }
         await this.flow.handleControl(type, from, payload);
@@ -303,7 +314,7 @@ export class StandalonePairing {
     // Once a peer has sent us encrypted chat, plaintext claiming to be from it is a downgrade and is
     // refused. Otherwise it is delivered marked as an unverified claim (Instar before step 9 sends
     // ordinary chat in plaintext). It never counts as a credential, and we never reply in plaintext.
-    const pin = this.keys.getProfileByFingerprint(from);
+    const pin = keys.getProfileByFingerprint(from);
     if (!pin?.peerIdentityPub) return { kind: 'message', text, type, encrypted: false, credential: false };
     if (this.encryptedChatSeen(from)) return { kind: 'refused', reason: 'plaintext from a paired agent that has sent encrypted messages before (possible downgrade)' };
     const signed = typeof env.signature === 'string'

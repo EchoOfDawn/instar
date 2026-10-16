@@ -165,6 +165,12 @@ Re-reading the spec against the build found three things it asked for that were 
 - Listener proxy mode is opt-in (SEC-9): only with `THREADLINE_USE_LISTENER=1`.
 - Evidence: `standalone-pairing.test.ts` (+3), proxy E2E (+1: a listener is ignored without opt-in), stdio E2E (history redaction), new `threadline-mcp-identity-guard.test.ts`. Breakages: 6 tried, 5 caught; the `to` check survives by construction (defence in depth, see above).
 
+## Spec-converge round 1: one owner per state directory (SEC-5)
+
+- New `stateLock.ts`: `<stateDir>/threadline/owner.lock` (pid, exclusive create, 0600); a lock whose pid is not running is taken over; released on exit, and only by its owner.
+- The owner alone pairs (tools and terminal socket), sends credentials, applies pairing messages and writes the encryptedSeen mark. Other instances refuse those with a reason that names the owner's pid, still exchange ordinary messages, and re-read pins from disk for every send and receive, so a pairing the owner just made is honoured at once (never downgraded).
+- Evidence: `state-lock.test.ts` (lock semantics; a non-owner refuses credentials, sees the owner's new pin, does not write the mark), E2E with two real servers on one state directory. Breakages: 6 tried, 6 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
