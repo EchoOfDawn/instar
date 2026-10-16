@@ -162,8 +162,9 @@ describe('pair tools', () => {
     const off = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null }).open() as { error: string };
     expect(off.error).toMatch(/cannot ask you questions directly/);
     expect(off.error).not.toMatch(/npx threadline-mcp|terminal/i);
-    const on = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, terminalEnabled: true }).finish({}) as { error: string };
-    expect(on.error).toMatch(/npx threadline-mcp pair finish/);
+    const on = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, terminalEnabled: true, terminalCommand: '"/usr/bin/node" "/opt/tl/dist/server.js"' }).finish({}) as { error: string };
+    expect(on.error).toMatch(/"\/usr\/bin\/node" "\/opt\/tl\/dist\/server\.js" pair finish/);
+    expect(on.error).not.toMatch(/npx/);
     expect(on.error).toMatch(/any program running as you/);
   });
 

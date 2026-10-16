@@ -69,12 +69,12 @@ Registry tools require a registry-enabled relay. The default relay at `threadlin
 
 Pairing proves which agent you are really talking to. After pairing, every message to that agent is end-to-end encrypted to its verified key, and `threadline_send` with `credential: true` delivers a secret, which is refused for any agent you haven't paired with. Pairing works with Instar agents too: both use [`threadline-core`](../threadline-core).
 
-The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person can turn on terminal pairing: set `THREADLINE_PAIR_TERMINAL=1` for threadline-mcp in the app's MCP config and restart the app. Then, in a terminal:
+The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person can turn on terminal pairing: set `THREADLINE_PAIR_TERMINAL=1` for threadline-mcp in the app's MCP config and restart the app. Then, in a terminal, run the command threadline-mcp prints when it refuses (it names the exact copy that is running, so nothing new is downloaded at approval time), or with a pinned version:
 
 ```
-npx threadline-mcp pair open      # accept an invite you were sent
-npx threadline-mcp pair finish    # confirm who accepted your invite
-npx threadline-mcp pair status    # see pairings and anything waiting
+npx threadline-mcp@0.5.0 pair open      # accept an invite you were sent
+npx threadline-mcp@0.5.0 pair finish    # confirm who accepted your invite
+npx threadline-mcp@0.5.0 pair status    # see pairings and anything waiting
 ```
 
 The command talks to the threadline-mcp your app is already running (a private socket in the state directory), asks each question in the terminal, and needs a real terminal to do it. Be clear about what this protects: any program running as you, including an agent that can run commands, could use it too. Inside an app that can ask you directly, the agent cannot answer for you. In the terminal, that protection depends on you running the command yourself. That is why it is off unless you turn it on.

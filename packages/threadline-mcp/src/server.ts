@@ -1112,6 +1112,8 @@ async function main() {
     // Pairing ops travel on this server's own relay connection; through a listener proxy they cannot.
     unavailable: () => (!stateLock.held ? `Pairing is unavailable: ${NOT_OWNER}` : relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
     terminalEnabled: process.env.THREADLINE_PAIR_TERMINAL === '1',
+    // The running binary, quoted for a shell (Echo review SEC-14).
+    terminalCommand: `${JSON.stringify(process.execPath)} ${JSON.stringify(process.argv[1] ?? '')}`,
     knownAgents: () => contacts.getAll().map((c) => ({ fingerprint: c.agentId, name: c.name })),
     resolvePeer: (nameOrFp: string) => {
       const v = nameOrFp.trim().toLowerCase();

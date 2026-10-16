@@ -202,6 +202,10 @@ Re-reading the spec against the build found three things it asked for that were 
 - `publish-threadline-mcp.yml`: the same split as threadline-core: a `test` job without secrets (build + both smoke steps), then `publish` (needs test, main only, no persisted credentials, `--ignore-scripts`, `NPM_TOKEN` only on the publish step, `RELEASE_TOKEN` only on the push). It previously had no ref check at all (SEC-1's note).
 - `threadline-mcp` depends on exactly `threadline-core` `0.1.0`, not `^0.1.0`, so one bad core publish cannot reach every `npx threadline-mcp` user (SEC-13). The lockfile is regenerated once core is on npm (already a release step).
 
+## Spec-converge round 1: the refusal names the running binary (SEC-14)
+
+- With terminal pairing on, the no-elicitation refusal now names this server's own binary (`"<node>" "<path to dist/server.js>"`), never a bare `npx threadline-mcp`, which could fetch a different version or a look-alike package at approval time. The README pins the version in its examples. Evidence: `pair-tools.test.ts` (the refusal names the given binary and never `npx`).
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
