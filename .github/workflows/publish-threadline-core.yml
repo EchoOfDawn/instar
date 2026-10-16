@@ -1,0 +1,80 @@
+name: Publish threadline-core
+
+# Publishes packages/threadline-core to npm as threadline-core: Threadline's agent-to-agent
+# fundamentals (identity, encrypted envelopes, pairing by invite, pinned keys, the credential
+# gate) with no framework attached (spec docs/specs/threadline-standalone-pairing.md). It must be
+# on npm BEFORE a threadline-mcp release that depends on it. The package has no lockfile, so
+# dependencies come from `npm install`; `npm test` builds and runs its tests before publishing.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/threadline-core/**'
+
+concurrency:
+  group: publish-threadline-core
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish threadline-core
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # RELEASE_TOKEN is a PAT that can bypass branch protection for version bump commits.
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        working-directory: packages/threadline-core
+        run: npm install --no-audit --no-fund
+
+      - name: Build and test
+        working-directory: packages/threadline-core
+        run: npm test
+
+      - name: Check if version changed
+        id: check
+        working-directory: packages/threadline-core
+        run: |
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npm view threadline-core version 2>/dev/null || echo "0.0.0")
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            npm version patch --no-git-tag-version
+            NEW=$(node -p "require('./package.json').version")
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "version=$NEW" >> "$GITHUB_OUTPUT"
+            echo "Bumped $LOCAL → $NEW"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "version=$LOCAL" >> "$GITHUB_OUTPUT"
+            echo "Already at $LOCAL (remote: $REMOTE)"
+          fi
+
+      - name: Publish to npm
+        working-directory: packages/threadline-core
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Commit version bump
+        if: steps.check.outputs.bumped == 'true'
+        env:
+          HUSKY: '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/threadline-core/package.json
+          git commit -m "chore: release threadline-core v${{ steps.check.outputs.version }} [skip ci]"
+          git push origin main
