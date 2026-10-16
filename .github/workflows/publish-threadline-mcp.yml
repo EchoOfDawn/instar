@@ -72,6 +72,9 @@ jobs:
     name: Publish threadline-mcp
     needs: test
     runs-on: ubuntu-latest
+    # Only main can deploy to this environment (repo setting), so a branch's edited copy of this
+    # workflow cannot reach what it holds (Echo's review of #2192, SEC-1).
+    environment: npm-publish
     if: "github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')"
     permissions:
       contents: read
@@ -109,6 +112,12 @@ jobs:
             echo "version=$LOCAL" >> "$GITHUB_OUTPUT"
             echo "Already at $LOCAL (remote: $REMOTE)"
           fi
+
+      # npm trusted publishing (OIDC, no stored npm token) needs npm 11.5.1 or later. NPM_TOKEN stays
+      # only as the fallback for the first publish of a new package; remove it from the repo once the
+      # package's trusted publisher (this repo, this workflow, environment npm-publish) is set on npmjs.com.
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@^11.5.1
 
       - name: Publish to npm
         working-directory: packages/threadline-mcp

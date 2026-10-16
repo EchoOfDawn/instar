@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { acquireStateLock } from '../../../packages/threadline-mcp/src/stateLock.js';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
-import { generateIdentityKeyPair } from 'threadline-core';
+import { generateIdentityKeyPair } from '@sagemindai/threadline-core';
 
 describe('state lock', () => {
   it('the first instance owns it; a second live one does not; a dead holder is taken over; release only removes our own', () => {

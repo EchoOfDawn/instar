@@ -13,10 +13,10 @@ import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { PinnedKeyStore, generateIdentityKeyPair } from 'threadline-core';
+import { PinnedKeyStore, generateIdentityKeyPair } from '@sagemindai/threadline-core';
 
 const pkg = path.resolve(__dirname, '../../../packages/threadline-mcp');
-const hasDeps = fs.existsSync(path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk')) && fs.existsSync(path.join(pkg, 'node_modules', 'threadline-core'));
+const hasDeps = fs.existsSync(path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk')) && fs.existsSync(path.join(pkg, 'node_modules', '@sagemindai', 'threadline-core'));
 
 describe.skipIf(!hasDeps)('threadline-mcp through a listener proxy', () => {
   let listener: http.Server;

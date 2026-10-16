@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { PairTools } from '../../../packages/threadline-mcp/src/pairTools.js';
-import { generateIdentityKeyPair, sign, canonicalizeEnvelope } from 'threadline-core';
+import { generateIdentityKeyPair, sign, canonicalizeEnvelope } from '@sagemindai/threadline-core';
 
 type Env = Record<string, unknown> & { from: string; to: string };
 

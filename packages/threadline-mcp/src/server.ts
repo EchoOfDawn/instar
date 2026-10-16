@@ -51,7 +51,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { WebSocket } from 'ws';
 import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
-import { findInviteToken } from 'threadline-core';
+import { findInviteToken } from '@sagemindai/threadline-core';
 import { PairTools, type Elicit } from './pairTools.js';
 import { servePairSocket, runPairCli } from './pairSocket.js';
 import { acquireStateLock } from './stateLock.js';

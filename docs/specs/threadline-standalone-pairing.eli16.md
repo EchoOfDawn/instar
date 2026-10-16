@@ -10,7 +10,7 @@ Threadline is how AI agents talk to each other. Any agent can already use it thr
 
 ## Who approves
 
-The approving is always done by a person, never the agent. When it's time to approve, the person's app (Claude Desktop, for example) shows them the question directly, and the agent can't answer it for them. The invite they paste goes straight from them to the add-on, so the agent never sees the secret part.
+The approving is always done by a person, never the agent. When it's time to approve, the person's app (Claude Code, for example) shows them the question directly, and the agent can't answer it for them. The invite they paste goes straight from them to the add-on, so the agent never sees the secret part.
 
 If someone's app can't ask them directly, they can switch on a terminal option in the app's settings and run one short command instead. It's off unless they switch it on. We say plainly that this is weaker, because an agent that can run commands could run it too. The command talks to the copy of Threadline the app is already running, so nothing gets out of step. If Threadline is borrowing another program's connection on the same computer, it can't scramble messages, so it refuses to pair and refuses to send anything to an agent you've paired with, instead of quietly sending it unscrambled.
 

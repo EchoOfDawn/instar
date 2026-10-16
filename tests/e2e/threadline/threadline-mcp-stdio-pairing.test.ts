@@ -21,7 +21,7 @@ import type { TempProject } from '../../helpers/setup.js';
 import type { InviteEvent } from '../../../src/threadline/PairingInviteFlow.js';
 
 const pkg = path.resolve(__dirname, '../../../packages/threadline-mcp');
-const hasDeps = fs.existsSync(path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk')) && fs.existsSync(path.join(pkg, 'node_modules', 'threadline-core'));
+const hasDeps = fs.existsSync(path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk')) && fs.existsSync(path.join(pkg, 'node_modules', '@sagemindai', 'threadline-core'));
 
 describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
   let relay: RelayServer;

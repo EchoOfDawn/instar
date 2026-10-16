@@ -24,7 +24,7 @@ Today it does require Instar for everything that makes a channel safe for secret
 - has **no verified pairing**. Its `trust` field (`unknown | seen | conversed | trusted`) is set by the agent itself and proves nothing about a key;
 - has **no credential gate**. Nothing refuses to send a secret to an agent whose key nobody verified.
 
-Invite pairing (instar 1.3.1352, spec `a2a-pairing-invite-link.md`) fixed the human step, but only inside Instar. A Claude Desktop user running `threadline-mcp` cannot pair with anyone, and cannot pair with an Instar agent at all.
+Invite pairing (instar 1.3.1352, spec `a2a-pairing-invite-link.md`) fixed the human step, but only inside Instar. Someone running `threadline-mcp` in Claude Code cannot pair with anyone, and cannot pair with an Instar agent at all.
 
 ## 2. Decisions
 
@@ -54,13 +54,15 @@ Inbound plaintext is not attributed to a pinned peer on the relay's word. On the
 
 **D9. Instar always encrypts ordinary chat to a mutual-verified peer, using the pinned key.** Today Instar 1.3.1352 encrypts ordinary chat only when the relay hands it the peer's X25519 key. After this step, for a peer that is `mutual-verified` through an invite pairing, Instar encrypts every ordinary message to the X25519 key derived from the PINNED identity key, regardless of what the relay offers, and never sends that peer plaintext. If the envelope cannot be built (no pinned key, a key that fails `isX25519BoundToIdentity`, any encryption error), the send is refused with the reason; it never falls back to plaintext. If the peer cannot decrypt, that is the peer's refusal (D6), surfaced to Instar as a failed delivery, and Instar does not retry in plaintext. Peers paired by the older SAS method keep the previous rule, because they may run a version before 1.3.1345, which cannot decrypt to a pinned key without a cached one; both sides of an invite pairing run 1.3.1352 or later. **Multi-machine, open for review:** the pairing replicated to an agent's other machines (FD11) carries five fields and arrives there as `identity-verified`, with no record of whether it was an invite or an SAS pairing. A standby machine therefore cannot tell that D9 applies, and as built it keeps the previous rule for those peers. That is safe (nothing is sent that the peer cannot read), but it is not yet "always encrypted" from a standby. Closing it means adding the pairing method as a sixth replicated field, so a standby encrypts with the same pinned key; that changes the replicated-store schema and is proposed, not assumed (§8.2). This changes Instar's behaviour, so it ships as its own rollout step (§7 step 5) behind this spec.
 
-**D10. `threadline-core` is published on its own to npm, from `main` only.** It is a separate package (`threadline-core`, public, MIT), published by `.github/workflows/publish-threadline-core.yml`:
-- **Trigger:** a push to `main` that touches `packages/threadline-core/**`, or a manual `workflow_dispatch`; the job runs only when `github.ref` is `refs/heads/main`, so a manual run on any other branch publishes nothing. Never `pull_request`, so a fork or PR cannot publish. Commits whose message contains `[skip ci]` are skipped.
-- **Who can cause a publish:** only someone who can land a commit on `main` (branch protection plus review) or run a workflow with repo write access.
-- **Tokens:** the `NPM_TOKEN` repository secret for `npm publish`; `RELEASE_TOKEN` only to push the version-bump commit; `id-token: write` for provenance.
+**D10. The shared package is published on its own to npm as `@sagemindai/threadline-core`, from `main` only.** (Scoped so the name cannot be taken by someone else before the first publish, Echo's review SEC-13; Justin's decision, topic 61599, 2026-10-16.) It is public and MIT, published by `.github/workflows/publish-threadline-core.yml`; `threadline-mcp` publishes the same way:
+- **Trigger:** a push to `main` that touches the package, or a manual `workflow_dispatch`; jobs run only when `github.ref` is `refs/heads/main`. Never `pull_request`. Commits whose message contains `[skip ci]` are skipped.
+- **Two jobs:** `test` builds and runs the package tests and the protocol suite with no secrets (read-only token, no persisted credentials, install scripts disabled); `publish` runs only after it passes.
+- **Who can cause a publish:** the `publish` job deploys to the GitHub Environment `npm-publish`, which only `main` may deploy to, so only someone who can land a commit on `main` can publish; a branch's edited copy of the workflow cannot reach what the environment holds.
+- **Credentials:** npm trusted publishing (GitHub OIDC, `id-token: write`), so no long-lived npm token is needed once the package's trusted publisher (this repository, this workflow, environment `npm-publish`) is configured on npmjs.com. `NPM_TOKEN` remains only as the fallback for the first publish of a new package and is then removed. `RELEASE_TOKEN` is used only to push the version-bump commit, and belongs in the environment rather than the repository.
 - **Provenance:** `npm publish --provenance --access public`, so every version links to the workflow run and commit that built it.
-- **Version:** the job builds and runs the package's tests first. If `package.json` equals the published version it bumps the patch and commits the bump with `[skip ci]`; otherwise it publishes `package.json`'s version as is. The first publish is `0.1.0` and is permanent.
-- **Order:** a `threadline-mcp` release that depends on `threadline-core` waits until that version is on npm.
+- **Version:** if `package.json` equals the published version the job bumps the patch and commits the bump with `[skip ci]`; otherwise it publishes `package.json`'s version. A concurrency group stops two runs bumping the same version.
+- **Pinning:** `threadline-mcp` (and later Instar) depends on an exact version of the shared package, so one bad publish cannot reach every user.
+- **Order:** a `threadline-mcp` release waits until the shared package version it pins is on npm.
 
 ## 3. The protocol
 
@@ -102,7 +104,7 @@ Inbound invite ops are handled by the server's relay listener, never surfaced to
 
 ## 8. Questions for review
 
-1. Is elicitation support in the hosts we care about (Claude Desktop, Claude Code) reliable enough to make D5 the rare case? A sub-agent's reading of Claude Code's documentation found that Claude Code shows an elicitation request as a dialog and waits for the person; Claude Desktop is unconfirmed. The walkthrough (step 4) settles Claude Code.
+1. Decided (Justin, 2026-10-16): Claude Desktop is not a required host and never has been. The supported path is a host with MCP elicitation, which Claude Code has; D5 covers any host without it. Remaining question: is elicitation reliable enough in Claude Code to keep D5 the rare case? A sub-agent's reading of Claude Code's documentation found that Claude Code shows an elicitation request as a dialog and waits for the person; Claude Desktop is unconfirmed. The walkthrough (step 4) settles Claude Code.
 2. D9 on a standby machine: should the replicated pairing record carry the pairing method (`invite` or `sas`), so a standby applies D9 with the same pinned key?
 
 ## 9. Later

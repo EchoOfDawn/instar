@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { PairTools, type Elicit } from '../../../packages/threadline-mcp/src/pairTools.js';
-import { generateIdentityKeyPair, findInviteToken } from 'threadline-core';
+import { generateIdentityKeyPair, findInviteToken } from '@sagemindai/threadline-core';
 
 type Env = Record<string, unknown> & { to: string };
 const tick = () => new Promise((r) => setTimeout(r, 5));

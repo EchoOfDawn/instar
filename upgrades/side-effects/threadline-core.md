@@ -206,6 +206,13 @@ Re-reading the spec against the build found three things it asked for that were 
 
 - With terminal pairing on, the no-elicitation refusal now names this server's own binary (`"<node>" "<path to dist/server.js>"`), never a bare `npx threadline-mcp`, which could fetch a different version or a look-alike package at approval time. The README pins the version in its examples. Evidence: `pair-tools.test.ts` (the refusal names the given binary and never `npx`).
 
+## Justin's decisions (topic 61599, 2026-10-16): scoped name, trusted publishing, no Claude Desktop requirement
+
+- The shared package is `@sagemindai/threadline-core` (scoped, so the name cannot be squatted before the first publish; SEC-13). Imports, the vitest aliases, the exact pin in threadline-mcp, and the workflow's version check all use it. Publishing it needs the free npm organization `sagemindai` on the publishing npm account.
+- Both publish jobs deploy to the GitHub Environment `npm-publish` (created 2026-10-16; only `main` may deploy) and install npm 11.5.1+ for npm trusted publishing (OIDC). `NPM_TOKEN` stays only as the first-publish fallback until each package's trusted publisher is set on npmjs.com; then it is removed, and `RELEASE_TOKEN` moves into the environment (SEC-1).
+- Claude Desktop is not a required host; the spec says so and drops it as an open question.
+- Evidence: 2186 unit tests (109 files) and 8 E2E pass after the rename; the core package's own tests pass; both workflows parse with the environment and step order.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

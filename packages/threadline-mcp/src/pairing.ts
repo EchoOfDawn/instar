@@ -22,7 +22,7 @@ import {
   EnvelopeCrypto, PairingInviteFlow, PairingInviteStore, PinnedKeyStore, INVITE_OPS, OP_ACCEPT,
   canonicalizeEnvelope, credentialAcceptFrom, credentialSendKey, edPublicToX25519, findInviteToken, verify,
   type InviteEvent, type MessageEnvelope, type PlaintextMessage,
-} from 'threadline-core';
+} from '@sagemindai/threadline-core';
 
 export interface StandaloneIdentity {
   /** 32 hex chars: the first 16 bytes of the public key. */
