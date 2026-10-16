@@ -224,7 +224,7 @@ export class StandalonePairing {
         return { kind: 'control' };
       }
       const credential = (msg.metadata as { credential?: unknown } | undefined)?.credential === true;
-      if (credential && !credentialAcceptFrom(this.keys, from)) return { kind: 'refused', reason: 'credential from a peer that is not mutual-verified' };
+      if (credential && !credentialAcceptFrom(this.keys, from, this.deps.identity.publicKey.toString('hex'))) return { kind: 'refused', reason: 'credential from a peer that is not mutual-verified' };
       // The downgrade high-water mark: ordinary chat only. Pairing ops and credentials are always
       // encrypted, even from peers that still send ordinary chat in plaintext.
       if (!credential) this.markEncryptedChat(from);

@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { PairingInvite } from './invite.js';
+import { readStoreJson, defaultReporter, type StoreProblemReporter } from './storeFile.js';
 
 export type InviteState = 'open' | 'used' | 'revoked' | 'expired';
 
@@ -45,6 +46,20 @@ export interface StoredInvite {
   secondAccept?: { fp: string; owner: string; agent: string; at: string };
 }
 
+/**
+ * The RECIPIENT side: an invite this agent's operator approved, so a Finish for it can be told
+ * apart from a replayed or foreign one (Echo's review of #2195). Persisted so a Finish that
+ * arrives after a restart is still accepted.
+ */
+export interface ApprovedAccept {
+  iid: string;
+  inviterFp: string;
+  exp: string;
+  approvedAt: string;
+  /** Set when a Finish was applied; a retry of that same Finish only re-acks. */
+  finishedNonce?: string;
+}
+
 /** What callers outside the store see: never the secret. */
 export type InviteSummary = Omit<StoredInvite, 'secret' | 'macKey'>;
 
@@ -61,29 +76,45 @@ const CLOSED_RETENTION_MS = 7 * 24 * 60 * 60_000;
 export class PairingInviteStore {
   private readonly file: string;
   private invites = new Map<string, StoredInvite>();
+  private accepted = new Map<string, ApprovedAccept>();
 
-  constructor(stateDir: string, private readonly now: () => Date = () => new Date()) {
+  constructor(stateDir: string, private readonly now: () => Date = () => new Date(), private readonly report: StoreProblemReporter = defaultReporter) {
     this.file = path.join(stateDir, 'threadline', INVITE_STORE_FILE);
     this.load();
   }
 
   private load(): void {
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8')) as { invites?: StoredInvite[] };
-      for (const inv of raw.invites ?? []) if (inv && typeof inv.iid === 'string') this.invites.set(inv.iid, inv);
-    } catch {
-      // No file yet, or unreadable: start empty. An unreadable file means open invites can't be
-      // accepted, which fails closed.
-    }
+    // A corrupt file is set aside and reported, never wiped by the next save; an unreadable one throws.
+    const raw = readStoreJson(this.file, this.now, this.report) as { invites?: StoredInvite[]; accepted?: ApprovedAccept[] } | null;
+    for (const inv of raw?.invites ?? []) if (inv && typeof inv.iid === 'string') this.invites.set(inv.iid, inv);
+    for (const a of raw?.accepted ?? []) if (a && typeof a.iid === 'string' && typeof a.inviterFp === 'string') this.accepted.set(a.iid, a);
     this.sweep();
   }
 
   private save(): void {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = `${this.file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ invites: [...this.invites.values()] }, null, 2), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ invites: [...this.invites.values()], accepted: [...this.accepted.values()] }, null, 2), { mode: 0o600 });
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, this.file);
+  }
+
+  /** Recipient side: record that this agent's operator approved invite `iid` from `inviterFp`. */
+  recordApprovedAccept(iid: string, inviterFp: string, exp: string): void {
+    this.accepted.set(iid, { iid, inviterFp: inviterFp.toLowerCase(), exp, approvedAt: this.now().toISOString() });
+    this.save();
+  }
+
+  getApprovedAccept(iid: string): ApprovedAccept | null {
+    const a = this.accepted.get(String(iid).toLowerCase());
+    return a ? { ...a } : null;
+  }
+
+  markAcceptFinished(iid: string, nonce: string): void {
+    const a = this.accepted.get(iid);
+    if (!a) return;
+    a.finishedNonce = nonce;
+    this.save();
   }
 
   /** Expire due invites (deleting their secrets) and drop old closed ones. Returns whether anything changed. */
@@ -104,6 +135,9 @@ export class PairingInviteStore {
         this.invites.delete(iid);
         changed = true;
       }
+    }
+    for (const [iid, a] of this.accepted) {
+      if (now - Date.parse(a.exp) > CLOSED_RETENTION_MS) { this.accepted.delete(iid); changed = true; }
     }
     if (changed) this.save();
     return changed;

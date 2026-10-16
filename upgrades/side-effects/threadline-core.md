@@ -140,6 +140,16 @@ Re-reading the spec against the build found three things it asked for that were 
 - `publish-threadline-core.yml`: the job runs only when `github.ref` is `refs/heads/main`, so a manual run on another branch publishes nothing (D10 says so).
 - Evidence: `pair-tools.test.ts` (+2: refusal text with and without the terminal; look-alike flagged, the real peer and an unrelated name not). Breakages: 3 tried, 3 caught. Proxy and stdio E2Es pass.
 
+## Echo's review of #2195 (core): fixes (added 2026-10-16)
+
+- `flow.ts` `handleFinish` (Medium): a Finish is applied only for an invite this agent's operator approved, from that inviter, with that invite's expiry, no later than 24 h after expiry (`FINISH_GRACE_MS`; the inviter allows a late Finish and retries for ~10 min), and only once. A retry of the applied Finish (same nonce) is re-acked with no state change; a different Finish for the same invite is refused; a first Finish for a paused pin is refused. Approvals are persisted in the invite store (`accepted`), so a Finish after a restart still works. Closes "a relay replays an old Finish to undo a pause".
+- `flow.ts` `approveAccept`: the accept is sent before the approval is recorded; if the send throws, a pin this approval created is rolled back (`InviteTrust.forget?`), the invite stays waiting, and a reason is returned instead of a raw exception.
+- `storeFile.ts` (new), used by `PinnedKeyStore` and `PairingInviteStore`: no file starts empty; invalid JSON is moved to `<file>.unreadable-<time>` and reported (never wiped by the next save); any other read error throws instead of starting empty.
+- `credentialAcceptFrom(trust, fp, ownIdentityPubHex?)`: with our key, also requires the pairing to be bound to it (as `credentialSendKey` does); threadline-mcp passes it.
+- Docs: README says ESM only; `decrypt`'s doc says the caller owns `to`, age and replay.
+- `publish-threadline-core.yml`: `npm ci` from a committed `package-lock.json`, and a "Protocol suite" step runs this repo's `tests/unit/threadline-core` plus the Instar compatibility test before any publish.
+- Evidence: `PairingInviteFlow.test.ts` (+8: replay after pause; replay after an unlabelled pause; first Finish on a paused pin; foreign iid; other expiry; a second validly signed Finish; late vs in-grace Finish; failed accept send), `trust.test.ts` (+1 binding). Breakages: 10 tried, 10 caught (3 only after adding the tests that isolate each layer of the replay defence). Lockfile: `npm ci` + `npm test` pass in a clean copy.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

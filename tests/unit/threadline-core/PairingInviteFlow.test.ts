@@ -13,7 +13,8 @@ import { PinnedKeyStore } from '../../../packages/threadline-core/src/trust.js';
 import { PairingInviteStore } from '../../../packages/threadline-core/src/inviteStore.js';
 import { PairingInviteFlow, OP_ACCEPT, type InviteEvent } from '../../../packages/threadline-core/src/flow.js';
 import { generateIdentityKeyPair } from '../../../packages/threadline-core/src/crypto.js';
-import { findInviteToken, decodeInvite, encodeInvite } from '../../../packages/threadline-core/src/invite.js';
+import { findInviteToken, decodeInvite, encodeInvite, transcript } from '../../../packages/threadline-core/src/invite.js';
+import { sign } from '../../../packages/threadline-core/src/crypto.js';
 
 type Msg = { from: string; to: string; op: string; payload: Record<string, unknown>; encrypted: boolean };
 
@@ -375,5 +376,120 @@ describe('invite flow: review follow-ups (Echo, PR #2188)', () => {
     const read = (dir: string) => fs.readFileSync(path.join(dir, 'threadline', 'pairing-invite-events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l).event);
     expect(read(B.dir)).toContain('declined');
     expect(read(A.dir)).toContain('not-them');
+  });
+});
+
+describe('threadline-core: review fixes (Echo, PR #2195)', () => {
+  async function paired() {
+    const net = new Net();
+    let t = Date.parse('2026-10-16T06:00:00Z');
+    const now = () => new Date(t);
+    const A = makeAgent(net, 'scout', { now }); const B = makeAgent(net, 'carl', { now });
+    const { iid, message } = await invite(net, A);
+    await acceptAndDeliver(net, B, message);
+    A.flow.approveFinish(iid);
+    const fin = { ...net.queue.find((m) => m.op === 'pair-invite-finish')!.payload };
+    await net.pump();
+    return { net, A, B, iid, fin, advance: (ms: number) => { t += ms; } };
+  }
+
+  it('a replayed Finish does not undo a pause, and a retry of the applied Finish changes nothing', async () => {
+    const { A, B, fin } = await paired();
+    expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(true);
+    B.trust.demoteInvitePairing(A.fp, 'a second agent accepted this invite');
+    B.flow.handleFinish(A.fp, fin); // the relay replays the Finish it kept
+    expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(false);
+    expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('invite-accepted');
+  });
+
+  it('a Finish for an invite this agent never accepted, or with another expiry, or a second different Finish, is refused', async () => {
+    const { A, B, fin } = await paired();
+    expect(B.flow.handleFinish(A.fp, { ...fin, iid: 'ab'.repeat(16) })).toMatchObject({ ok: false, reason: 'finish for an invite this agent did not accept' });
+    expect(B.flow.handleFinish(A.fp, { ...fin, exp: '2099-01-01T00:00:00.000Z' })).toMatchObject({ ok: false, reason: 'finish for an invite this agent did not accept' });
+    expect(B.flow.handleFinish(A.fp, { ...fin, nonce: 'cd'.repeat(16) })).toMatchObject({ ok: false });
+  });
+
+  it('the applied Finish is remembered: a replay after a pause the trust store did not label still changes nothing', async () => {
+    const { A, B, fin } = await paired();
+    B.trust.demoteInvitePairing(A.fp, 'x');
+    // A trust store (like Instar's) that records no "paused" marker on the profile.
+    const peers = (B.trust as unknown as { peers: Map<string, { via?: string }> }).peers;
+    delete peers.get(A.fp)!.via;
+    B.flow.handleFinish(A.fp, fin);
+    expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('invite-accepted');
+  });
+
+  it('a first Finish arriving for a paused pin is refused', async () => {
+    const net = new Net();
+    const A = makeAgent(net, 'scout'); const B = makeAgent(net, 'carl');
+    const { iid, message } = await invite(net, A);
+    await acceptAndDeliver(net, B, message);
+    B.trust.demoteInvitePairing(A.fp, 'paused before finish');
+    A.flow.approveFinish(iid);
+    const fin = { ...net.queue.find((m) => m.op === 'pair-invite-finish')!.payload };
+    expect(B.flow.handleFinish(A.fp, fin)).toMatchObject({ ok: false, reason: 'this pairing is paused; a new invite is needed' });
+    expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(false);
+  });
+
+  it('a second, validly signed Finish with a different nonce for an already finished invite is refused', async () => {
+    const { A, B, iid, fin } = await paired();
+    const nonce = 'cd'.repeat(16);
+    const T = transcript({ iid, fpA: A.fp, idA: A.pub, fpB: B.fp, idB: B.pub, exp: String(fin.exp), nonce, direction: 'finish' });
+    const second = { iid, exp: fin.exp, nonce, sig: sign(A.id.privateKey, T).toString('hex') };
+    expect(B.flow.handleFinish(A.fp, second)).toMatchObject({ ok: false, reason: 'this invite was already finished' });
+  });
+
+  it('a Finish more than a day after the invite expired is refused; one inside the grace window is accepted', async () => {
+    const net = new Net();
+    let t = Date.parse('2026-10-16T06:00:00Z');
+    const now = () => new Date(t);
+    const A = makeAgent(net, 'scout', { now }); const B = makeAgent(net, 'carl', { now });
+    const { iid, message } = await invite(net, A);
+    await acceptAndDeliver(net, B, message);
+    A.flow.approveFinish(iid);
+    const fin = { ...net.queue.find((m) => m.op === 'pair-invite-finish')!.payload };
+    net.queue.length = 0;
+    t = Date.parse(String(fin.exp)) + 25 * 60 * 60_000;
+    expect(B.flow.handleFinish(A.fp, fin)).toMatchObject({ ok: false, reason: 'finish arrived too long after the invite expired' });
+    expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(false);
+    t = Date.parse(String(fin.exp)) + 2 * 60 * 60_000;
+    expect(B.flow.handleFinish(A.fp, fin)).toMatchObject({ ok: true });
+    expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(true);
+  });
+
+  it('when the accept cannot be sent, nothing is pinned, the reason is returned, and approving again works', async () => {
+    const net = new Net();
+    const A = makeAgent(net, 'scout'); const B = makeAgent(net, 'carl');
+    const { message } = await invite(net, A);
+    const r = await B.flow.receiveInvite(message) as { iid: string };
+    const real = (B.flow as unknown as { deps: { sendPlaintext: (...a: unknown[]) => void } }).deps;
+    const orig = real.sendPlaintext;
+    real.sendPlaintext = () => { throw new Error('relay down'); };
+    expect(B.flow.approveAccept(r.iid)).toMatchObject({ ok: false, reason: expect.stringMatching(/could not send the accept \(relay down\)/) });
+    expect(B.trust.getProfileByFingerprint(A.fp)).toBeFalsy();
+    expect(B.store.getApprovedAccept(r.iid)).toBeNull();
+    real.sendPlaintext = orig;
+    expect(B.flow.approveAccept(r.iid)).toMatchObject({ ok: true });
+    expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('invite-accepted');
+  });
+
+  it('a corrupt store file is set aside and reported, never wiped; an unreadable one refuses to start', () => {
+    for (const [name, make] of [['pinned-keys.json', (d: string, rep: (m: string) => void) => new PinnedKeyStore(d, undefined, rep)], ['pairing-invites.json', (d: string, rep: (m: string) => void) => new PairingInviteStore(d, undefined, rep)]] as const) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-corrupt-'));
+      fs.mkdirSync(path.join(dir, 'threadline'));
+      const file = path.join(dir, 'threadline', name);
+      fs.writeFileSync(file, '{ "peers": [ truncated');
+      const reports: string[] = [];
+      make(dir, (m) => reports.push(m));
+      expect(reports[0]).toMatch(/was not valid JSON\. It was moved to .*unreadable-/);
+      const aside = fs.readdirSync(path.join(dir, 'threadline')).find((f) => f.startsWith(`${name}.unreadable-`))!;
+      expect(fs.readFileSync(path.join(dir, 'threadline', aside), 'utf8')).toBe('{ "peers": [ truncated');
+      fs.writeFileSync(file, '{}');
+      fs.chmodSync(file, 0o000);
+      try {
+        let readable = true; try { fs.readFileSync(file); } catch { readable = false; }
+        if (!readable) expect(() => make(dir, () => {})).toThrow(/refusing to start rather than overwrite it/);
+      } finally { fs.chmodSync(file, 0o600); }
+    }
   });
 });

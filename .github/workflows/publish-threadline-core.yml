@@ -3,8 +3,8 @@ name: Publish threadline-core
 # Publishes packages/threadline-core to npm as threadline-core: Threadline's agent-to-agent
 # fundamentals (identity, encrypted envelopes, pairing by invite, pinned keys, the credential
 # gate) with no framework attached (spec docs/specs/threadline-standalone-pairing.md). It must be
-# on npm BEFORE a threadline-mcp release that depends on it. The package has no lockfile, so
-# dependencies come from `npm install`; `npm test` builds and runs its tests before publishing.
+# on npm BEFORE a threadline-mcp release that depends on it. Dependencies come from the
+# package's lockfile (`npm ci`); its tests and the protocol suite must pass before publishing.
 
 on:
   workflow_dispatch:
@@ -39,11 +39,20 @@ jobs:
 
       - name: Install dependencies
         working-directory: packages/threadline-core
-        run: npm install --no-audit --no-fund
+        # From the committed lockfile: a job that holds publish rights installs exactly what was reviewed.
+        run: npm ci --no-audit --no-fund
 
       - name: Build and test
         working-directory: packages/threadline-core
         run: npm test
+
+      # The package's own tests cover crypto and envelopes. The protocol (invite, store, flow,
+      # pinned keys, the credential gate, the standalone module) is tested in this repo's suite,
+      # including byte-compatibility with Instar; all of it must pass before a publish.
+      - name: Protocol suite
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npx vitest run tests/unit/threadline-core tests/unit/threadline/threadline-core-compat.test.ts
 
       - name: Check if version changed
         id: check
