@@ -122,6 +122,18 @@ export function findInviteToken(text: string): string | null {
   return m ? m[0] : null;
 }
 
+/**
+ * Does this text carry a real invite? (Spec D4.) `valid` only for a token that decodes and passes
+ * its checksum, a known secret format; `lookalike` for text that only resembles one (a quoted id,
+ * a discussion of the format), which callers pass with a signal rather than refuse.
+ */
+export function classifyInviteText(text: string): 'valid' | 'lookalike' | null {
+  const s = String(text ?? '');
+  if (!s.includes(INVITE_PREFIX)) return null;
+  for (const m of s.matchAll(/tlinv1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g)) if (decodeInvite(m[0]).ok) return 'valid';
+  return 'lookalike';
+}
+
 /** Decode and validate an invite. Never throws. Expiry is checked separately (isExpired). */
 export function decodeInvite(text: string): DecodeResult {
   const token = findInviteToken(text);
@@ -221,10 +233,16 @@ export function checkCode(K: Buffer, idAHex: string, idBHex: string): string {
   return out;
 }
 
+/**
+ * How to hand the invite over, the same for every host (spec D4, Echo's review LES-5): it goes into
+ * the box the agent's software shows, never into a conversation with the model.
+ */
+export const INVITE_HOW_TO = 'Ask your agent to open a Threadline invite, and paste this into the box it shows you, not into the chat. (For an Instar agent, forward it to its Telegram or paste it in its dashboard.)';
+
 /** The message the inviter sends (spec §5): a code, never an http(s) URL. */
 export function inviteMessage(inv: PairingInvite): string {
   const mins = Math.max(1, Math.round((Date.parse(inv.exp) - Date.now()) / 60_000));
   const when = mins >= 120 ? `${Math.round(mins / 60)} hours` : `${mins} minutes`;
   return `${inv.agent || 'An agent'} (${inv.owner || 'unknown owner'}'s agent) invites your agent to pair. ` +
-    `Forward this to your agent's Telegram, or paste it in its dashboard. Keep it private; it expires in ${when}.\n\n${encodeInvite(inv)}`;
+    `${INVITE_HOW_TO} Keep it private; it works once and expires in ${when}.\n\n${encodeInvite(inv)}`;
 }
