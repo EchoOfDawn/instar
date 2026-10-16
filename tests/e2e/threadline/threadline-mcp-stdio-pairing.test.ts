@@ -127,6 +127,11 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
 
     const sent = await call('threadline_send', { to: instarFp, message: 'the vault password', credential: true });
     expect(sent.isError).toBe(false);
+    // History keeps only that a credential was sent, never its body (Echo review SEC-11).
+    const histDir = path.join(mcpState.stateDir, 'history');
+    const hist = fs.readdirSync(histDir).map((f) => fs.statSync(path.join(histDir, f)).isFile() ? fs.readFileSync(path.join(histDir, f), 'utf8') : '').join('\n');
+    expect(hist).toMatch(/\[credential, 18 bytes\]/);
+    expect(hist).not.toContain('the vault password');
     await vi.waitFor(() => {
       expect(inbox.filter((m) => m.from !== instarFp).some((m) => JSON.stringify(m.content).includes('the vault password'))).toBe(true);
     }, { timeout: 15_000 });

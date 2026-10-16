@@ -47,7 +47,7 @@ describe.skipIf(!hasDeps)('threadline-mcp through a listener proxy', () => {
 
     const transport = new StdioClientTransport({
       command: process.execPath, args: [path.join(pkg, 'dist', 'server.js')],
-      env: { ...process.env as Record<string, string>, THREADLINE_STATE_DIR: stateDir, THREADLINE_SEND_PORT: String(port), THREADLINE_RELAY: 'ws://127.0.0.1:9/v1/connect' },
+      env: { ...process.env as Record<string, string>, THREADLINE_STATE_DIR: stateDir, THREADLINE_SEND_PORT: String(port), THREADLINE_USE_LISTENER: '1', THREADLINE_RELAY: 'ws://127.0.0.1:9/v1/connect' },
       stderr: 'pipe',
     });
     client = new Client({ name: 'host', version: '1.0.0' }, { capabilities: { elicitation: {} } });
@@ -55,6 +55,17 @@ describe.skipIf(!hasDeps)('threadline-mcp through a listener proxy', () => {
   }, 120_000);
 
   afterAll(async () => { await client?.close(); listener?.close(); });
+
+  it('without THREADLINE_USE_LISTENER=1 a listener on the port is ignored: no proxy mode (Echo review SEC-9)', async () => {
+    const sd = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-noproxy-'));
+    const port = (listener.address() as { port: number }).port;
+    const t2 = new StdioClientTransport({ command: process.execPath, args: [path.join(pkg, 'dist', 'server.js')], env: { ...process.env as Record<string, string>, THREADLINE_STATE_DIR: sd, THREADLINE_SEND_PORT: String(port), THREADLINE_RELAY: 'ws://127.0.0.1:9/v1/connect' }, stderr: 'pipe' });
+    const c2 = new Client({ name: 'host', version: '1.0.0' }, { capabilities: { elicitation: {} } });
+    await c2.connect(t2);
+    const r = await c2.callTool({ name: 'threadline_pair_invite', arguments: {} });
+    expect(JSON.stringify(r.content)).not.toMatch(/Pairing is unavailable/);
+    await c2.close();
+  });
 
   it('refuses to pair, refuses plaintext to a paired agent, never relays an invite; other messages still go', async () => {
     // Terminal pairing is off unless the person turns it on: no socket in the state dir (D5).

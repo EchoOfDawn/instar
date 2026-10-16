@@ -80,6 +80,10 @@ export class StandalonePairing {
   /** Encrypted messages already accepted, by sender and messageId, so a captured envelope cannot be replayed. In memory, bounded. */
   private readonly seen = new Set<string>();
   static readonly SEEN_MAX = 10_000;
+  /** A credential older than this, or dated this far in the future, is refused (a relay replaying a captured one). */
+  static readonly CREDENTIAL_MAX_AGE_MS = 60 * 60_000;
+  static readonly CREDENTIAL_MAX_SKEW_MS = 10 * 60_000;
+  private seenLines = 0;
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
   /** Append-only record of pairing events, refusals and credential sends (never content or secrets). 0600, rotated at 1 MB. */
@@ -99,6 +103,7 @@ export class StandalonePairing {
     this.keys = new PinnedKeyStore(deps.stateDir, this.now, report);
     this.invites = new PairingInviteStore(deps.stateDir, this.now, report);
     this.crypto = new EnvelopeCrypto(deps.identity.privateKey, deps.identity.publicKey);
+    this.loadSeen();
     this.flow = new PairingInviteFlow({
       store: this.invites,
       trust: this.keys,
@@ -110,6 +115,33 @@ export class StandalonePairing {
       ownName: deps.ownName,
       now: this.now,
     });
+  }
+
+  private seenFile(): string { return path.join(this.deps.stateDir, 'threadline', 'seen-messages.jsonl'); }
+
+  /** Load the replay ledger (last SEEN_MAX ids). */
+  private loadSeen(): void {
+    try {
+      const lines = fs.readFileSync(this.seenFile(), 'utf8').split('\n').filter(Boolean);
+      this.seenLines = lines.length;
+      for (const l of lines.slice(-StandalonePairing.SEEN_MAX)) this.seen.add(l);
+    } catch { /* no ledger yet */ }
+  }
+
+  private rememberSeen(id: string): void {
+    this.seen.add(id);
+    if (this.seen.size > StandalonePairing.SEEN_MAX) this.seen.delete(this.seen.values().next().value as string);
+    try {
+      const file = this.seenFile();
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, id + '\n', { mode: 0o600 });
+      if (++this.seenLines > 2 * StandalonePairing.SEEN_MAX) {
+        const tmp = `${file}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, [...this.seen].join('\n') + '\n', { mode: 0o600 });
+        fs.renameSync(tmp, file);
+        this.seenLines = this.seen.size;
+      }
+    } catch { /* the in-memory ledger still refuses replays this run */ }
   }
 
   /** Peers that have sent us encrypted ordinary chat (the downgrade high-water mark), persisted 0600. */
@@ -222,17 +254,29 @@ export class StandalonePairing {
       } catch {
         return { kind: 'refused', reason: 'could not verify or decrypt with the pinned key' };
       }
-      // Recorded only AFTER verification, so a forged envelope cannot poison the set.
+      // Defence in depth: `to` is signed, and an envelope encrypted for another agent already fails to
+      // decrypt with our key, so this only states the rule explicitly (Echo review SEC-3).
+      if (String(env.to || '').toLowerCase() !== this.deps.identity.fp.toLowerCase()) return { kind: 'refused', reason: 'addressed to another agent' };
+      // Recorded only AFTER verification, so a forged envelope cannot poison the ledger; persisted,
+      // so a replay is refused after a restart too.
       const id = `${from}:${env.messageId || env.signature}`;
       if (this.seen.has(id)) return { kind: 'refused', reason: 'replayed message (already received)' };
-      this.seen.add(id);
-      if (this.seen.size > StandalonePairing.SEEN_MAX) this.seen.delete(this.seen.values().next().value as string);
+      this.rememberSeen(id);
       if (msg.type && INVITE_OPS.has(msg.type)) {
         await this.flow.handleControl(msg.type, from, msg as unknown as Record<string, unknown>);
         return { kind: 'control' };
       }
       const credential = (msg.metadata as { credential?: unknown } | undefined)?.credential === true;
       if (credential && !credentialAcceptFrom(this.keys, from, this.deps.identity.publicKey.toString('hex'))) return { kind: 'refused', reason: 'credential from a peer that is not mutual-verified' };
+      if (credential) {
+        // The timestamp is signed. Ordinary chat may legitimately arrive late (queued while we were
+        // offline); a credential may not, so a captured one cannot be replayed under a new messageId later.
+        const ts = Date.parse(String(env.timestamp || ''));
+        const age = this.now().getTime() - ts;
+        if (Number.isNaN(ts) || age > StandalonePairing.CREDENTIAL_MAX_AGE_MS || age < -StandalonePairing.CREDENTIAL_MAX_SKEW_MS) {
+          return { kind: 'refused', reason: 'credential outside its freshness window (possible replay)' };
+        }
+      }
       // The downgrade high-water mark: ordinary chat only. Pairing ops and credentials are always
       // encrypted, even from peers that still send ordinary chat in plaintext.
       if (!credential) this.markEncryptedChat(from);

@@ -118,16 +118,14 @@ interface StoredIdentity {
 function getOrCreateIdentity(): StoredIdentity {
   const keyFile = path.join(STATE_DIR, 'identity.json');
 
-  try {
-    if (fs.existsSync(keyFile)) {
-      try { fs.chmodSync(keyFile, 0o600); } catch { /* best effort */ }
-      const data = JSON.parse(fs.readFileSync(keyFile, 'utf-8'));
-      if (data.agentId && data.publicKey && data.privateKey) {
-        return data as StoredIdentity;
-      }
-    }
-  } catch {
-    // Regenerate on error
+  // An identity that exists but cannot be read is never replaced: a new key is a new agent, every
+  // peer's pin of us would break, and the old private key would be gone (Echo's review, SEC-15).
+  if (fs.existsSync(keyFile)) {
+    try { fs.chmodSync(keyFile, 0o600); } catch { /* best effort */ }
+    let data: Partial<StoredIdentity> | null = null;
+    try { data = JSON.parse(fs.readFileSync(keyFile, 'utf-8')); } catch { /* reported below */ }
+    if (data?.agentId && data.publicKey && data.privateKey) return data as StoredIdentity;
+    throw new Error(`${keyFile} exists but is not a readable identity. Refusing to replace it with a new one (that would be a new agent, and every pairing with this one would break). Repair or move the file, then restart.`);
   }
 
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
@@ -638,7 +636,9 @@ class RelayConnection {
     }
 
     // Check if a local listener is already connected — use it as proxy
-    const listenerAvailable = await this.isListenerAvailable();
+    // Opt-in only: anything answering on localhost could otherwise switch pairing off and read every
+    // unpinned message (Echo's review, SEC-9).
+    const listenerAvailable = process.env.THREADLINE_USE_LISTENER === '1' && await this.isListenerAvailable();
     if (listenerAvailable) {
       this.listenerProxyMode = true;
       this.connected = true;
@@ -821,6 +821,8 @@ class RelayConnection {
       const decoded = JSON.parse(Buffer.from(msg.payload, 'base64').toString());
       text = decoded.text || decoded.content || JSON.stringify(decoded);
     } catch { /* use raw payload */ }
+    // A credential reaches the inbox once; history keeps only that one arrived (Echo's review, SEC-11).
+    if (decoded?.credential) text = `[credential, ${Buffer.byteLength(text, 'utf-8')} bytes]`;
 
     this.history.append(fromId, {
       id: msg.id,
@@ -860,7 +862,8 @@ class RelayConnection {
       if (!r.sent) throw new Error(r.reason === 'peer-not-mutually-verified'
         ? 'Refused: credentials only go to an agent you have paired with (threadline_pair_invite / threadline_pair_open).'
         : r.reason === INVITE_IN_MESSAGE ? INVITE_REFUSAL : `Refused: ${r.reason}`);
-      this.history.append(to, { id: crypto.randomUUID(), from: this.identity.agentId, to, text, threadId: r.threadId, timestamp: new Date().toISOString(), direction: 'sent' });
+      const kept = opts.credential ? `[credential, ${Buffer.byteLength(text, 'utf-8')} bytes]` : text;
+      this.history.append(to, { id: crypto.randomUUID(), from: this.identity.agentId, to, text: kept, threadId: r.threadId, timestamp: new Date().toISOString(), direction: 'sent' });
       this.contacts.recordMessage(to, r.threadId);
       return r.threadId;
     }

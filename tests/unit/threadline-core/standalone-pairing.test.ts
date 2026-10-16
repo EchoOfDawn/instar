@@ -13,18 +13,20 @@ import { generateIdentityKeyPair, sign, canonicalizeEnvelope } from 'threadline-
 
 type Env = Record<string, unknown> & { from: string; to: string };
 
-function agent(name: string, wire: { out: Env[] }, opts: { fetchImpl?: typeof fetch; relayHttpBase?: string | null } = {}) {
-  const k = generateIdentityKeyPair();
+function agent(name: string, wire: { out: Env[] }, opts: { fetchImpl?: typeof fetch; relayHttpBase?: string | null; dir?: string; kp?: { publicKey: Buffer; privateKey: Buffer }; now?: () => Date } = {}) {
+  const k = opts.kp ?? generateIdentityKeyPair();
   const fp = k.publicKey.subarray(0, 16).toString('hex');
+  const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), `sa-${name}-`));
   const p = new StandalonePairing({
-    stateDir: fs.mkdtempSync(path.join(os.tmpdir(), `sa-${name}-`)),
+    stateDir: dir,
     identity: { fp, publicKey: k.publicKey, privateKey: k.privateKey },
     ownName: () => ({ owner: `${name}-owner`, agent: name }),
     sendEnvelope: (e) => wire.out.push(e as Env),
     relayHttpBase: opts.relayHttpBase ?? null,
     fetchImpl: opts.fetchImpl,
+    now: opts.now,
   });
-  return { name, fp, p, key: k.publicKey, priv: k.privateKey };
+  return { name, fp, p, key: k.publicKey, priv: k.privateKey, dir, kp: k };
 }
 
 /** The engine sends Finish on a timer (delay 0, then bounded retries): let it fire. */
@@ -272,6 +274,53 @@ describe('StandalonePairing', () => {
     expect(st.attention[0].problem).toMatch(/moved to .*unreadable-/);
     expect(fs.readFileSync(p.auditPath, 'utf8')).toMatch(/"kind":"store-problem"/);
     expect(fs.readdirSync(path.join(dir, 'threadline')).some((f) => f.startsWith('pinned-keys.json.unreadable-'))).toBe(true);
+  });
+
+  it('a relay cannot redirect: an encrypted envelope addressed to another agent is refused', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    A.p.send(B.fp, 'for b only');
+    const e = wire.out.shift()!;
+    // the signed `to` cannot be changed, so re-addressing breaks the signature; and a validly signed envelope
+    // for someone else that reaches B is refused by the to-check
+    expect(await B.p.receive({ ...e, to: 'f'.repeat(32) } as never)).toMatchObject({ kind: 'refused' });
+    const C = agent('c', wire);
+    expect(await C.p.receive(e as never)).toMatchObject({ kind: 'refused' });
+    expect(await B.p.receive(e as never)).toMatchObject({ kind: 'message', text: 'for b only' });
+  });
+
+  it('the replay ledger survives a restart', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    A.p.send(B.fp, 'once');
+    const e = wire.out.shift()!;
+    expect(await B.p.receive(e as never)).toMatchObject({ kind: 'message' });
+    const B2 = agent('b', wire, { dir: B.dir, kp: B.kp }); // restart
+    expect(await B2.p.receive(e as never)).toEqual({ kind: 'refused', reason: 'replayed message (already received)' });
+    expect(fs.statSync(path.join(B.dir, 'threadline', 'seen-messages.jsonl')).mode & 0o077).toBe(0);
+  });
+
+  it('a credential outside its freshness window is refused; ordinary chat has no window', async () => {
+    const wire = { out: [] as Env[] };
+    // The envelope's timestamp is the real clock, so the receiver's clock is moved relative to it.
+    let skew = 0;
+    const now = () => new Date(Date.now() + skew);
+    const A = agent('a', wire), B = agent('b', wire, { now });
+    await pair(wire, A, B);
+    A.p.send(B.fp, 'old secret', { credential: true });
+    A.p.send(B.fp, 'old chat');
+    const [cred, chat] = [wire.out.shift()!, wire.out.shift()!];
+    skew = 2 * 60 * 60_000; // delivered two hours later
+    expect(await B.p.receive(cred as never)).toEqual({ kind: 'refused', reason: 'credential outside its freshness window (possible replay)' });
+    expect(await B.p.receive(chat as never)).toMatchObject({ kind: 'message', text: 'old chat' });
+    skew = 0;
+    A.p.send(B.fp, 'fresh secret', { credential: true });
+    expect(await B.p.receive(wire.out.shift()! as never)).toMatchObject({ kind: 'message', credential: true });
+    skew = -30 * 60_000; // dated 30 minutes in the receiver's future
+    A.p.send(B.fp, 'future secret', { credential: true });
+    expect(await B.p.receive(wire.out.shift()! as never)).toMatchObject({ kind: 'refused' });
   });
 
   it('relay-card key check: a matching key is returned, a mismatch or failure is null', async () => {

@@ -157,6 +157,14 @@ Re-reading the spec against the build found three things it asked for that were 
 - Merged #2197's branch (0.4.5 fix + built-server smoke) into this branch, keeping 0.5.0.
 - `publish-threadline-mcp.yml` gains "Smoke test the packed package as a consumer": `npm pack`, install the tarball into an empty project the way a user would, then run the installed bin (must load and reach the network) and `pair status` (must answer). Closes Echo's item (4): the built package and its exports were never tested, so a 0.4.4-style break could ship green. Verified locally with the packed threadline-core tarball standing in for npm: both checks pass.
 
+## Spec-converge round 1 (Echo, 2026-10-16): first code fixes
+
+- Replay (SEC-3, LES-8): the (sender, messageId) ledger is persisted (`threadline/seen-messages.jsonl`, 0600, compacted at 2x10,000) so a replay is refused after a restart; a credential outside [-10 min, +1 h] of its signed timestamp is refused (ordinary chat has no window: it may be queued while offline); an explicit `to == own fp` check is defence in depth (an envelope for another agent already fails to decrypt).
+- Credentials in history (SEC-11): history keeps `[credential, N bytes]` in both directions; the inbox still delivers the body once.
+- Identity (SEC-15): an `identity.json` that exists but is unreadable makes the server refuse to start, and the file is left untouched (never silently replaced by a new identity).
+- Listener proxy mode is opt-in (SEC-9): only with `THREADLINE_USE_LISTENER=1`.
+- Evidence: `standalone-pairing.test.ts` (+3), proxy E2E (+1: a listener is ignored without opt-in), stdio E2E (history redaction), new `threadline-mcp-identity-guard.test.ts`. Breakages: 6 tried, 5 caught; the `to` check survives by construction (defence in depth, see above).
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

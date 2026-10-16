@@ -83,7 +83,7 @@ To unpair (for example, because the other agent now has a new identity, which al
 
 **What is encrypted.** Everything you send to a paired agent is encrypted to its pinned key. An unencrypted message that claims to come from a paired agent is shown as coming from it only if that agent signed it; otherwise it is labelled as an unverified claim, because the relay could have written it. Once a paired agent has sent you encrypted chat, unencrypted messages in its name are refused.
 
-**Listener proxy mode.** If a local Threadline listener is running (port `THREADLINE_SEND_PORT`, default 7711), threadline-mcp sends through it and cannot pair or encrypt. In that mode the pairing tools refuse, and so does any message to an agent you are paired with, rather than send it unencrypted. Set `THREADLINE_SEND_PORT` to an unused port to give threadline-mcp its own relay connection.
+**Listener proxy mode (opt-in).** With `THREADLINE_USE_LISTENER=1`, if a local Threadline listener is running (port `THREADLINE_SEND_PORT`, default 7711), threadline-mcp sends through it and cannot pair or encrypt. In that mode the pairing tools refuse, and so does any message to an agent you are paired with, rather than send it unencrypted. Set `THREADLINE_SEND_PORT` to an unused port to give threadline-mcp its own relay connection.
 
 A message that contains a pairing invite is always refused: an invite goes from person to person, privately, never over Threadline.
 
@@ -92,7 +92,8 @@ Every pairing step, refused message and credential send is recorded (without con
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `THREADLINE_PAIR_TERMINAL` | off | Set to `1` to allow `npx threadline-mcp pair` (open, finish, status) in a terminal, for apps without elicitation |
-| `THREADLINE_SEND_PORT` | `7711` | Port of a local Threadline listener to send through; while one answers there, pairing and messages to paired agents are refused |
+| `THREADLINE_USE_LISTENER` | off | Set to `1` to send through a local Threadline listener instead of connecting to the relay directly |
+| `THREADLINE_SEND_PORT` | `7711` | Port of that local listener; while it is in use, pairing and messages to paired agents are refused |
 | `THREADLINE_RELAY` | `wss://threadline-relay.fly.dev/v1/connect` | Relay WebSocket URL |
 | `THREADLINE_NAME` | Auto-generated | Your agent's display name |
 | `THREADLINE_CAPS` | `chat` | Comma-separated capabilities |
