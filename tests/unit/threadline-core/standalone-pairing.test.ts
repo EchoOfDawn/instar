@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
+import { PairTools } from '../../../packages/threadline-mcp/src/pairTools.js';
 import { generateIdentityKeyPair, sign, canonicalizeEnvelope } from 'threadline-core';
 
 type Env = Record<string, unknown> & { from: string; to: string };
@@ -257,6 +258,20 @@ describe('StandalonePairing', () => {
     expect(B.p.systemLines()[0]).toMatch(/now paired with "a"/);
     expect(JSON.stringify([...A.p.systemLines(), ...B.p.systemLines()])).not.toMatch(/tlinv1:|secret/);
     expect(A.p.systemLines(1)).toHaveLength(1);
+  });
+
+  it('a corrupt pairing file is an attention item in status and the inbox lines, and the file is kept aside', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sa-corrupt-'));
+    fs.mkdirSync(path.join(dir, 'threadline'));
+    fs.writeFileSync(path.join(dir, 'threadline', 'pinned-keys.json'), 'not json');
+    const k = generateIdentityKeyPair();
+    const p = new StandalonePairing({ stateDir: dir, identity: { fp: k.publicKey.subarray(0, 16).toString('hex'), publicKey: k.publicKey, privateKey: k.privateKey }, ownName: () => ({ owner: 'o', agent: 'a' }), sendEnvelope: () => {}, relayHttpBase: null });
+    expect(p.storeProblems).toHaveLength(1);
+    expect(p.systemLines()[0]).toMatch(/Pairing ATTENTION: .*pinned-keys\.json was not valid JSON/);
+    const st = new PairTools({ pairing: p, elicit: null, resolvePeer: () => null }).status() as { attention: Array<{ problem: string }> };
+    expect(st.attention[0].problem).toMatch(/moved to .*unreadable-/);
+    expect(fs.readFileSync(p.auditPath, 'utf8')).toMatch(/"kind":"store-problem"/);
+    expect(fs.readdirSync(path.join(dir, 'threadline')).some((f) => f.startsWith('pinned-keys.json.unreadable-'))).toBe(true);
   });
 
   it('relay-card key check: a matching key is returned, a mismatch or failure is null', async () => {

@@ -75,6 +75,8 @@ export class StandalonePairing {
   readonly events = new EventEmitter();
   private readonly crypto: EnvelopeCrypto;
   private readonly recent: StandaloneEvent[] = [];
+  /** Store files set aside this run (unparseable): an attention item in status and the inbox. */
+  readonly storeProblems: Array<{ at: string; message: string }> = [];
   /** Encrypted messages already accepted, by sender and messageId, so a captured envelope cannot be replayed. In memory, bounded. */
   private readonly seen = new Set<string>();
   static readonly SEEN_MAX = 10_000;
@@ -88,8 +90,14 @@ export class StandalonePairing {
     this.now = deps.now ?? (() => new Date());
     this.auditPath = path.join(deps.stateDir, 'threadline', 'pairing-audit.jsonl');
     this.fetchImpl = deps.fetchImpl ?? fetch;
-    this.keys = new PinnedKeyStore(deps.stateDir, this.now);
-    this.invites = new PairingInviteStore(deps.stateDir, this.now);
+    // A store file that could not be parsed is set aside by threadline-core; the person must see that.
+    const report = (message: string) => {
+      this.storeProblems.push({ at: this.now().toISOString(), message });
+      this.audit({ kind: 'store-problem', message });
+      process.stderr.write(`[threadline-mcp] ${message}\n`);
+    };
+    this.keys = new PinnedKeyStore(deps.stateDir, this.now, report);
+    this.invites = new PairingInviteStore(deps.stateDir, this.now, report);
     this.crypto = new EnvelopeCrypto(deps.identity.privateKey, deps.identity.publicKey);
     this.flow = new PairingInviteFlow({
       store: this.invites,
@@ -263,7 +271,8 @@ export class StandalonePairing {
 
   /** The newest pairing events as plain lines, for the inbox. */
   systemLines(limit = 5): string[] {
-    return this.recent.slice(0, limit).map((r) => `${r.at} ${describePairingEvent(r.event)}`);
+    const attention = this.storeProblems.map((p) => `${p.at} Pairing ATTENTION: ${p.message} Pairings recorded in it are not in use until the file is repaired; tell your person.`);
+    return [...attention, ...this.recent.slice(0, limit).map((r) => `${r.at} ${describePairingEvent(r.event)}`)];
   }
 
   /** Recent pairing events (accepts waiting, leak alarms, paired), newest first. Never secrets. */

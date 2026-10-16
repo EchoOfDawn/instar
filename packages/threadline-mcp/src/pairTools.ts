@@ -129,6 +129,7 @@ export class PairTools {
       ok: true,
       paired,
       ...(lookalikes.length ? { lookalikes } : {}),
+      ...(p.storeProblems.length ? { attention: p.storeProblems.map((x) => ({ at: x.at, problem: x.message, note: 'A pairing file could not be read and was set aside (not deleted). Pairings in it are not in use until it is repaired.' })) } : {}),
       openInvites: p.invites.list().filter((i) => i.state === 'open').map((i) => ({ iid: i.iid, exp: i.exp, boundTo: i.bind })),
       waitingToFinish: p.waitingToFinish().map((i) => ({ iid: i.iid, claimedAgent: i.acceptor?.agent, claimedOwner: i.acceptor?.owner })),
       recent: p.recentEvents().slice(0, 10),
