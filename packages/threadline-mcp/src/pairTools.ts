@@ -17,6 +17,8 @@ export interface PairToolsDeps {
   elicit: Elicit | null;
   /** Resolve a contact name or fingerprint to a fingerprint, or null. */
   resolvePeer: (nameOrFp: string) => string | null;
+  /** Why pairing cannot work right now (e.g. no direct relay connection), or null. */
+  unavailable?: () => string | null;
 }
 
 export type ToolResult = { ok: true; [k: string]: unknown } | { ok: false; error: string };
@@ -28,6 +30,8 @@ export class PairTools {
 
   /** threadline_pair_invite: make an invite for the person to send privately. Grants nothing. */
   invite(args: { for?: string; ttlMinutes?: number }): ToolResult {
+    const why = this.deps.unavailable?.();
+    if (why) return { ok: false, error: why };
     let bindFp: string | undefined;
     if (args.for) {
       const fp = this.deps.resolvePeer(args.for);
@@ -45,6 +49,8 @@ export class PairTools {
 
   /** threadline_pair_open: the person pastes an invite (never through the model), then approves or declines. */
   async open(): Promise<ToolResult> {
+    const why = this.deps.unavailable?.();
+    if (why) return { ok: false, error: why };
     if (!this.deps.elicit) return { ok: false, error: NO_ELICIT };
     const pasted = await this.deps.elicit('Paste the pairing invite you were sent. It goes straight to Threadline, not to your agent.', {
       invite: { type: 'string', title: 'Pairing invite', description: 'The whole message, including the part that starts with tlinv1:' },
@@ -69,6 +75,8 @@ export class PairTools {
 
   /** threadline_pair_finish: the person confirms (or refuses) the agent that accepted their invite. */
   async finish(args: { iid?: string }): Promise<ToolResult> {
+    const why = this.deps.unavailable?.();
+    if (why) return { ok: false, error: why };
     if (!this.deps.elicit) return { ok: false, error: NO_ELICIT };
     const waiting = this.deps.pairing.waitingToFinish();
     const target = args.iid ? waiting.find((i) => i.iid === args.iid) : waiting.length === 1 ? waiting[0] : undefined;

@@ -117,6 +117,14 @@ An independent review by GPT 5.4 and Gemini 3.1 Pro (Grok unreachable) found no 
 - Evidence: `standalone-pairing.test.ts` (a message in the window is delivered; after finish it is encrypted; after a pause it is still encrypted and delivered). Breakages: 2 tried, 2 caught.
 - Step 9 consequence: Instar's equivalent change (encrypt ordinary chat to pinned peers) must use the same rule, encrypting only to `mutual-verified` (or paused) pins, never to a pin still waiting for the inviter's Finish.
 
+## Spec re-check: three gaps closed (added 2026-10-16)
+
+Re-reading the spec against the build found three things it asked for that were missing:
+- D4: nothing refused sending an invite as a message (only the receiver refused it, after it had crossed the relay). `StandalonePairing.send` and `server.ts sendMessage` now refuse any `tlinv1:` text, in every mode.
+- D6: in listener proxy mode (a local listener on 7711, which is the default on Dawn's machines) `sendMessage` skipped pairing entirely, so a paired agent got plaintext, and pairing ops could not go out at all. Now the pair tools (MCP and terminal) refuse with the reason, via a new `PairTools` `unavailable` dep, and a message to a pinned agent through the proxy is refused.
+- §4: pairing events were not in `threadline_inbox`. `StandalonePairing.systemLines()` gives plain lines; the inbox shows them as `pairing`.
+- Evidence: `pair-tools.test.ts` (+1), `standalone-pairing.test.ts` (+2), new `tests/e2e/threadline/threadline-mcp-proxy-mode.test.ts` (the BUILT server with a fake listener and a pre-pinned peer), the stdio E2E checks the inbox lines. Breakages: 7 tried, 7 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

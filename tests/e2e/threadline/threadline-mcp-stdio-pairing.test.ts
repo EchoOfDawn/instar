@@ -112,6 +112,11 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
       expect(st.body.paired).toEqual([expect.objectContaining({ fingerprint: instarFp, state: 'mutual-verified' })]);
     }, { timeout: 15_000 });
 
+    // Pairing events reach the inbox as system lines, not agent messages (spec §4).
+    const inboxNow = await call('threadline_inbox');
+    expect(inboxNow.body.pairing.join('\n')).toMatch(/now paired with "echo"/);
+    expect(JSON.stringify(inboxNow.body.messages)).not.toMatch(/pair-invite-/);
+
     // The terminal fallback (D5) reaches the same running server: `threadline-mcp pair status`.
     const cli = execFileSync(process.execPath, [path.join(pkg, 'dist', 'server.js'), 'pair', 'status'], {
       env: { ...process.env, THREADLINE_STATE_DIR: mcpState.stateDir }, encoding: 'utf8', timeout: 15_000,

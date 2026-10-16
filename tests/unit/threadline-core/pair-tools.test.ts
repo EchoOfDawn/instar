@@ -124,6 +124,19 @@ describe('pair tools', () => {
     expect(A.tools(null).invite({ ttlMinutes: 5000 })).toMatchObject({ ok: false });
   });
 
+  it('when pairing is unavailable (no direct relay connection), invite, open and finish refuse without asking the person', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire);
+    const asked: string[] = [];
+    const tools = new PairTools({ pairing: A.pairing, elicit: async (m) => { asked.push(m); return null; }, resolvePeer: () => null, unavailable: () => 'Pairing is unavailable: proxy' });
+    expect(tools.invite({})).toEqual({ ok: false, error: 'Pairing is unavailable: proxy' });
+    expect(await tools.open()).toEqual({ ok: false, error: 'Pairing is unavailable: proxy' });
+    expect(await tools.finish({})).toEqual({ ok: false, error: 'Pairing is unavailable: proxy' });
+    expect(asked).toEqual([]);
+    expect(A.pairing.invites.list()).toEqual([]);
+    expect(wire.out).toHaveLength(0);
+  });
+
   it('cancel revokes an open invite once', () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire);

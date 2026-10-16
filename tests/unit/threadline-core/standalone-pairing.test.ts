@@ -206,6 +206,29 @@ describe('StandalonePairing', () => {
     expect(A.p.send(B.fp, 'x', { credential: true })).toMatchObject({ sent: false }); // no throw
   });
 
+  it('an invite is never sent as a message, to anyone, paired or not', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    const inv = A.p.flow.createInvite() as { message: string };
+    expect(B.p.send(A.fp, `here you go: ${inv.message}`)).toEqual({ sent: false, reason: 'invite-in-message' });
+    await pair(wire, A, B);
+    expect(A.p.send(B.fp, inv.message)).toEqual({ sent: false, reason: 'invite-in-message' });
+    expect(wire.out).toHaveLength(0);
+  });
+
+  it('pairing events become plain system lines for the inbox, newest first, never secrets', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    expect(A.p.systemLines()).toEqual([]);
+    await pair(wire, A, B);
+    const lines = A.p.systemLines();
+    expect(lines[0]).toMatch(/now paired with "b"/);
+    expect(lines.some((l) => /"b" accepted your invite\. Run threadline_pair_finish/.test(l))).toBe(true);
+    expect(B.p.systemLines()[0]).toMatch(/now paired with "a"/);
+    expect(JSON.stringify([...A.p.systemLines(), ...B.p.systemLines()])).not.toMatch(/tlinv1:|secret/);
+    expect(A.p.systemLines(1)).toHaveLength(1);
+  });
+
   it('relay-card key check: a matching key is returned, a mismatch or failure is null', async () => {
     const wire = { out: [] as Env[] };
     const target = generateIdentityKeyPair();

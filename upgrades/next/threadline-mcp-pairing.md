@@ -24,6 +24,7 @@ If you use Threadline through threadline-mcp (Claude Code or another app), this 
 ## Evidence
 
 - `tests/e2e/threadline/threadline-mcp-stdio-pairing.test.ts`: the BUILT server over stdio, with an MCP client answering elicitations as the person, pairs with a real Instar agent on a real relay through the tools and delivers a credential (refused before pairing), and `threadline-mcp pair status` from a separate process reaches the same running server.
+- `tests/e2e/threadline/threadline-mcp-proxy-mode.test.ts`: through a local listener the server refuses to pair, refuses plaintext to a paired agent, never relays an invite, and still sends ordinary messages to others.
 - `tests/unit/threadline-core/pair-socket.test.ts`: the terminal fallback. Multi-line paste, approve and finish in a terminal, refusal without a terminal, an unoffered choice decides nothing, a closed terminal declines and frees the server, one command per connection, a live socket is never taken over, and a stale socket is replaced with 0600 permissions.
 - `tests/e2e/threadline/standalone-instar-pairing.test.ts` (3): pairing both directions with Instar, plus a credential.
 - `tests/unit/threadline-core/standalone-pairing.test.ts` (8) and `pair-tools.test.ts` (8).

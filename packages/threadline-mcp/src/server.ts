@@ -50,7 +50,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { WebSocket } from 'ws';
-import { StandalonePairing } from './pairing.js';
+import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
+import { findInviteToken } from 'threadline-core';
 import { PairTools, type Elicit } from './pairTools.js';
 import { servePairSocket, runPairCli } from './pairSocket.js';
 
@@ -58,6 +59,8 @@ import { servePairSocket, runPairCli } from './pairSocket.js';
 
 const RELAY_URL = process.env.THREADLINE_RELAY || 'wss://threadline-relay.fly.dev/v1/connect';
 const CAPABILITIES = (process.env.THREADLINE_CAPS || 'chat').split(',').map(s => s.trim());
+const INVITE_REFUSAL = 'Refused: that message contains a pairing invite. An invite is given by your person, privately, in an app they already use (never over Threadline): it works once, and whoever sees it first is offered to your person.';
+const PROXY_NOTE = 'this threadline-mcp is sending through a local Threadline listener (THREADLINE_SEND_PORT, default 7711), which cannot encrypt for it. Run threadline-mcp with its own relay connection (set THREADLINE_SEND_PORT to an unused port) to pair or to message paired agents.';
 const STATE_DIR = process.env.THREADLINE_STATE_DIR || path.join(os.homedir(), '.threadline');
 const REGISTRY_ENABLED = process.env.THREADLINE_REGISTRY !== 'false';
 const REGISTRY_LISTED = process.env.THREADLINE_REGISTRY === 'true';
@@ -626,6 +629,7 @@ class RelayConnection {
 
   // Flag: true when using listener proxy mode (no direct relay connection)
   private listenerProxyMode = false;
+  get isListenerProxy(): boolean { return this.listenerProxyMode; }
 
   async connect(): Promise<string> {
     if (this.connected && this.ws?.readyState === WebSocket.OPEN) {
@@ -846,18 +850,23 @@ class RelayConnection {
       throw new Error(`Message too large (${text.length} bytes, max ${MAX_MESSAGE_SIZE})`);
     }
 
+    if (findInviteToken(text)) throw new Error(INVITE_REFUSAL);
     // Verified pairing decides the wire: a paired agent is always sent encrypted to its pinned key,
     // and a credential goes only to a mutual-verified pair (never plaintext, never the listener proxy).
     if (this.pairing && !this.listenerProxyMode) {
       const r = this.pairing.send(to, text, { threadId, credential: opts.credential });
       if (!r.sent) throw new Error(r.reason === 'peer-not-mutually-verified'
         ? 'Refused: credentials only go to an agent you have paired with (threadline_pair_invite / threadline_pair_open).'
-        : `Refused: ${r.reason}`);
+        : r.reason === INVITE_IN_MESSAGE ? INVITE_REFUSAL : `Refused: ${r.reason}`);
       this.history.append(to, { id: crypto.randomUUID(), from: this.identity.agentId, to, text, threadId: r.threadId, timestamp: new Date().toISOString(), direction: 'sent' });
       this.contacts.recordMessage(to, r.threadId);
       return r.threadId;
     }
     if (opts.credential) throw new Error('Refused: credentials need a direct relay connection and a paired agent.');
+    // The listener proxy sends plaintext under the listener's control: never to an agent we are paired with (no silent downgrade, spec D6).
+    if (this.listenerProxyMode && this.pairing?.keys.getProfileByFingerprint(to.toLowerCase())?.peerIdentityPub) {
+      throw new Error(`Refused: you are paired with this agent, so messages to it must be encrypted, and ${PROXY_NOTE}`);
+    }
 
     const tid = threadId || `thread-${crypto.randomBytes(4).toString('hex')}`;
 
@@ -1085,6 +1094,8 @@ async function main() {
   };
   const pairBase = {
     pairing,
+    // Pairing ops travel on this server's own relay connection; through a listener proxy they cannot.
+    unavailable: () => (relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
     resolvePeer: (nameOrFp: string) => {
       const v = nameOrFp.trim().toLowerCase();
       if (/^[0-9a-f]{32}$/.test(v)) return v;
@@ -1347,7 +1358,7 @@ async function main() {
       return {
         content: [{
           type: 'text' as const,
-          text: JSON.stringify({ count: messages.length, messages }, null, 2),
+          text: JSON.stringify({ count: messages.length, messages, ...(pairing.systemLines().length ? { pairing: pairing.systemLines() } : {}) }, null, 2),
         }],
       };
     },

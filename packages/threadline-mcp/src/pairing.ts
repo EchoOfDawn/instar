@@ -55,6 +55,19 @@ export type Inbound =
 
 export interface StandaloneEvent { at: string; event: InviteEvent }
 
+export const INVITE_IN_MESSAGE = 'invite-in-message';
+
+/** One plain line per pairing event, for the inbox (spec §4: system lines, not agent messages). */
+export function describePairingEvent(e: InviteEvent): string {
+  switch (e.kind) {
+    case 'accept-prompt': return `Pairing: you were invited by the agent that calls itself "${e.claimedAgent}". Your person decides with threadline_pair_open.`;
+    case 'finish-prompt': return `Pairing: the agent that calls itself "${e.claimedAgent}" accepted your invite. Run threadline_pair_finish so your person can confirm it is who they sent it to.`;
+    case 'paired': return `Pairing: you are now paired with "${e.claimedAgent}". Messages to it are always encrypted, and it can receive credentials.`;
+    case 'second-accept-alarm': return `Pairing WARNING: a second agent ("${e.lateClaimedAgent}") used the same invite, so it leaked. The first pairing is paused. Tell your person.`;
+    case 'invite-used-elsewhere': return 'Pairing: the invite you accepted had already been used by someone else, so it did not pair. Ask for a new one.';
+  }
+}
+
 export class StandalonePairing {
   readonly flow: PairingInviteFlow;
   readonly keys: PinnedKeyStore;
@@ -139,6 +152,9 @@ export class StandalonePairing {
    */
   send(to: string, text: string, opts: { threadId?: string; credential?: boolean } = {}): { sent: true; threadId: string; encrypted: boolean } | { sent: false; reason: string } {
     const fp = to.toLowerCase();
+    // An invite is handed over privately by a person, never relayed (spec D4): it works once,
+    // and whoever sees it first is offered to the inviter's person.
+    if (findInviteToken(text)) return { sent: false, reason: INVITE_IN_MESSAGE };
     if (opts.credential) {
       const d = credentialSendKey(this.keys, fp, this.deps.identity.publicKey.toString('hex'));
       this.audit({ kind: d.allow ? 'credential-sent' : 'credential-refused', to: fp, ...(d.allow ? {} : { reason: d.reason }) });
@@ -211,6 +227,11 @@ export class StandalonePairing {
     if (findInviteToken(text)) return { kind: 'refused', reason: 'a pairing invite arrived as a message; invites are pasted by a person, not relayed' };
     const pin = this.keys.getProfileByFingerprint(from);
     return { kind: 'message', text, type, encrypted: false, credential: false, fromPairedPeer: pin?.pairingState === 'mutual-verified' };
+  }
+
+  /** The newest pairing events as plain lines, for the inbox. */
+  systemLines(limit = 5): string[] {
+    return this.recent.slice(0, limit).map((r) => `${r.at} ${describePairingEvent(r.event)}`);
   }
 
   /** Recent pairing events (accepts waiting, leak alarms, paired), newest first. Never secrets. */
