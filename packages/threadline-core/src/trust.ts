@@ -44,8 +44,6 @@ interface StoredPeer {
   pairingState: PairingState;
   pairingId?: string;
   verifiedAt?: string;
-  /** How the pin was set; `paused: <reason>` after a leaked invite was used twice. */
-  via?: string;
   updatedAt: string;
   via?: string;
 }

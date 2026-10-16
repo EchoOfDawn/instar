@@ -76,6 +76,11 @@ Delete the package directory and the compat test. Nothing depends on it.
 - `envelope.ts` `decrypt` now refuses a static X25519 key that is not derived from the signing identity (found by an independent GPT 5.4 / Gemini 3.1 Pro review; every caller was already correct, but the API invited misuse). Wire format unchanged; the Instar vectors still pass.
 - Evidence: core test `round trip core → core` asserts decrypt throws on an unbound key. Breakage check: removing the guard fails that test.
 
+## PeerProfile.via (added 2026-10-16)
+
+- Type only: `PeerProfile` gains optional `via` (the store already wrote it; `paused: <reason>` marks a pin paused after a leaked invite). threadline-mcp 0.5.0 reads it to tell a paused pin (encrypt) from one still waiting for the inviter's Finish (send as before pairing, so nothing is lost). No runtime change in this package.
+- The first commit of this change inserted the field twice into `StoredPeer` and did not compile; the follow-up removed the duplicate. The repo's commit gate type-checks the root project only, not `packages/*`; the package's own CI workflow (`npm test` = `tsc` + tests) is what catches it.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
