@@ -15,6 +15,8 @@
  */
 
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   EnvelopeCrypto, PairingInviteFlow, PairingInviteStore, PinnedKeyStore, INVITE_OPS, OP_ACCEPT,
@@ -65,9 +67,13 @@ export class StandalonePairing {
   static readonly SEEN_MAX = 10_000;
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
+  /** Append-only record of pairing events, refusals and credential sends (never content or secrets). 0600, rotated at 1 MB. */
+  readonly auditPath: string;
+  static readonly AUDIT_MAX_BYTES = 1_000_000;
 
   constructor(private readonly deps: StandaloneDeps) {
     this.now = deps.now ?? (() => new Date());
+    this.auditPath = path.join(deps.stateDir, 'threadline', 'pairing-audit.jsonl');
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.keys = new PinnedKeyStore(deps.stateDir, this.now);
     this.invites = new PairingInviteStore(deps.stateDir, this.now);
@@ -79,10 +85,19 @@ export class StandalonePairing {
       relayKeyFor: (fp) => this.relayKeyFor(fp),
       sendPlaintext: (to, op, payload) => this.sendPlaintextTyped(to, op, JSON.stringify(payload)),
       sendToKey: (to, keyHex, op, payload) => this.sendEncrypted(to, Buffer.from(keyHex, 'hex'), { content: op, type: op, ...payload } as PlaintextMessage),
-      notify: (event) => { this.recent.unshift({ at: this.now().toISOString(), event }); this.recent.splice(50); this.events.emit('event', event); },
+      notify: (event) => { this.recent.unshift({ at: this.now().toISOString(), event }); this.recent.splice(50); this.audit({ ...event }); this.events.emit('event', event); },
       ownName: deps.ownName,
       now: this.now,
     });
+  }
+
+  /** Best effort: the audit must never break messaging. */
+  private audit(entry: Record<string, unknown>): void {
+    try {
+      fs.mkdirSync(path.dirname(this.auditPath), { recursive: true, mode: 0o700 });
+      try { if (fs.statSync(this.auditPath).size > StandalonePairing.AUDIT_MAX_BYTES) fs.renameSync(this.auditPath, this.auditPath + '.1'); } catch { /* none yet */ }
+      fs.appendFileSync(this.auditPath, JSON.stringify({ at: this.now().toISOString(), ...entry }) + '\n', { mode: 0o600 });
+    } catch { /* unwritable state dir: messaging continues */ }
   }
 
   /** The key the relay's public card shows for `fp`, or null when it has none (spec: proceed). */
@@ -126,6 +141,7 @@ export class StandalonePairing {
     const fp = to.toLowerCase();
     if (opts.credential) {
       const d = credentialSendKey(this.keys, fp, this.deps.identity.publicKey.toString('hex'));
+      this.audit({ kind: d.allow ? 'credential-sent' : 'credential-refused', to: fp, ...(d.allow ? {} : { reason: d.reason }) });
       if (!d.allow) return { sent: false, reason: d.reason };
       return { sent: true, encrypted: true, threadId: this.sendEncrypted(fp, d.peerIdentityPub, { content: text, type: 'chat', metadata: { credential: true } }, opts.threadId) };
     }
@@ -138,6 +154,13 @@ export class StandalonePairing {
 
   /** Classify an incoming envelope: pairing ops are handled here; encrypted ones need a pinned sender. */
   async receive(env: WireEnvelope): Promise<Inbound> {
+    const r = await this.classify(env);
+    if (r.kind === 'refused') this.audit({ kind: 'refused', from: String(env.from || '').toLowerCase(), reason: r.reason });
+    else if (r.kind === 'message' && r.credential) this.audit({ kind: 'credential-received', from: String(env.from || '').toLowerCase() });
+    return r;
+  }
+
+  private async classify(env: WireEnvelope): Promise<Inbound> {
     const from = String(env.from || '').toLowerCase();
     if (env.signature && env.ephemeralPubKey) {
       const pin = this.keys.getProfileByFingerprint(from);

@@ -77,6 +77,8 @@ npx threadline-mcp pair finish    # confirm who accepted your invite
 npx threadline-mcp pair status    # see pairings and anything waiting
 ```
 
+Every pairing step, refused message and credential send is recorded (without content) in `~/.threadline/threadline/pairing-audit.jsonl`; `threadline_pair_status` shows where.
+
 The command talks to the threadline-mcp your app is already running (a private socket in the state directory), asks each question in the terminal, and needs a real terminal to do it. Be clear about what this protects: an agent that can run commands in a terminal could run it too. Inside an app that can ask you directly, the agent cannot answer for you. In the terminal, that protection depends on you running the command yourself.
 
 

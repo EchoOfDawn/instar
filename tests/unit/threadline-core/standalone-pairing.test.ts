@@ -154,6 +154,39 @@ describe('StandalonePairing', () => {
     expect(await B.p.receive(pt as never)).toEqual({ kind: 'message', text: 'old instar sends this way', type: 'chat', encrypted: false, credential: false, fromPairedPeer: true });
   });
 
+  it('the audit log records pairing, credential sends and refusals, privately, with no message content', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire), C = agent('c', wire);
+    expect(A.p.send(C.fp, 'secret-to-stranger', { credential: true })).toMatchObject({ sent: false });
+    await pair(wire, A, B);
+    A.p.send(B.fp, 'the vault password', { credential: true });
+    await pump(wire, [A, B]);
+    A.p.send(B.fp, 'hello');
+    const env = wire.out.shift()!;
+    await B.p.receive(env as never); await B.p.receive(env as never); // the second is a replay
+    const read = (x: ReturnType<typeof agent>) => fs.readFileSync(x.p.auditPath, 'utf8');
+    const a = read(A).trim().split('\n').map((l) => JSON.parse(l)), b = read(B).trim().split('\n').map((l) => JSON.parse(l));
+    expect(a.map((x) => x.kind)).toEqual(expect.arrayContaining(['credential-refused', 'finish-prompt', 'paired', 'credential-sent']));
+    expect(a.find((x) => x.kind === 'credential-refused')).toMatchObject({ to: C.fp, reason: 'peer-not-mutually-verified' });
+    expect(b.map((x) => x.kind)).toEqual(expect.arrayContaining(['accept-prompt', 'paired', 'credential-received', 'refused']));
+    expect(b.find((x) => x.kind === 'refused')).toMatchObject({ from: A.fp, reason: 'replayed message (already received)' });
+    expect(read(A) + read(B)).not.toMatch(/vault password|secret-to-stranger|hello|tlinv1:/);
+    expect(fs.statSync(A.p.auditPath).mode & 0o077).toBe(0);
+  });
+
+  it('the audit log rotates past its size limit, and an unwritable state dir never breaks messaging', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    fs.mkdirSync(path.dirname(A.p.auditPath), { recursive: true });
+    fs.writeFileSync(A.p.auditPath, 'x'.repeat(StandalonePairing.AUDIT_MAX_BYTES + 1));
+    A.p.send(B.fp, 'x', { credential: true });
+    expect(fs.existsSync(A.p.auditPath + '.1')).toBe(true);
+    expect(fs.readFileSync(A.p.auditPath, 'utf8').trim().split('\n')).toHaveLength(1);
+    fs.renameSync(path.dirname(A.p.auditPath), path.dirname(A.p.auditPath) + '.moved');
+    fs.writeFileSync(path.dirname(A.p.auditPath), 'not a directory');
+    expect(A.p.send(B.fp, 'x', { credential: true })).toMatchObject({ sent: false }); // no throw
+  });
+
   it('relay-card key check: a matching key is returned, a mismatch or failure is null', async () => {
     const wire = { out: [] as Env[] };
     const target = generateIdentityKeyPair();

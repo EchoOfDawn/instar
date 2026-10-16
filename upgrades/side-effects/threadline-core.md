@@ -104,6 +104,12 @@ An independent review by GPT 5.4 and Gemini 3.1 Pro (Grok unreachable) found no 
 - Accepted, not changed: plaintext from a paired peer stays delivered-and-marked until Instar encrypts to pinned peers (D6 as built, step 9); the stale-socket probe→unlink→listen race fails safe (the loser gets EADDRINUSE and logs); `handleFinish` matches Instar's semantics.
 - Evidence: core test (decrypt refuses an unbound key), `standalone-pairing.test.ts` (replay refused; a forgery first does not burn the id), `pair-socket.test.ts` (idle terminal closed, question answered with nothing). Breakages: 3 tried, 3 caught.
 
+## Hardening: the pairing audit log (added 2026-10-16)
+
+- `pairing.ts`: every pairing event, every refusal (with sender and reason), and every credential send, refusal or receipt is appended to `<stateDir>/threadline/pairing-audit.jsonl` (0600, rotated to `.1` past 1 MB). Before this, events lived in memory (last 50) and refusals only on stderr, which an MCP host may hide. Never message content, invite text or keys. Best effort: an unwritable state dir never breaks messaging.
+- `pairTools.ts`: `threadline_pair_status` names the audit file.
+- Evidence: `standalone-pairing.test.ts` (2: what is recorded and what never is, 0600; rotation and an unwritable dir). Breakages: 5 tried, 5 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

@@ -102,6 +102,7 @@ export class PairTools {
       openInvites: p.invites.list().filter((i) => i.state === 'open').map((i) => ({ iid: i.iid, exp: i.exp, boundTo: i.bind })),
       waitingToFinish: p.waitingToFinish().map((i) => ({ iid: i.iid, claimedAgent: i.acceptor?.agent, claimedOwner: i.acceptor?.owner })),
       recent: p.recentEvents().slice(0, 10),
+      auditLog: p.auditPath,
     };
   }
 
