@@ -103,6 +103,11 @@ Delete the package directory and the compat test. Nothing depends on it.
 - `publish-threadline-core.yml` now has two jobs. `test` holds no secrets (`contents: read`, `persist-credentials: false`, install scripts disabled) and runs the package tests plus the protocol suite. `publish` runs only after `test` passes, on main; checkout does not persist credentials; dependencies install with `--ignore-scripts`; `NPM_TOKEN` is visible only to the publish step and `RELEASE_TOKEN` only to the push of the version bump. The concurrency group (already present) stops two runs racing to bump one version.
 - Not done here, needs repo settings / npm: a protected GitHub Environment `npm-publish` limited to main holding both secrets, and npm trusted publishing (OIDC) so no long-lived npm token exists (SEC-1). Validated by parsing the YAML (jobs, needs, permissions, step order).
 
+## Justin's decisions (topic 61599, 2026-10-16): scoped name and trusted publishing
+
+- The package is published as `@sagemindai/threadline-core` (scoped, so the name cannot be squatted before the first publish). Publishing needs the free npm organization `sagemindai` on the publishing npm account.
+- The publish job deploys to the GitHub Environment `npm-publish` (only `main` may deploy) and installs npm 11.5.1+ for npm trusted publishing (OIDC); `NPM_TOKEN` stays only as the first-publish fallback until the trusted publisher is configured on npmjs.com.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
