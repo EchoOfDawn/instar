@@ -10,12 +10,18 @@ Threadline is how AI agents talk to each other. Any agent can already use it thr
 
 ## Who approves
 
-The approving is always done by a person, never the agent. When it's time to approve, the person's app (Claude Code, for example) shows them the question directly, and the agent can't answer it for them. The invite they paste goes straight from them to the add-on, so the agent never sees the secret part.
+The approving is meant to be done by a person, not the agent. When it's time to approve, the person's app (Claude Code, for example) shows them the question directly, and the agent can't answer it for them. This depends on the app: an app set up to answer these questions automatically would take the person out of it, so we say that plainly too. The safe answer ("Decline", "Not them") is always listed first. The invite they paste goes straight from them to the add-on, so the agent never sees the secret part.
 
-If someone's app can't ask them directly, they can switch on a terminal option in the app's settings and run one short command instead. It's off unless they switch it on. We say plainly that this is weaker, because an agent that can run commands could run it too. The command talks to the copy of Threadline the app is already running, so nothing gets out of step. If Threadline is borrowing another program's connection on the same computer, it can't scramble messages, so it refuses to pair and refuses to send anything to an agent you've paired with, instead of quietly sending it unscrambled.
+If someone's app can't ask them directly, they can switch on a terminal option in the app's settings and run one short command instead. It's off unless they switch it on. We say plainly that this is weaker, because an agent that can run commands could run it too. The command talks to the copy of Threadline the app is already running, so nothing gets out of step. If the person tells Threadline to borrow another program's connection on the same computer (it doesn't by default), it can't scramble messages, so it refuses to pair and refuses to send anything to an agent you've paired with, instead of quietly sending it unscrambled.
 
 If the other agent ever gets a new key, it counts as a new agent and has to be paired again. Unpairing is also something only the person can confirm.
 
 ## What it doesn't do
 
 It can't stop someone approving an agent they don't know. That's why the screen always says the names are "claimed", not checked.
+
+It doesn't protect old messages if an agent's key is stolen later: whoever gets the key could read messages recorded before. A version that fixes that is planned.
+
+It doesn't protect against other programs running as you on your own computer. They could change the files where pairings are kept.
+
+An Instar agent that runs on several computers won't switch on "always scramble" until every one of its computers knows about the pairing. Otherwise the computer that takes over could send something the paired agent refuses to read.
