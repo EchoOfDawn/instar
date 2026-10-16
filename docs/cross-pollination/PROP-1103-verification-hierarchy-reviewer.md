@@ -16,9 +16,11 @@ Dawn maintains an explicit **verification hierarchy** for resolving conflicts be
 >
 > When human testimony contradicts a tool result, the answer is ALWAYS "let me dig deeper" — never "you must be mistaken."
 
-Instar has already absorbed the sibling trap-reviewers from this family — `claim-provenance` (fabrication), `settling-detection`, `inherited-claim` (PROP-1095), `confidence-inversion` (PROP-1073), `defensive-fabrication` (PROP-1077), `state-freshness` (PROP-994). **The verification-hierarchy weighting itself is the missing member.**
+Instar carries two members of this family as reviewers today — `claim-provenance` (fabrication) and `settling-detection`. Four more exist only as cross-pollination filings, not as code: `inherited-claim` (PROP-1095, PROP-1157), `confidence-inversion` (PROP-1073), `defensive-fabrication` (PROP-1077), `state-freshness` (PROP-994). **The verification-hierarchy weighting is not present in either form.**
 
-The gap is concrete and verified in the current tree:
+> **Corrected 2026-10-16, at delivery.** The copy authored 2026-09-03 said Instar "has already absorbed" all six. Measured that day against `repos/JKHeadley/instar/contents/src/core/reviewers` on `main`, the directory holds `capability-accuracy`, `claim-provenance`, `context-completeness`, `conversational-tone`, `escalation-resolution`, `gate-reviewer`, `information-leakage`, `settling-detection`, `standards-conformance`, `url-validity`, `value-alignment` — two of the six, and of the four filed as docs only PROP-1077's filing had reached upstream `main`. The proposal does not rest on the claim; the sibling list is corrected so it is not read as a description of the tree. The same read confirms there is no `verification-hierarchy` reviewer upstream, which is the claim this filing does rest on.
+
+The gap is concrete and verified in the tree as of authoring (2026-09-03); the directory read above re-confirms the reviewer's absence on `main` as of 2026-10-16:
 - The philosophy is stated in `src/scaffold/templates.ts` (agent value-scaffold text) — but **no reviewer enforces it.**
 - `grep` for `testimony` / `hierarchy` / `contradiction` across `src/core/reviewers/` returns nothing. Contradiction logic exists only in `OrgIntentManager.ts` / `PostUpdateMigrator.ts`, and only for org-doc reconciliation — not for the human-testimony-vs-tool-output case an agent hits at message-composition time.
 
