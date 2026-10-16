@@ -21,7 +21,7 @@ export interface PairToolsDeps {
 
 export type ToolResult = { ok: true; [k: string]: unknown } | { ok: false; error: string };
 
-const NO_ELICIT = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Use an app that supports it, such as Claude Code, to approve this step.';
+const NO_ELICIT = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Either use an app that supports it, such as Claude Code, or open a terminal and run: npx threadline-mcp pair open (to accept an invite you were sent) or npx threadline-mcp pair finish (to confirm who accepted yours). That command asks you, not me. It is an honest boundary rather than a hard one: an agent that can run commands in a terminal could run it too, so do not let one do it for you.';
 
 export class PairTools {
   constructor(private readonly deps: PairToolsDeps) {}

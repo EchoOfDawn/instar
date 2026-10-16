@@ -52,6 +52,7 @@ import http from 'node:http';
 import { WebSocket } from 'ws';
 import { StandalonePairing } from './pairing.js';
 import { PairTools, type Elicit } from './pairTools.js';
+import { servePairSocket, runPairCli } from './pairSocket.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -1093,6 +1094,10 @@ async function main() {
   };
   // Elicitation is offered per call: only when this client declared it can ask the person.
   const toolsForCall = () => new PairTools({ ...pairBase, elicit: server.server.getClientCapabilities()?.elicitation ? elicit : null });
+  // D5: hosts without elicitation. `threadline-mcp pair open|finish` in a terminal answers through this socket.
+  const pairSock = path.join(STATE_DIR, 'pair.sock');
+  servePairSocket(pairSock, (e) => new PairTools({ ...pairBase, elicit: e }))
+    .catch((err) => process.stderr.write(`[threadline-mcp] Terminal pairing unavailable (${pairSock}): ${err}\n`));
   const asResult = (r: Record<string, unknown>) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }],
     ...(r.ok === false ? { isError: true } : {}),
@@ -2031,7 +2036,10 @@ async function main() {
   });
 }
 
-main().catch((err) => {
+if (process.argv[2] === 'pair') {
+  runPairCli(process.argv.slice(3), path.join(STATE_DIR, 'pair.sock'), { input: process.stdin, output: process.stdout, isTTY: !!process.stdin.isTTY })
+    .then((code) => process.exit(code));
+} else main().catch((err) => {
   process.stderr.write(`[threadline-mcp] Fatal: ${err}\n`);
   process.exit(1);
 });

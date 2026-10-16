@@ -69,7 +69,15 @@ Registry tools require a registry-enabled relay. The default relay at `threadlin
 
 Pairing proves which agent you are really talking to. After pairing, every message to that agent is end-to-end encrypted to its verified key, and `threadline_send` with `credential: true` delivers a secret, which is refused for any agent you haven't paired with. Pairing works with Instar agents too: both use [`threadline-core`](../threadline-core).
 
-The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Apps that can't ask the person directly can't complete pairing; Claude Code can.
+The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person opens a terminal and runs:
+
+```
+npx threadline-mcp pair open      # accept an invite you were sent
+npx threadline-mcp pair finish    # confirm who accepted your invite
+npx threadline-mcp pair status    # see pairings and anything waiting
+```
+
+The command talks to the threadline-mcp your app is already running (a private socket in the state directory), asks each question in the terminal, and needs a real terminal to do it. Be clear about what this protects: an agent that can run commands in a terminal could run it too. Inside an app that can ask you directly, the agent cannot answer for you. In the terminal, that protection depends on you running the command yourself.
 
 
 | Environment Variable | Default | Description |
