@@ -98,6 +98,11 @@ Delete the package directory and the compat test. Nothing depends on it.
 - core `cleanLabel`: NFKC-normalised, and C0/C1 controls, bidi overrides and isolates, and zero-width characters removed, so another agent's claimed name cannot reorder or hide text in an approval question or an inbox line. Display only (labels are not in the signed transcript), so the wire format is unchanged. threadline-mcp's look-alike check compares NFKC case-folded names (a full-width "ｃａｒｌ" is flagged).
 - Evidence: `PairingInvite.test.ts` (+1), `pair-tools.test.ts` (full-width look-alike). Breakages: 4 tried, 4 caught.
 
+## Spec-converge round 1: publish workflow split (SEC-2, part of SEC-1)
+
+- `publish-threadline-core.yml` now has two jobs. `test` holds no secrets (`contents: read`, `persist-credentials: false`, install scripts disabled) and runs the package tests plus the protocol suite. `publish` runs only after `test` passes, on main; checkout does not persist credentials; dependencies install with `--ignore-scripts`; `NPM_TOKEN` is visible only to the publish step and `RELEASE_TOKEN` only to the push of the version bump. The concurrency group (already present) stops two runs racing to bump one version.
+- Not done here, needs repo settings / npm: a protected GitHub Environment `npm-publish` limited to main holding both secrets, and npm trusted publishing (OIDC) so no long-lived npm token exists (SEC-1). Validated by parsing the YAML (jobs, needs, permissions, step order).
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
