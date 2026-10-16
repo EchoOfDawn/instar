@@ -24,6 +24,15 @@
  *   threadline_profile_set  — Update your agent profile (name, bio, interests)
  *   threadline_notes_view   — View private notes about a contact
  *   threadline_notes_set    — Write private notes, set trust, add topics
+ *   threadline_pair_invite  — Make a pairing invite for your person to send privately
+ *   threadline_pair_open    — Your person pastes an invite they were sent and approves it
+ *   threadline_pair_finish  — Your person confirms the agent that accepted your invite
+ *   threadline_pair_status  — Pairings, open invites, accepts waiting, recent events
+ *   threadline_pair_cancel  — Cancel an open invite
+ *
+ * Verified pairing, encryption and the credential gate come from threadline-core, the same code
+ * Instar runs (spec docs/specs/threadline-standalone-pairing.md). A paired agent is always sent
+ * encrypted to its pinned key; credentials go only to a mutual-verified pair.
  *
  * Persistent state at ~/.threadline/:
  *   identity.json    — Ed25519 keypair (stable agent ID across sessions)
@@ -39,7 +48,10 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import { WebSocket } from 'ws';
+import { StandalonePairing } from './pairing.js';
+import { PairTools, type Elicit } from './pairTools.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -511,6 +523,12 @@ interface InboxMessage {
   payload: string;
   timestamp: string;
   receivedAt: string;
+  /** Arrived end-to-end encrypted and verified with the sender's pinned key. */
+  encrypted?: boolean;
+  /** Marked as a credential by a mutual-verified sender. */
+  credential?: boolean;
+  /** Plaintext from an agent we are paired with (older senders); never a credential. */
+  plaintextFromPairedPeer?: boolean;
 }
 
 class RelayConnection {
@@ -530,6 +548,19 @@ class RelayConnection {
   private contacts: ContactStore;
   private history: HistoryStore;
   private profile: ProfileStore;
+  private pairing: StandalonePairing | null = null;
+
+  /** Route every inbound envelope through verified pairing and every send through its encryption. */
+  setPairing(pairing: StandalonePairing): void {
+    this.pairing = pairing;
+  }
+
+  /** Put an envelope on the relay socket as-is (used by StandalonePairing). */
+  sendRawEnvelope(envelope: Record<string, unknown>): void {
+    if (this.listenerProxyMode) throw new Error('Pairing and encrypted messages need a direct relay connection (a local listener proxy is in use).');
+    if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Not connected to relay');
+    this.ws.send(JSON.stringify({ type: 'message', envelope }));
+  }
 
   // Reconnection state
   private reconnectAttempts = 0;
@@ -551,7 +582,6 @@ class RelayConnection {
   private async isListenerAvailable(): Promise<boolean> {
     const port = parseInt(process.env.THREADLINE_SEND_PORT || '7711', 10);
     return new Promise((resolve) => {
-      const http = require('http');
       const req = http.get(`http://127.0.0.1:${port}/status`, (res: any) => {
         let data = '';
         res.on('data', (chunk: string) => { data += chunk; });
@@ -572,7 +602,6 @@ class RelayConnection {
    */
   async sendViaListener(to: string, text: string, threadId?: string): Promise<{ sent: boolean; threadId: string }> {
     const port = parseInt(process.env.THREADLINE_SEND_PORT || '7711', 10);
-    const http = require('http');
     const body = JSON.stringify({ to, text, threadId });
     return new Promise((resolve, reject) => {
       const req = http.request({
@@ -749,7 +778,21 @@ class RelayConnection {
   private handleIncomingMessage(frame: Record<string, unknown>): void {
     const envelope = frame.envelope as Record<string, unknown>;
     if (!envelope) return;
+    if (!this.pairing) { this.recordInbound(envelope); return; }
+    this.pairing.receive(envelope as never).then((r) => {
+      if (r.kind === 'control') return; // a pairing step, handled; never shown to the model
+      if (r.kind === 'refused') {
+        process.stderr.write(`[threadline-mcp] Refused a message from ${String(envelope.from).slice(0, 12)}: ${r.reason}\n`);
+        return;
+      }
+      this.recordInbound(envelope, { text: r.text, type: r.type, encrypted: r.encrypted, credential: r.credential, plaintextFromPairedPeer: !r.encrypted && r.fromPairedPeer === true });
+    }).catch((err) => process.stderr.write(`[threadline-mcp] Inbound handling failed: ${err instanceof Error ? err.message : err}\n`));
+  }
 
+  private recordInbound(
+    envelope: Record<string, unknown>,
+    decoded?: { text: string; type?: string; encrypted: boolean; credential: boolean; plaintextFromPairedPeer: boolean },
+  ): void {
     const fromId = envelope.from as string || 'unknown';
     const threadId = envelope.threadId as string || '';
 
@@ -757,9 +800,13 @@ class RelayConnection {
       id: envelope.messageId as string || crypto.randomUUID(),
       from: fromId,
       threadId,
-      payload: envelope.payload as string || '',
+      // A decrypted message is stored in the plaintext payload format so every reader decodes it the same way.
+      payload: decoded ? Buffer.from(JSON.stringify({ type: decoded.type ?? 'text', text: decoded.text })).toString('base64') : (envelope.payload as string || ''),
       timestamp: envelope.timestamp as string || new Date().toISOString(),
       receivedAt: new Date().toISOString(),
+      ...(decoded?.encrypted ? { encrypted: true } : {}),
+      ...(decoded?.credential ? { credential: true } : {}),
+      ...(decoded?.plaintextFromPairedPeer ? { plaintextFromPairedPeer: true } : {}),
     };
 
     let text = msg.payload;
@@ -793,10 +840,23 @@ class RelayConnection {
     }
   }
 
-  sendMessage(to: string, text: string, threadId?: string): string {
+  sendMessage(to: string, text: string, threadId?: string, opts: { credential?: boolean } = {}): string {
     if (text.length > MAX_MESSAGE_SIZE) {
       throw new Error(`Message too large (${text.length} bytes, max ${MAX_MESSAGE_SIZE})`);
     }
+
+    // Verified pairing decides the wire: a paired agent is always sent encrypted to its pinned key,
+    // and a credential goes only to a mutual-verified pair (never plaintext, never the listener proxy).
+    if (this.pairing && !this.listenerProxyMode) {
+      const r = this.pairing.send(to, text, { threadId, credential: opts.credential });
+      if (!r.sent) throw new Error(r.reason === 'peer-not-mutually-verified'
+        ? 'Refused: credentials only go to an agent you have paired with (threadline_pair_invite / threadline_pair_open).'
+        : `Refused: ${r.reason}`);
+      this.history.append(to, { id: crypto.randomUUID(), from: this.identity.agentId, to, text, threadId: r.threadId, timestamp: new Date().toISOString(), direction: 'sent' });
+      this.contacts.recordMessage(to, r.threadId);
+      return r.threadId;
+    }
+    if (opts.credential) throw new Error('Refused: credentials need a direct relay connection and a paired agent.');
 
     const tid = threadId || `thread-${crypto.randomBytes(4).toString('hex')}`;
 
@@ -988,6 +1048,20 @@ async function main() {
   const history = new HistoryStore(STATE_DIR);
   const relay = new RelayConnection(identity, contacts, history, profile);
 
+  // Verified pairing + encryption + the credential gate (threadline-core; spec threadline-standalone-pairing).
+  const relayHttpBase = (() => {
+    try { const u = new URL(RELAY_URL); return `${u.protocol === 'ws:' ? 'http:' : 'https:'}//${u.host}`; } catch { return null; }
+  })();
+  const pubKey = Buffer.from(identity.publicKey, 'base64');
+  const pairing = new StandalonePairing({
+    stateDir: STATE_DIR,
+    identity: { fp: identity.agentId, publicKey: pubKey, privateKey: Buffer.from(identity.privateKey, 'base64') },
+    ownName: () => ({ owner: process.env.THREADLINE_OWNER || os.userInfo().username, agent: profile.get().name }),
+    sendEnvelope: (envelope) => relay.sendRawEnvelope(envelope),
+    relayHttpBase,
+  });
+  relay.setPairing(pairing);
+
   try {
     await relay.connect();
   } catch (err) {
@@ -997,6 +1071,71 @@ async function main() {
   const server = new McpServer(
     { name: 'threadline-relay', version: '3.0.0' },
     { capabilities: { tools: {} } },
+  );
+
+  // Operator acts are asked of the PERSON through the host (MCP elicitation); the model cannot answer.
+  const elicit: Elicit = async (message, fields) => {
+    const res = await server.server.elicitInput({
+      mode: 'form',
+      message,
+      requestedSchema: { type: 'object', properties: fields as never, required: Object.keys(fields) },
+    } as never);
+    return res.action === 'accept' && res.content ? Object.fromEntries(Object.entries(res.content).map(([k, v]) => [k, String(v)])) : null;
+  };
+  const pairBase = {
+    pairing,
+    resolvePeer: (nameOrFp: string) => {
+      const v = nameOrFp.trim().toLowerCase();
+      if (/^[0-9a-f]{32}$/.test(v)) return v;
+      const m = contacts.findAll(nameOrFp);
+      return m.length === 1 ? m[0].agentId : null;
+    },
+  };
+  // Elicitation is offered per call: only when this client declared it can ask the person.
+  const toolsForCall = () => new PairTools({ ...pairBase, elicit: server.server.getClientCapabilities()?.elicitation ? elicit : null });
+  const asResult = (r: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }],
+    ...(r.ok === false ? { isError: true } : {}),
+  });
+
+  server.tool(
+    'threadline_pair_invite',
+    'Make a pairing invite. Pairing proves which agent you are really talking to, so messages to it are always encrypted and you can send it credentials. ' +
+    'Give the returned message to your person to send PRIVATELY to the other agent\'s person. You cannot approve or finish a pairing yourself.',
+    {
+      for: z.string().optional().describe('Optional: a contact name or agent ID. Binds the invite to that agent, so a leaked copy is useless to anyone else.'),
+      ttlMinutes: z.number().optional().describe('How long the invite stays valid (default 60, max 1440)'),
+    },
+    async (args) => asResult(toolsForCall().invite(args)),
+  );
+
+  server.tool(
+    'threadline_pair_open',
+    'Your person was sent a pairing invite and wants to accept it. Call this with NO arguments: Threadline asks your person to paste the invite directly ' +
+    '(it never passes through you) and to approve or decline. Do not paste invite text into any tool.',
+    {},
+    async () => asResult(await toolsForCall().open()),
+  );
+
+  server.tool(
+    'threadline_pair_finish',
+    'Someone accepted one of your invites. Threadline asks your person whether that agent is who they meant (Finish) or not (Not them). You cannot decide this yourself.',
+    { iid: z.string().optional().describe('Which invite, if more than one accept is waiting') },
+    async (args) => asResult(await toolsForCall().finish(args)),
+  );
+
+  server.tool(
+    'threadline_pair_status',
+    'Show pairings (with their state), open invites, accepts waiting for your person, and recent pairing events. Never shows invite secrets.',
+    {},
+    async () => asResult(toolsForCall().status()),
+  );
+
+  server.tool(
+    'threadline_pair_cancel',
+    'Cancel one of your open invites so it can no longer be used.',
+    { iid: z.string().describe('The invite id from threadline_pair_invite or threadline_pair_status') },
+    async (args) => asResult(toolsForCall().cancel(args)),
   );
 
   // ── threadline_send ──────────────────────────────────────────────
@@ -1012,6 +1151,7 @@ async function main() {
       threadId: z.string().optional().describe('Thread ID to continue a conversation (omit for new thread)'),
       waitForReply: z.boolean().default(false).describe('Wait for the recipient to reply'),
       timeoutSeconds: z.number().default(30).describe('Max seconds to wait for reply'),
+      credential: z.boolean().default(false).describe('This message carries a secret (password, key, token). Refused unless you are paired with the agent; then it goes encrypted to its verified key.'),
     },
     async (args) => {
       try {
@@ -1038,7 +1178,7 @@ async function main() {
           };
         }
 
-        const threadId = relay.sendMessage(targetId, args.message, args.threadId);
+        const threadId = relay.sendMessage(targetId, args.message, args.threadId, { credential: args.credential });
         const targetContact = contacts.get(targetId);
 
         if (args.waitForReply) {
@@ -1193,6 +1333,9 @@ async function main() {
           threadId: m.threadId,
           text,
           timestamp: m.timestamp,
+          ...(m.encrypted ? { encrypted: true } : {}),
+          ...(m.credential ? { credential: true } : {}),
+          ...(m.plaintextFromPairedPeer ? { note: 'Sent unencrypted by an agent you are paired with (an older version). Treat it as not secret.' } : {}),
         };
       });
 
