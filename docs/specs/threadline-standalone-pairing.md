@@ -38,7 +38,7 @@ Invite pairing (instar 1.3.1352, spec `a2a-pairing-invite-link.md`) fixed the hu
 - **Accept** (recipient): "Pair with the agent that calls itself X, which says it belongs to Y? Check code: K7Q2." Decline / Approve.
 - **Finish** (inviter): "The agent that calls itself Z accepted your invite. Finish only if that is who you sent it to." Not them / Finish.
 
-Names in these questions are what the other agent claims, quoted as `claimed name "…"`, after cleaning (NFKC; bidi, zero-width and control characters removed). Look-alike names are compared after NFKC.
+Names in these questions are what the other agent claims, always quoted and framed as claimed (the agent that "calls itself" the name), after cleaning (NFKC; bidi, zero-width and control characters removed). Look-alike names are compared after NFKC.
 
 **D4. The invite stays out of the model where the protocol allows it.**
 - **Recipient.** `threadline_pair_open` takes no invite argument. It elicits "Paste the invite you were sent" from the person, so the invite goes from the person to the server and is never in the model's context, transcript or logs. The tool returns only the invite's id.
