@@ -91,6 +91,8 @@ Delete the package directory and the compat test. Nothing depends on it.
 - `publish-threadline-core.yml`: `npm ci` from a committed `package-lock.json`, and a "Protocol suite" step runs this repo's `tests/unit/threadline-core` plus the Instar compatibility test before any publish.
 - Evidence: `PairingInviteFlow.test.ts` (+8, also on #2196: replay after pause; replay after an unlabelled pause; first Finish on a paused pin; foreign iid; other expiry; a second validly signed Finish; late vs in-grace Finish; failed accept send), `trust.test.ts` (+1 binding). Breakages: 10 tried, 10 caught (3 only after adding the tests that isolate each layer of the replay defence). Lockfile: `npm ci` + `npm test` pass in a clean copy.
 
+- Echo's follow-up notes (thread 1a01ebaa): every refused Finish in the tests now asserts the recipient's stored files are byte-for-byte unchanged; in threadline-mcp a store file set aside as unparseable is an attention item (`threadline_pair_status.attention`, a `Pairing ATTENTION` inbox line, and a `store-problem` audit row), not only a log line. Breakages: 2 tried, 2 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

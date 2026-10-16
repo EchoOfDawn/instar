@@ -380,6 +380,10 @@ describe('invite flow: review follow-ups (Echo, PR #2188)', () => {
 });
 
 describe('threadline-core: review fixes (Echo, PR #2195)', () => {
+  /** Every stored byte on the recipient: a refused Finish must leave it exactly as it was. */
+  const snapshot = (a: Agent) => fs.readdirSync(path.join(a.dir, 'threadline')).sort()
+    .map((f) => `${f}\n${fs.readFileSync(path.join(a.dir, 'threadline', f), 'utf8')}`).join('\n---\n');
+
   async function paired() {
     const net = new Net();
     let t = Date.parse('2026-10-16T06:00:00Z');
@@ -397,16 +401,20 @@ describe('threadline-core: review fixes (Echo, PR #2195)', () => {
     const { A, B, fin } = await paired();
     expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(true);
     B.trust.demoteInvitePairing(A.fp, 'a second agent accepted this invite');
+    const before = snapshot(B);
     B.flow.handleFinish(A.fp, fin); // the relay replays the Finish it kept
+    expect(snapshot(B)).toBe(before);
     expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(false);
     expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('invite-accepted');
   });
 
   it('a Finish for an invite this agent never accepted, or with another expiry, or a second different Finish, is refused', async () => {
     const { A, B, fin } = await paired();
+    const before = snapshot(B);
     expect(B.flow.handleFinish(A.fp, { ...fin, iid: 'ab'.repeat(16) })).toMatchObject({ ok: false, reason: 'finish for an invite this agent did not accept' });
     expect(B.flow.handleFinish(A.fp, { ...fin, exp: '2099-01-01T00:00:00.000Z' })).toMatchObject({ ok: false, reason: 'finish for an invite this agent did not accept' });
     expect(B.flow.handleFinish(A.fp, { ...fin, nonce: 'cd'.repeat(16) })).toMatchObject({ ok: false });
+    expect(snapshot(B)).toBe(before);
   });
 
   it('the applied Finish is remembered: a replay after a pause the trust store did not label still changes nothing', async () => {
@@ -427,8 +435,10 @@ describe('threadline-core: review fixes (Echo, PR #2195)', () => {
     B.trust.demoteInvitePairing(A.fp, 'paused before finish');
     A.flow.approveFinish(iid);
     const fin = { ...net.queue.find((m) => m.op === 'pair-invite-finish')!.payload };
+    const before = snapshot(B);
     expect(B.flow.handleFinish(A.fp, fin)).toMatchObject({ ok: false, reason: 'this pairing is paused; a new invite is needed' });
     expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(false);
+    expect(snapshot(B)).toBe(before);
   });
 
   it('a second, validly signed Finish with a different nonce for an already finished invite is refused', async () => {
@@ -436,7 +446,9 @@ describe('threadline-core: review fixes (Echo, PR #2195)', () => {
     const nonce = 'cd'.repeat(16);
     const T = transcript({ iid, fpA: A.fp, idA: A.pub, fpB: B.fp, idB: B.pub, exp: String(fin.exp), nonce, direction: 'finish' });
     const second = { iid, exp: fin.exp, nonce, sig: sign(A.id.privateKey, T).toString('hex') };
+    const before = snapshot(B);
     expect(B.flow.handleFinish(A.fp, second)).toMatchObject({ ok: false, reason: 'this invite was already finished' });
+    expect(snapshot(B)).toBe(before);
   });
 
   it('a Finish more than a day after the invite expired is refused; one inside the grace window is accepted', async () => {
@@ -450,7 +462,9 @@ describe('threadline-core: review fixes (Echo, PR #2195)', () => {
     const fin = { ...net.queue.find((m) => m.op === 'pair-invite-finish')!.payload };
     net.queue.length = 0;
     t = Date.parse(String(fin.exp)) + 25 * 60 * 60_000;
+    const before = snapshot(B);
     expect(B.flow.handleFinish(A.fp, fin)).toMatchObject({ ok: false, reason: 'finish arrived too long after the invite expired' });
+    expect(snapshot(B)).toBe(before);
     expect(B.trust.isCredentialShareAllowedByFingerprint(A.fp)).toBe(false);
     t = Date.parse(String(fin.exp)) + 2 * 60 * 60_000;
     expect(B.flow.handleFinish(A.fp, fin)).toMatchObject({ ok: true });
