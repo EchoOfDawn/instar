@@ -93,6 +93,11 @@ Delete the package directory and the compat test. Nothing depends on it.
 
 - Echo's follow-up notes (thread 1a01ebaa): every refused Finish in the tests now asserts the recipient's stored files are byte-for-byte unchanged; in threadline-mcp a store file set aside as unparseable is an attention item (`threadline_pair_status.attention`, a `Pairing ATTENTION` inbox line, and a `store-problem` audit row), not only a log line. Breakages: 2 tried, 2 caught.
 
+## Spec-converge round 1: names made safe to show (SEC-12)
+
+- core `cleanLabel`: NFKC-normalised, and C0/C1 controls, bidi overrides and isolates, and zero-width characters removed, so another agent's claimed name cannot reorder or hide text in an approval question or an inbox line. Display only (labels are not in the signed transcript), so the wire format is unchanged. threadline-mcp's look-alike check compares NFKC case-folded names (a full-width "ｃａｒｌ" is flagged).
+- Evidence: `PairingInvite.test.ts` (+1), `pair-tools.test.ts` (full-width look-alike). Breakages: 4 tried, 4 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
