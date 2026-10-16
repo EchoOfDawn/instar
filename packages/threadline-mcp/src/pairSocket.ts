@@ -176,7 +176,7 @@ export async function runPairCli(args: string[], sockPath: string, io: CliIO): P
       const finish = (code: number) => { if (!done) { done = true; resolve(code); } };
       sock.on('error', (e: NodeJS.ErrnoException) => {
         out.write(e.code === 'ENOENT' || e.code === 'ECONNREFUSED'
-          ? 'Nothing is listening for terminal pairing. Terminal pairing is off unless THREADLINE_TERMINAL_PAIRING=1 is set for threadline-mcp in your app\'s config, and threadline-mcp must be running (start your app). Then try again.\n'
+          ? 'Nothing is listening for terminal pairing. Terminal pairing is off unless THREADLINE_PAIR_TERMINAL=1 is set for threadline-mcp in your app\'s config, and threadline-mcp must be running (start your app). Then try again.\n'
           : `Could not reach threadline-mcp: ${e.message}\n`);
         finish(1);
       });

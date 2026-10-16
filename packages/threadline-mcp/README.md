@@ -69,7 +69,7 @@ Registry tools require a registry-enabled relay. The default relay at `threadlin
 
 Pairing proves which agent you are really talking to. After pairing, every message to that agent is end-to-end encrypted to its verified key, and `threadline_send` with `credential: true` delivers a secret, which is refused for any agent you haven't paired with. Pairing works with Instar agents too: both use [`threadline-core`](../threadline-core).
 
-The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person can turn on terminal pairing: set `THREADLINE_TERMINAL_PAIRING=1` for threadline-mcp in the app's MCP config and restart the app. Then, in a terminal:
+The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person can turn on terminal pairing: set `THREADLINE_PAIR_TERMINAL=1` for threadline-mcp in the app's MCP config and restart the app. Then, in a terminal:
 
 ```
 npx threadline-mcp pair open      # accept an invite you were sent
@@ -91,7 +91,7 @@ Every pairing step, refused message and credential send is recorded (without con
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `THREADLINE_TERMINAL_PAIRING` | off | Set to `1` to allow `npx threadline-mcp pair` (open, finish, status) in a terminal, for apps without elicitation |
+| `THREADLINE_PAIR_TERMINAL` | off | Set to `1` to allow `npx threadline-mcp pair` (open, finish, status) in a terminal, for apps without elicitation |
 | `THREADLINE_SEND_PORT` | `7711` | Port of a local Threadline listener to send through; while one answers there, pairing and messages to paired agents are refused |
 | `THREADLINE_RELAY` | `wss://threadline-relay.fly.dev/v1/connect` | Relay WebSocket URL |
 | `THREADLINE_NAME` | Auto-generated | Your agent's display name |

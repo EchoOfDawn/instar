@@ -156,6 +156,33 @@ describe('pair tools', () => {
     expect(await A.tools(person([{ decision: 'unpair' }]).elicit).forget({ peer: 'c'.repeat(32) })).toMatchObject({ ok: false });
   });
 
+  it('without elicitation, the terminal is mentioned only when the person turned it on', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire);
+    const off = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null }).open() as { error: string };
+    expect(off.error).toMatch(/cannot ask you questions directly/);
+    expect(off.error).not.toMatch(/npx threadline-mcp|terminal/i);
+    const on = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, terminalEnabled: true }).finish({}) as { error: string };
+    expect(on.error).toMatch(/npx threadline-mcp pair finish/);
+    expect(on.error).toMatch(/any program running as you/);
+  });
+
+  it('status flags an unpaired agent that claims a paired agent\'s name (a new key is never the same pairing)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('carl', wire);
+    const made = A.tools(null).invite({}) as { message: string };
+    await B.tools(person([{ invite: made.message }, { decision: 'approve' }]).elicit).open();
+    await pump(wire, [A, B]);
+    await A.tools(person([{ decision: 'finish' }]).elicit).finish({});
+    await tick(); await pump(wire, [A, B]);
+    const impostor = 'd'.repeat(32);
+    const known = [{ fingerprint: B.fp, name: 'carl' }, { fingerprint: impostor, name: 'Carl ' }, { fingerprint: 'e'.repeat(32), name: 'someone' }];
+    const st = new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, knownAgents: () => known }).status() as { lookalikes: Array<Record<string, string>> };
+    expect(st.lookalikes).toEqual([expect.objectContaining({ fingerprint: impostor, claimsNameOf: B.fp })]);
+    expect(st.lookalikes[0].note).toMatch(/different key/);
+    expect(new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, knownAgents: () => known.slice(0, 1) }).status()).not.toHaveProperty('lookalikes');
+  });
+
   it('cancel revokes an open invite once', () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire);

@@ -1098,6 +1098,8 @@ async function main() {
     pairing,
     // Pairing ops travel on this server's own relay connection; through a listener proxy they cannot.
     unavailable: () => (relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
+    terminalEnabled: process.env.THREADLINE_PAIR_TERMINAL === '1',
+    knownAgents: () => contacts.getAll().map((c) => ({ fingerprint: c.agentId, name: c.name })),
     resolvePeer: (nameOrFp: string) => {
       const v = nameOrFp.trim().toLowerCase();
       if (/^[0-9a-f]{32}$/.test(v)) return v;
@@ -1111,7 +1113,7 @@ async function main() {
   const pairSock = path.join(STATE_DIR, 'pair.sock');
   // Off unless the person turns it on in the host config: any process running as this user can
   // reach the socket, so a host that can ask the person directly never exposes it (spec D5).
-  if (process.env.THREADLINE_TERMINAL_PAIRING === '1') {
+  if (process.env.THREADLINE_PAIR_TERMINAL === '1') {
     servePairSocket(pairSock, (e) => new PairTools({ ...pairBase, elicit: e }))
       .catch((err) => process.stderr.write(`[threadline-mcp] Terminal pairing unavailable (${pairSock}): ${err}\n`));
   }

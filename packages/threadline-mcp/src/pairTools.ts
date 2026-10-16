@@ -17,16 +17,35 @@ export interface PairToolsDeps {
   elicit: Elicit | null;
   /** Resolve a contact name or fingerprint to a fingerprint, or null. */
   resolvePeer: (nameOrFp: string) => string | null;
+  /** True when the person turned on terminal pairing (THREADLINE_PAIR_TERMINAL=1); only then is it mentioned. */
+  terminalEnabled?: boolean;
+  /** Known agents (fingerprint and claimed name), to flag look-alikes of paired agents in status (D8). */
+  knownAgents?: () => Array<{ fingerprint: string; name: string }>;
   /** Why pairing cannot work right now (e.g. no direct relay connection), or null. */
   unavailable?: () => string | null;
 }
 
 export type ToolResult = { ok: true; [k: string]: unknown } | { ok: false; error: string };
 
-const NO_ELICIT = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Either use an app that supports it, such as Claude Code, or turn on terminal pairing (set THREADLINE_TERMINAL_PAIRING=1 for threadline-mcp in your app config and restart it), then open a terminal and run: npx threadline-mcp pair open (to accept an invite you were sent) or npx threadline-mcp pair finish (to confirm who accepted yours). That command asks you, not me. It is an honest boundary rather than a hard one: an agent that can run commands in a terminal could run it too, so do not let one do it for you.';
+const NO_ELICIT = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Use an app that supports it, such as Claude Code, to do this step.';
+const NO_ELICIT_TERMINAL = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Terminal pairing is turned on for this server, so please run this yourself in a terminal: npx threadline-mcp pair open (to accept an invite you were sent) or npx threadline-mcp pair finish (to confirm who accepted yours). That command asks you, not me. It is an honest boundary rather than a hard one: any program running as you, including an agent that can run commands, could use it too, so do not let one do it for you.';
 
 export class PairTools {
   constructor(private readonly deps: PairToolsDeps) {}
+
+  private noElicit(): string { return this.deps.terminalEnabled ? NO_ELICIT_TERMINAL : NO_ELICIT; }
+
+  /** Unpaired agents that claim the display name of a paired one: a rotation or an impostor, never the same agent (D8). */
+  private lookalikes(paired: Array<{ agent: string; fingerprint?: string }>): Array<{ agent: string; fingerprint: string; claimsNameOf: string; note: string }> {
+    const pinnedFps = new Set(paired.map((p) => String(p.fingerprint || '').toLowerCase()));
+    const byName = new Map(paired.map((p) => [p.agent.trim().toLowerCase(), p]));
+    return (this.deps.knownAgents?.() ?? [])
+      .filter((k) => !pinnedFps.has(k.fingerprint.toLowerCase()) && byName.has(k.name.trim().toLowerCase()))
+      .map((k) => {
+        const p = byName.get(k.name.trim().toLowerCase())!;
+        return { agent: k.name, fingerprint: k.fingerprint, claimsNameOf: String(p.fingerprint), note: `Claims the name of "${p.agent}", which you are paired with, but has a different key, so it is not that pairing. If that agent changed its identity, unpair the old one and pair again.` };
+      });
+  }
 
   /** threadline_pair_invite: make an invite for the person to send privately. Grants nothing. */
   invite(args: { for?: string; ttlMinutes?: number }): ToolResult {
@@ -51,7 +70,7 @@ export class PairTools {
   async open(): Promise<ToolResult> {
     const why = this.deps.unavailable?.();
     if (why) return { ok: false, error: why };
-    if (!this.deps.elicit) return { ok: false, error: NO_ELICIT };
+    if (!this.deps.elicit) return { ok: false, error: this.noElicit() };
     const pasted = await this.deps.elicit('Paste the pairing invite you were sent. It goes straight to Threadline, not to your agent.', {
       invite: { type: 'string', title: 'Pairing invite', description: 'The whole message, including the part that starts with tlinv1:' },
     });
@@ -77,7 +96,7 @@ export class PairTools {
   async finish(args: { iid?: string }): Promise<ToolResult> {
     const why = this.deps.unavailable?.();
     if (why) return { ok: false, error: why };
-    if (!this.deps.elicit) return { ok: false, error: NO_ELICIT };
+    if (!this.deps.elicit) return { ok: false, error: this.noElicit() };
     const waiting = this.deps.pairing.waitingToFinish();
     const target = args.iid ? waiting.find((i) => i.iid === args.iid) : waiting.length === 1 ? waiting[0] : undefined;
     if (!target) {
@@ -104,9 +123,12 @@ export class PairTools {
   /** threadline_pair_status: pairings, open invites, accepts waiting, recent events. Never secrets. */
   status(): ToolResult {
     const p = this.deps.pairing;
+    const paired = p.keys.list().map((k) => ({ agent: k.agent, fingerprint: k.fingerprint, state: k.pairingState, verifiedAt: k.verifiedAt }));
+    const lookalikes = this.lookalikes(paired);
     return {
       ok: true,
-      paired: p.keys.list().map((k) => ({ agent: k.agent, fingerprint: k.fingerprint, state: k.pairingState, verifiedAt: k.verifiedAt })),
+      paired,
+      ...(lookalikes.length ? { lookalikes } : {}),
       openInvites: p.invites.list().filter((i) => i.state === 'open').map((i) => ({ iid: i.iid, exp: i.exp, boundTo: i.bind })),
       waitingToFinish: p.waitingToFinish().map((i) => ({ iid: i.iid, claimedAgent: i.acceptor?.agent, claimedOwner: i.acceptor?.owner })),
       recent: p.recentEvents().slice(0, 10),
@@ -121,7 +143,7 @@ export class PairTools {
    * pin is forgotten here and the agent is paired again from scratch.
    */
   async forget(args: { peer: string }): Promise<ToolResult> {
-    if (!this.deps.elicit) return { ok: false, error: NO_ELICIT };
+    if (!this.deps.elicit) return { ok: false, error: this.noElicit() };
     const fp = this.deps.resolvePeer(String(args.peer || ''));
     const pin = fp ? this.deps.pairing.keys.getProfileByFingerprint(fp) : null;
     if (!fp || !pin) return { ok: false, error: `You are not paired with "${args.peer}".` };

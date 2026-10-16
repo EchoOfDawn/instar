@@ -129,9 +129,16 @@ Re-reading the spec against the build found three things it asked for that were 
 
 - Plaintext naming a pinned sender (Echo 1): `pairing.ts` delivers it as `fromPairedPeer` only when the envelope verifies against the pinned key; otherwise `unverifiedPairedClaim`, with an inbox note that the relay could have written it. New downgrade high-water mark: after a pinned peer's first encrypted ORDINARY chat (pairing ops and credentials excluded, because pre-step-9 Instar encrypts those while still sending chat in plaintext), plaintext in its name is refused. Persisted 0600 at `threadline/encrypted-chat-peers.json`.
 - Key change (Echo 2): structurally a new fingerprint; new `threadline_pair_forget` is an operator act (elicitation), so the model cannot remove a pin and with it the always-encrypt rule.
-- Terminal fallback (Echo 6): the socket exists only when `THREADLINE_TERMINAL_PAIRING=1`.
+- Terminal fallback (Echo 6): the socket exists only when `THREADLINE_PAIR_TERMINAL=1`.
 - Over-block: plaintext from a peer that has sent encrypted chat is refused even if a later peer version legitimately stopped encrypting (by design: a downgrade). Under-block: none new.
 - Evidence: `standalone-pairing.test.ts` (signed vs unsigned vs forged vs tampered plaintext; the high-water mark, what sets it and what does not, persisted 0600), `pair-tools.test.ts` (forget: no elicitation, keep, dismiss, unpair, unknown), proxy E2E (no socket by default), stdio E2E (socket when turned on). Breakages: 7 tried, 7 caught.
+
+## Spec r2.1 reconciliation with instar-codey's r2 (added 2026-10-16)
+
+- Env var renamed to `THREADLINE_PAIR_TERMINAL` (instar-codey's name). Without it, the no-elicitation refusal no longer mentions the terminal at all; with it, the refusal names the commands and states that any same-user program could use them.
+- `threadline_pair_status` gains `lookalikes`: an unpaired known agent whose display name matches a paired agent's (case- and space-insensitive) is flagged as a different key, never the same pairing (D8). Source: the contacts store.
+- `publish-threadline-core.yml`: the job runs only when `github.ref` is `refs/heads/main`, so a manual run on another branch publishes nothing (D10 says so).
+- Evidence: `pair-tools.test.ts` (+2: refusal text with and without the terminal; look-alike flagged, the real peer and an unrelated name not). Breakages: 3 tried, 3 caught. Proxy and stdio E2Es pass.
 
 ## Class-Closure Declaration (display-only mirror)
 
