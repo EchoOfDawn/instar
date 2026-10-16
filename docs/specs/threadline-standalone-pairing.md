@@ -46,6 +46,8 @@ Invite pairing (instar 1.3.1352, spec `a2a-pairing-invite-link.md`) fixed the hu
 
 **D6 as built in v1 (2026-10-16).** `threadline-mcp` encrypts to every peer whose key is PINNED (any pairing state), never to a relay-presented key, so the `e2e-v1` capability question (§8.1) is deferred and pre-pairing messages stay plaintext as today. Instar 1.3.1352 still encrypts ordinary chat only when the relay gave it the peer's X25519 key, so a paired Instar agent may send the standalone plaintext. The standalone delivers that, marked unencrypted and from a paired peer, and never as a credential; it never replies in plaintext. Step 9 makes Instar encrypt to pinned peers using the pinned key, which closes this from Instar's side.
 
+**Listener proxy mode (as built).** When a local Threadline listener answers on `THREADLINE_SEND_PORT` (default 7711), `threadline-mcp` sends through it and has no relay connection of its own. It then cannot pair or encrypt, so `threadline_pair_invite|open|finish` (and the terminal commands) refuse with that reason, and an ordinary message to an agent it holds a pin for is refused rather than sent through the listener in plaintext. Messages to unpinned agents go through the listener as before. Any message containing an invite (`tlinv1:`) is refused in every mode (D4).
+
 **D7. The credential gate is in the package.** `threadline_send` gains `credential: true`. It is refused unless the peer is `mutual-verified` with a pinned key, the envelope is encrypted to the X25519 key derived from that pinned key, and the receiving side applies the same rule on ingestion. Same predicate as Instar's `CredentialShareGate`, from `threadline-core`.
 
 ## 3. The protocol
@@ -66,7 +68,7 @@ Inbound invite ops are handled by the server's relay listener, never surfaced to
 
 ## 5. Storage (state dir, all `0600`)
 
-`identity.json` (existing), `pairing-invites.json` (the store from instar, same semantics), `pinned-keys.json` (fp → identity key, state, verifiedAt, pairingId), and `pairing-invite-events.jsonl` (bounded, rotated at 1 MB, never secrets). The existing contacts file keeps its `trust` label but it no longer counts for anything security-relevant. Only `pinned-keys.json` does.
+`identity.json` (existing), `pairing-invites.json` (the store from instar, same semantics), `pinned-keys.json` (fp → identity key, state, verifiedAt, pairingId), and `pairing-invite-events.jsonl` (bounded, rotated at 1 MB, never secrets). *As built:* `threadline/pairing-audit.jsonl`, which also records refusals and credential sends and receipts; same bound and rotation; `threadline_pair_status` names it, and `threadline_inbox` shows the newest pairing events as plain `pairing` lines. The existing contacts file keeps its `trust` label but it no longer counts for anything security-relevant. Only `pinned-keys.json` does.
 
 ## 6. Threats (what changes outside Instar)
 
