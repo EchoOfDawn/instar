@@ -21,7 +21,8 @@ jobs:
   publish:
     name: Publish threadline-core
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    # main only: a manual dispatch from another branch must not publish (spec D10).
+    if: "github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')"
     permissions:
       contents: write
       id-token: write
