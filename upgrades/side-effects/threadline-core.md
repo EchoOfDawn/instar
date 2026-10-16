@@ -9,7 +9,7 @@
 
 Spec `docs/specs/threadline-standalone-pairing.md`, principle D0 (Justin, 2026-10-15): the fundamentals of agent-to-agent communication live in Threadline and packages shared with Instar, never only in Instar. This adds `packages/threadline-core`, a standalone package with no Instar imports, depending only on `@noble/ciphers`.
 
-Steps 1–2 (this commit): `crypto.ts` (identity keys, sign/verify, X25519 from Ed25519, `isX25519BoundToIdentity`, the pairing id) and `envelope.ts` (XChaCha20-Poly1305 with X25519/HKDF, signed canonical envelope), ported from Instar's `ThreadlineCrypto` and `MessageEncryptor` with the same algorithms, labels and encodings. Nothing in Instar or `threadline-mcp` uses the package yet.
+Steps 1–2: `crypto.ts` (identity keys, sign/verify, X25519 from Ed25519, `isX25519BoundToIdentity`, the pairing id) and `envelope.ts` (XChaCha20-Poly1305 with X25519/HKDF, signed canonical envelope), ported from Instar's `ThreadlineCrypto` and `MessageEncryptor` with the same algorithms, labels and encodings. Nothing in Instar or `threadline-mcp` uses the package yet.
 
 ## Decision-point inventory
 
@@ -63,6 +63,14 @@ Delete the package directory and the compat test. Nothing depends on it.
 - `tests/unit/threadline/threadline-core-compat.test.ts` (3, vitest, live keys): core → Instar and Instar → core both decrypt and verify, and derivations agree.
 - Breakages: 8 tried, 7 caught (HKDF label, key sort, the signature exclusion (after adding a direct canonical-form test), AAD, the signature check, the pairing-id label, the fingerprint length). One survived by design: removing the RFC 7748 clamp bit has no effect, because Node's X25519 clamps scalars itself. Kept for fidelity to Instar.
 
+## Steps 3–4: the pairing protocol, pinned keys, the credential gate (added 2026-10-16)
+
+- `invite.ts` and `inviteStore.ts`: Instar's `PairingInvite.ts` and `PairingInviteStore.ts`, copied (already free of Instar imports).
+- `flow.ts`: Instar's `PairingInviteFlow.ts`, with its trust dependency changed from `AgentTrustManager` to a small `InviteTrust` interface (four methods), which Instar's manager still satisfies by shape.
+- `trust.ts` (new): `PinnedKeyStore`, a 0600 file of fingerprint → pinned identity key + state, with Instar's invite transitions (accept pins as `invite-accepted`; finish → `mutual-verified` with the pairing id; demote → paused; never swaps a pinned key). `credentialSendKey` allows a credential only to a `mutual-verified` pin whose pairing id still matches OUR current key, and returns the only key it may be encrypted to (X25519 derived from the pinned identity). `credentialAcceptFrom` gates inbound. Both fail closed.
+- Decision points added: `credentialSendKey`, `credentialAcceptFrom`, and `PinnedKeyStore`'s transitions.
+- Evidence: Instar's own protocol suites (`PairingInvite`, `PairingInviteStore`, `PairingInviteFlow`) copied into `tests/unit/threadline-core/`, pointed at the package with `PinnedKeyStore` as the trust store: 44 pass unchanged. New `trust.test.ts` (9). Total 53. Breakages: 10 of 10 caught, two of them in the ported engine (the one-alarm-per-invite guard, the MAC tag check), proving the suites exercise the core copy. One survived at first: removing the state check from `credentialSendKey` passed, because no test sent to a PAUSED peer, and a demoted pin keeps its pairing id. So a credential could have gone to a peer whose invite leaked. The test was added and the check is now caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
-`unbounded-self-action` — closure **n/a** (negative declaration). Pure cryptographic functions with no loops over actions, no retries, no scheduling.
+`unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
