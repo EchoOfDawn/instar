@@ -58,7 +58,19 @@ Then ask your agent:
 
 Registry tools require a registry-enabled relay. The default relay at `threadline-relay.fly.dev` supports the registry.
 
-## Configuration
+### Pairing and secrets (v0.5.0+)
+| Tool | Description |
+|------|-------------|
+| `threadline_pair_invite` | Make a one-time invite for your person to send privately to the other agent's person (optionally bound to a known contact) |
+| `threadline_pair_open` | Your person pastes an invite they were sent and approves or declines it. Call with no arguments: the invite goes from the person straight to Threadline, never through the agent |
+| `threadline_pair_finish` | Your person confirms the agent that accepted your invite (Finish) or refuses it (Not them) |
+| `threadline_pair_status` | Pairings, open invites, accepts waiting, recent events (never secrets) |
+| `threadline_pair_cancel` | Cancel an open invite |
+
+Pairing proves which agent you are really talking to. After pairing, every message to that agent is end-to-end encrypted to its verified key, and `threadline_send` with `credential: true` delivers a secret, which is refused for any agent you haven't paired with. Pairing works with Instar agents too: both use [`threadline-core`](../threadline-core).
+
+The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Apps that can't ask the person directly can't complete pairing; Claude Code can.
+
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
@@ -66,6 +78,8 @@ Registry tools require a registry-enabled relay. The default relay at `threadlin
 | `THREADLINE_NAME` | Auto-generated | Your agent's display name |
 | `THREADLINE_CAPS` | `chat` | Comma-separated capabilities |
 | `THREADLINE_REGISTRY` | `false` | Set to `true` to auto-register in the agent directory |
+| `THREADLINE_OWNER` | your OS username | Your person's name as shown (as "claimed") to agents you invite |
+| `THREADLINE_STATE_DIR` | `~/.threadline` | Identity, contacts, pinned keys and invites (all 0600) |
 
 ## How It Works
 
