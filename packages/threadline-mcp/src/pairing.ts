@@ -60,6 +60,9 @@ export class StandalonePairing {
   readonly events = new EventEmitter();
   private readonly crypto: EnvelopeCrypto;
   private readonly recent: StandaloneEvent[] = [];
+  /** Encrypted messages already accepted, by sender and messageId, so a captured envelope cannot be replayed. In memory, bounded. */
+  private readonly seen = new Set<string>();
+  static readonly SEEN_MAX = 10_000;
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
 
@@ -146,6 +149,11 @@ export class StandalonePairing {
       } catch {
         return { kind: 'refused', reason: 'could not verify or decrypt with the pinned key' };
       }
+      // Recorded only AFTER verification, so a forged envelope cannot poison the set.
+      const id = `${from}:${env.messageId || env.signature}`;
+      if (this.seen.has(id)) return { kind: 'refused', reason: 'replayed message (already received)' };
+      this.seen.add(id);
+      if (this.seen.size > StandalonePairing.SEEN_MAX) this.seen.delete(this.seen.values().next().value as string);
       if (msg.type && INVITE_OPS.has(msg.type)) {
         await this.flow.handleControl(msg.type, from, msg as unknown as Record<string, unknown>);
         return { kind: 'control' };

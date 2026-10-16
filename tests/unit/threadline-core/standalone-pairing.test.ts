@@ -120,6 +120,21 @@ describe('StandalonePairing', () => {
     expect(await B.p.receive(tampered as never)).toEqual({ kind: 'refused', reason: 'could not verify or decrypt with the pinned key' });
   });
 
+  it('a captured encrypted envelope is accepted once; a replay of it is refused, and a forgery cannot burn its id', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    A.p.send(B.fp, 'pay invoice 7');
+    const e = wire.out.shift()!;
+    // a forgery reusing the real messageId arrives FIRST; it fails verification and must not mark the id as seen
+    expect(await B.p.receive({ ...e, payload: Buffer.from('x').toString('base64') } as never)).toMatchObject({ kind: 'refused' });
+    expect(await B.p.receive(e as never)).toMatchObject({ kind: 'message', text: 'pay invoice 7', encrypted: true });
+    expect(await B.p.receive(e as never)).toEqual({ kind: 'refused', reason: 'replayed message (already received)' });
+    // a new message from the same sender still goes through
+    A.p.send(B.fp, 'second');
+    expect(await B.p.receive(wire.out.shift()! as never)).toMatchObject({ kind: 'message', text: 'second' });
+  });
+
   it('pairing ops other than the accept are ignored in plaintext; an invite sent as a message is refused', async () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire), B = agent('b', wire);

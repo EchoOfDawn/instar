@@ -142,6 +142,23 @@ describe('terminal pairing (D5)', () => {
     expect(got).not.toContain('"result"');
   });
 
+  it('a terminal that sits on a question past the idle limit is closed, and the question is answered with nothing', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire);
+    const ended: unknown[] = [];
+    servers.push(await servePairSocket(A.sock, (e) => {
+      const t = new PairTools({ ...A.base, elicit: e });
+      const open = t.open.bind(t);
+      t.open = async () => { const r = await open(); ended.push(r); return r; };
+      return t;
+    }, { idleMs: 50 }));
+    const raw = net.connect(A.sock);
+    raw.on('data', () => { /* sees the question, never answers */ });
+    raw.write(JSON.stringify({ cmd: 'open' }) + '\n');
+    await new Promise((r) => raw.on('close', r));
+    await vi.waitFor(() => expect(ended).toEqual([expect.objectContaining({ ok: false })]));
+  });
+
   it('says plainly when threadline-mcp is not running', async () => {
     const t = terminal([]);
     expect(await runPairCli(['open'], path.join(os.tmpdir(), `none-${process.pid}.sock`), t.io)).toBe(1);

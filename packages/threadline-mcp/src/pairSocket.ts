@@ -21,6 +21,11 @@ import type { Elicit, PairTools, ToolResult } from './pairTools.js';
 
 type Fields = Parameters<Elicit>[1];
 
+/** How long a terminal may sit on one question before the server gives up on it. */
+export const PAIR_SOCKET_IDLE_MS = 15 * 60_000;
+/** At most this many terminals at once; more are refused by the OS backlog/close. */
+export const PAIR_SOCKET_MAX_CONNECTIONS = 4;
+
 function lines(sock: net.Socket, onLine: (msg: Record<string, unknown>) => void): void {
   let buf = '';
   sock.setEncoding('utf8');
@@ -37,7 +42,7 @@ function lines(sock: net.Socket, onLine: (msg: Record<string, unknown>) => void)
 const send = (sock: net.Socket, msg: unknown) => { if (!sock.destroyed) sock.write(JSON.stringify(msg) + '\n'); };
 
 /** Serve the pair socket. `toolsFor(elicit)` builds PairTools that ask through the connected terminal. */
-export async function servePairSocket(sockPath: string, toolsFor: (elicit: Elicit) => PairTools): Promise<net.Server> {
+export async function servePairSocket(sockPath: string, toolsFor: (elicit: Elicit) => PairTools, opts: { idleMs?: number } = {}): Promise<net.Server> {
   // Never take the socket from a live server on the same state dir; only clear a stale one.
   const live = await new Promise<boolean>((resolve) => {
     const probe = net.connect(sockPath);
@@ -56,6 +61,8 @@ export async function servePairSocket(sockPath: string, toolsFor: (elicit: Elici
     });
     sock.on('close', () => { pendingAnswer?.(null); pendingAnswer = null; }); // a closed terminal answers nothing
     sock.on('error', () => { /* handled by close */ });
+    // A connection that goes quiet is closed, which answers any pending question with nothing.
+    sock.setTimeout(opts.idleMs ?? PAIR_SOCKET_IDLE_MS, () => sock.destroy());
     lines(sock, async (msg) => {
       if (pendingAnswer && 'answer' in msg) {
         const a = msg.answer && typeof msg.answer === 'object'
@@ -76,6 +83,7 @@ export async function servePairSocket(sockPath: string, toolsFor: (elicit: Elici
       sock.end();
     });
   });
+  server.maxConnections = PAIR_SOCKET_MAX_CONNECTIONS;
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(sockPath, () => {
