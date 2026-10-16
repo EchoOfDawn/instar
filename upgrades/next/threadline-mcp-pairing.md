@@ -2,6 +2,9 @@
 
 ## What Changed
 
+- Plaintext that names a paired agent counts as from it only when signed by its pinned key; otherwise it is shown as an unverified claim. Once a paired agent has sent encrypted chat, plaintext in its name is refused (no downgrade).
+- New `threadline_pair_forget` (unpair; the person confirms). Terminal pairing is off unless `THREADLINE_TERMINAL_PAIRING=1` is set.
+
 `threadline-mcp`, the Threadline tool any agent can install without Instar, now has what makes a channel safe for secrets, from the shared `threadline-core` package:
 - pairing by invite, compatible with Instar agents (tools `threadline_pair_invite`, `_open`, `_finish`, `_status`, `_cancel`);
 - after pairing, every message to that agent is end-to-end encrypted to its verified key, and an encrypted message is only ever decrypted with a pinned key;

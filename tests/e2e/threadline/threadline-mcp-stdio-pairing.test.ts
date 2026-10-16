@@ -70,6 +70,7 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
         ...process.env as Record<string, string>,
         THREADLINE_RELAY: relayUrl, THREADLINE_STATE_DIR: mcpState.stateDir, THREADLINE_NAME: 'desktop-agent', THREADLINE_OWNER: 'Justin',
         THREADLINE_SEND_PORT: '1', // never adopt a local listener proxy on this machine
+        THREADLINE_TERMINAL_PAIRING: '1', // the terminal fallback is off unless the person turns it on (D5)
       },
       stderr: 'pipe',
     });

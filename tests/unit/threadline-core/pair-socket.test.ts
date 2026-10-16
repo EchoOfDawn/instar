@@ -162,7 +162,7 @@ describe('terminal pairing (D5)', () => {
   it('says plainly when threadline-mcp is not running', async () => {
     const t = terminal([]);
     expect(await runPairCli(['open'], path.join(os.tmpdir(), `none-${process.pid}.sock`), t.io)).toBe(1);
-    expect(t.text()).toMatch(/not running/);
+    expect(t.text()).toMatch(/Nothing is listening for terminal pairing\. Terminal pairing is off unless THREADLINE_TERMINAL_PAIRING=1/);
   });
 
   it('a second server on the same state dir does not take the socket from a live one', async () => {

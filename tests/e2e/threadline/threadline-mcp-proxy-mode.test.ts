@@ -57,6 +57,8 @@ describe.skipIf(!hasDeps)('threadline-mcp through a listener proxy', () => {
   afterAll(async () => { await client?.close(); listener?.close(); });
 
   it('refuses to pair, refuses plaintext to a paired agent, never relays an invite; other messages still go', async () => {
+    // Terminal pairing is off unless the person turns it on: no socket in the state dir (D5).
+    expect(fs.existsSync(path.join(stateDir, 'pair.sock'))).toBe(false);
     const inv = await call('threadline_pair_invite');
     expect(inv.isError).toBe(true);
     expect(JSON.stringify(inv.body)).toMatch(/Pairing is unavailable: .*local Threadline listener/);

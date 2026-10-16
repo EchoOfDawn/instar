@@ -137,6 +137,25 @@ describe('pair tools', () => {
     expect(wire.out).toHaveLength(0);
   });
 
+  it('forget (unpair) is the person\'s decision: refused without elicitation, "keep" changes nothing, "unpair" removes the pin', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    const made = A.tools(null).invite({}) as { message: string };
+    await B.tools(person([{ invite: made.message }, { decision: 'approve' }]).elicit).open();
+    await pump(wire, [A, B]);
+    await A.tools(person([{ decision: 'finish' }]).elicit).finish({});
+    await tick(); await pump(wire, [A, B]);
+    expect(await A.tools(null).forget({ peer: B.fp })).toMatchObject({ ok: false });
+    expect(await A.tools(person([{ decision: 'keep' }]).elicit).forget({ peer: B.fp })).toMatchObject({ ok: true, result: 'kept' });
+    expect(await A.tools(person([null]).elicit).forget({ peer: B.fp })).toMatchObject({ ok: true, result: 'kept' });
+    expect(A.pairing.keys.getProfileByFingerprint(B.fp)).toBeTruthy();
+    const p = person([{ decision: 'unpair' }]);
+    expect(await A.tools(p.elicit).forget({ peer: B.fp })).toMatchObject({ ok: true, result: 'unpaired' });
+    expect(p.asked[0]).toMatch(/Unpair from the agent "b"/);
+    expect(A.pairing.keys.getProfileByFingerprint(B.fp)).toBeFalsy();
+    expect(await A.tools(person([{ decision: 'unpair' }]).elicit).forget({ peer: 'c'.repeat(32) })).toMatchObject({ ok: false });
+  });
+
   it('cancel revokes an open invite once', () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire);

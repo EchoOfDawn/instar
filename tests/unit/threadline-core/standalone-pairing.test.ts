@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
-import { generateIdentityKeyPair } from 'threadline-core';
+import { generateIdentityKeyPair, sign, canonicalizeEnvelope } from 'threadline-core';
 
 type Env = Record<string, unknown> & { from: string; to: string };
 
@@ -23,7 +23,7 @@ function agent(name: string, wire: { out: Env[] }, opts: { fetchImpl?: typeof fe
     relayHttpBase: opts.relayHttpBase ?? null,
     fetchImpl: opts.fetchImpl,
   });
-  return { name, fp, p, key: k.publicKey };
+  return { name, fp, p, key: k.publicKey, priv: k.privateKey };
 }
 
 /** The engine sends Finish on a timer (delay 0, then bounded retries): let it fire. */
@@ -165,12 +165,42 @@ describe('StandalonePairing', () => {
     expect(await B.p.receive(relayed as never)).toMatchObject({ kind: 'refused' });
   });
 
-  it('plaintext from a PAIRED peer is delivered but marked unencrypted, and never as a credential', async () => {
+  it('plaintext naming a PAIRED peer: from that peer only if signed by its pinned key; otherwise an unverified claim; never a credential', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire), M = agent('m', wire);
+    await pair(wire, A, B);
+    const pt = (text: string) => ({ from: A.fp, to: B.fp, messageId: `m-${text}`, payload: Buffer.from(JSON.stringify({ type: 'chat', text })).toString('base64') });
+    // Unsigned (how Instar before step 9 sends ordinary chat): the relay could have written it.
+    expect(await B.p.receive(pt('old instar sends this way') as never)).toEqual({ kind: 'message', text: 'old instar sends this way', type: 'chat', encrypted: false, credential: false, unverifiedPairedClaim: true });
+    // Signed by the pinned key: really from A.
+    const signedEnv = pt('signed by a');
+    const good = { ...signedEnv, signature: sign(A.priv, Buffer.from(canonicalizeEnvelope(signedEnv), 'utf-8')).toString('base64') };
+    expect(await B.p.receive(good as never)).toMatchObject({ kind: 'message', fromPairedPeer: true, encrypted: false, credential: false });
+    // Signed by someone else (a relay forging A's name): still only an unverified claim.
+    const forged = { ...signedEnv, signature: sign(M.priv, Buffer.from(canonicalizeEnvelope(signedEnv), 'utf-8')).toString('base64') };
+    expect(await B.p.receive(forged as never)).toMatchObject({ kind: 'message', unverifiedPairedClaim: true });
+    expect(await B.p.receive(forged as never)).not.toHaveProperty('fromPairedPeer');
+    // A tampered signed envelope is no longer A's.
+    expect(await B.p.receive({ ...good, payload: Buffer.from(JSON.stringify({ text: 'changed' })).toString('base64') } as never)).toMatchObject({ unverifiedPairedClaim: true });
+  });
+
+  it('once a paired peer has sent encrypted chat, plaintext in its name is refused (downgrade); pairing ops and credentials do not set that mark', async () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire), B = agent('b', wire);
-    await pair(wire, A, B);
-    const pt = { from: A.fp, to: B.fp, payload: Buffer.from(JSON.stringify({ type: 'chat', text: 'old instar sends this way' })).toString('base64') };
-    expect(await B.p.receive(pt as never)).toEqual({ kind: 'message', text: 'old instar sends this way', type: 'chat', encrypted: false, credential: false, fromPairedPeer: true });
+    await pair(wire, A, B); // finish/ack travelled encrypted
+    A.p.send(B.fp, 'a credential', { credential: true });
+    await pump(wire, [A, B]);
+    expect(B.p.encryptedChatSeen(A.fp)).toBe(false);
+    const pt = { from: A.fp, to: B.fp, payload: Buffer.from(JSON.stringify({ type: 'chat', text: 'plain' })).toString('base64') };
+    expect(await B.p.receive(pt as never)).toMatchObject({ kind: 'message', unverifiedPairedClaim: true });
+    A.p.send(B.fp, 'ordinary encrypted chat');
+    await pump(wire, [A, B]);
+    expect(B.p.encryptedChatSeen(A.fp)).toBe(true);
+    expect(await B.p.receive(pt as never)).toEqual({ kind: 'refused', reason: 'plaintext from a paired agent that has sent encrypted messages before (possible downgrade)' });
+    // persisted: a restarted B still refuses
+    const file = path.join(B.p.auditPath, '..', 'encrypted-chat-peers.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))[A.fp]).toBeTruthy();
+    expect(fs.statSync(file).mode & 0o077).toBe(0);
   });
 
   it('the audit log records pairing, credential sends and refusals, privately, with no message content', async () => {

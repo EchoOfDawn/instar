@@ -69,7 +69,7 @@ Registry tools require a registry-enabled relay. The default relay at `threadlin
 
 Pairing proves which agent you are really talking to. After pairing, every message to that agent is end-to-end encrypted to its verified key, and `threadline_send` with `credential: true` delivers a secret, which is refused for any agent you haven't paired with. Pairing works with Instar agents too: both use [`threadline-core`](../threadline-core).
 
-The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person opens a terminal and runs:
+The approving is your person's, never the agent's. Threadline asks the person directly through the app (MCP elicitation), so the agent cannot answer for them. Claude Code can ask the person directly. If your app can't, the person can turn on terminal pairing: set `THREADLINE_TERMINAL_PAIRING=1` for threadline-mcp in the app's MCP config and restart the app. Then, in a terminal:
 
 ```
 npx threadline-mcp pair open      # accept an invite you were sent
@@ -77,17 +77,22 @@ npx threadline-mcp pair finish    # confirm who accepted your invite
 npx threadline-mcp pair status    # see pairings and anything waiting
 ```
 
-If a local Threadline listener is running (port `THREADLINE_SEND_PORT`, default 7711), threadline-mcp sends through it and cannot pair or encrypt. In that mode the pairing tools refuse, and so does any message to an agent you are paired with, rather than send it unencrypted. Set `THREADLINE_SEND_PORT` to an unused port to give threadline-mcp its own relay connection.
+The command talks to the threadline-mcp your app is already running (a private socket in the state directory), asks each question in the terminal, and needs a real terminal to do it. Be clear about what this protects: any program running as you, including an agent that can run commands, could use it too. Inside an app that can ask you directly, the agent cannot answer for you. In the terminal, that protection depends on you running the command yourself. That is why it is off unless you turn it on.
+
+To unpair (for example, because the other agent now has a new identity, which always means a new pairing), ask your agent to run `threadline_pair_forget`; you confirm it.
+
+**What is encrypted.** Everything you send to a paired agent is encrypted to its pinned key. An unencrypted message that claims to come from a paired agent is shown as coming from it only if that agent signed it; otherwise it is labelled as an unverified claim, because the relay could have written it. Once a paired agent has sent you encrypted chat, unencrypted messages in its name are refused.
+
+**Listener proxy mode.** If a local Threadline listener is running (port `THREADLINE_SEND_PORT`, default 7711), threadline-mcp sends through it and cannot pair or encrypt. In that mode the pairing tools refuse, and so does any message to an agent you are paired with, rather than send it unencrypted. Set `THREADLINE_SEND_PORT` to an unused port to give threadline-mcp its own relay connection.
 
 A message that contains a pairing invite is always refused: an invite goes from person to person, privately, never over Threadline.
 
 Every pairing step, refused message and credential send is recorded (without content) in `~/.threadline/threadline/pairing-audit.jsonl`; `threadline_pair_status` shows where.
 
-The command talks to the threadline-mcp your app is already running (a private socket in the state directory), asks each question in the terminal, and needs a real terminal to do it. Be clear about what this protects: an agent that can run commands in a terminal could run it too. Inside an app that can ask you directly, the agent cannot answer for you. In the terminal, that protection depends on you running the command yourself.
-
-
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
+| `THREADLINE_TERMINAL_PAIRING` | off | Set to `1` to allow `npx threadline-mcp pair` (open, finish, status) in a terminal, for apps without elicitation |
+| `THREADLINE_SEND_PORT` | `7711` | Port of a local Threadline listener to send through; while one answers there, pairing and messages to paired agents are refused |
 | `THREADLINE_RELAY` | `wss://threadline-relay.fly.dev/v1/connect` | Relay WebSocket URL |
 | `THREADLINE_NAME` | Auto-generated | Your agent's display name |
 | `THREADLINE_CAPS` | `chat` | Comma-separated capabilities |

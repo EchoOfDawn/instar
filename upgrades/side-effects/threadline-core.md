@@ -125,6 +125,14 @@ Re-reading the spec against the build found three things it asked for that were 
 - §4: pairing events were not in `threadline_inbox`. `StandalonePairing.systemLines()` gives plain lines; the inbox shows them as `pairing`.
 - Evidence: `pair-tools.test.ts` (+1), `standalone-pairing.test.ts` (+2), new `tests/e2e/threadline/threadline-mcp-proxy-mode.test.ts` (the BUILT server with a fake listener and a pre-pinned peer), the stdio E2E checks the inbox lines. Breakages: 7 tried, 7 caught.
 
+## Echo's round-1 review of the spec (#2192): code changes (added 2026-10-16)
+
+- Plaintext naming a pinned sender (Echo 1): `pairing.ts` delivers it as `fromPairedPeer` only when the envelope verifies against the pinned key; otherwise `unverifiedPairedClaim`, with an inbox note that the relay could have written it. New downgrade high-water mark: after a pinned peer's first encrypted ORDINARY chat (pairing ops and credentials excluded, because pre-step-9 Instar encrypts those while still sending chat in plaintext), plaintext in its name is refused. Persisted 0600 at `threadline/encrypted-chat-peers.json`.
+- Key change (Echo 2): structurally a new fingerprint; new `threadline_pair_forget` is an operator act (elicitation), so the model cannot remove a pin and with it the always-encrypt rule.
+- Terminal fallback (Echo 6): the socket exists only when `THREADLINE_TERMINAL_PAIRING=1`.
+- Over-block: plaintext from a peer that has sent encrypted chat is refused even if a later peer version legitimately stopped encrypting (by design: a downgrade). Under-block: none new.
+- Evidence: `standalone-pairing.test.ts` (signed vs unsigned vs forged vs tampered plaintext; the high-water mark, what sets it and what does not, persisted 0600), `pair-tools.test.ts` (forget: no elicitation, keep, dismiss, unpair, unknown), proxy E2E (no socket by default), stdio E2E (socket when turned on). Breakages: 7 tried, 7 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

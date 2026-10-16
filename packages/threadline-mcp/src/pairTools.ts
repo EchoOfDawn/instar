@@ -23,7 +23,7 @@ export interface PairToolsDeps {
 
 export type ToolResult = { ok: true; [k: string]: unknown } | { ok: false; error: string };
 
-const NO_ELICIT = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Either use an app that supports it, such as Claude Code, or open a terminal and run: npx threadline-mcp pair open (to accept an invite you were sent) or npx threadline-mcp pair finish (to confirm who accepted yours). That command asks you, not me. It is an honest boundary rather than a hard one: an agent that can run commands in a terminal could run it too, so do not let one do it for you.';
+const NO_ELICIT = 'Your app cannot ask you questions directly (it does not support MCP elicitation), and approving a pairing must come from you, not from me. Either use an app that supports it, such as Claude Code, or turn on terminal pairing (set THREADLINE_TERMINAL_PAIRING=1 for threadline-mcp in your app config and restart it), then open a terminal and run: npx threadline-mcp pair open (to accept an invite you were sent) or npx threadline-mcp pair finish (to confirm who accepted yours). That command asks you, not me. It is an honest boundary rather than a hard one: an agent that can run commands in a terminal could run it too, so do not let one do it for you.';
 
 export class PairTools {
   constructor(private readonly deps: PairToolsDeps) {}
@@ -112,6 +112,26 @@ export class PairTools {
       recent: p.recentEvents().slice(0, 10),
       auditLog: p.auditPath,
     };
+  }
+
+  /**
+   * threadline_pair_forget: unpair. An operator act, because forgetting a pin removes the always-
+   * encrypt rule and the credential right for that agent. A rotated key is a different fingerprint
+   * (the fingerprint is the key's first 16 bytes), so a pin can never move to a new key: the old
+   * pin is forgotten here and the agent is paired again from scratch.
+   */
+  async forget(args: { peer: string }): Promise<ToolResult> {
+    if (!this.deps.elicit) return { ok: false, error: NO_ELICIT };
+    const fp = this.deps.resolvePeer(String(args.peer || ''));
+    const pin = fp ? this.deps.pairing.keys.getProfileByFingerprint(fp) : null;
+    if (!fp || !pin) return { ok: false, error: `You are not paired with "${args.peer}".` };
+    const answer = await this.deps.elicit(
+      `Unpair from the agent "${pin.agent}" (${fp})? Messages to it will no longer be guaranteed encrypted, and it can no longer receive credentials. To pair again you will need a new invite.`,
+      { decision: { type: 'string', title: 'Your decision', enum: ['unpair', 'keep'] } },
+    );
+    if (answer?.decision !== 'unpair') return { ok: true, result: 'kept', note: 'Nothing changed.' };
+    this.deps.pairing.keys.forget(fp);
+    return { ok: true, result: 'unpaired', peer: fp };
   }
 
   /** threadline_pair_cancel: revoke an open invite. */

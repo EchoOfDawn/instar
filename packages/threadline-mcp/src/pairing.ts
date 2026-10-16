@@ -20,7 +20,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   EnvelopeCrypto, PairingInviteFlow, PairingInviteStore, PinnedKeyStore, INVITE_OPS, OP_ACCEPT,
-  credentialAcceptFrom, credentialSendKey, edPublicToX25519, findInviteToken,
+  canonicalizeEnvelope, credentialAcceptFrom, credentialSendKey, edPublicToX25519, findInviteToken, verify,
   type InviteEvent, type MessageEnvelope, type PlaintextMessage,
 } from 'threadline-core';
 
@@ -50,7 +50,7 @@ export interface StandaloneDeps {
 /** What an incoming envelope turned out to be. */
 export type Inbound =
   | { kind: 'control' }                                   // a pairing op, handled here, never shown to the model
-  | { kind: 'message'; text: string; type?: string; encrypted: boolean; credential: boolean; fromPairedPeer?: boolean }
+  | { kind: 'message'; text: string; type?: string; encrypted: boolean; credential: boolean; fromPairedPeer?: boolean; unverifiedPairedClaim?: boolean }
   | { kind: 'refused'; reason: string };                  // e.g. an encrypted message from an unpinned sender
 
 export interface StandaloneEvent { at: string; event: InviteEvent }
@@ -102,6 +102,27 @@ export class StandalonePairing {
       ownName: deps.ownName,
       now: this.now,
     });
+  }
+
+  /** Peers that have sent us encrypted ordinary chat (the downgrade high-water mark), persisted 0600. */
+  private encryptedPeersFile(): string { return path.join(this.deps.stateDir, 'threadline', 'encrypted-chat-peers.json'); }
+
+  private readEncryptedPeers(): Record<string, string> {
+    try { const v = JSON.parse(fs.readFileSync(this.encryptedPeersFile(), 'utf8')); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
+  }
+
+  encryptedChatSeen(fp: string): boolean { return Boolean(this.readEncryptedPeers()[fp.toLowerCase()]); }
+
+  private markEncryptedChat(fp: string): void {
+    const all = this.readEncryptedPeers();
+    if (all[fp]) return;
+    all[fp] = this.now().toISOString();
+    const file = this.encryptedPeersFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    this.audit({ kind: 'encrypted-chat-first-seen', from: fp });
   }
 
   /** Best effort: the audit must never break messaging. */
@@ -204,6 +225,9 @@ export class StandalonePairing {
       }
       const credential = (msg.metadata as { credential?: unknown } | undefined)?.credential === true;
       if (credential && !credentialAcceptFrom(this.keys, from)) return { kind: 'refused', reason: 'credential from a peer that is not mutual-verified' };
+      // The downgrade high-water mark: ordinary chat only. Pairing ops and credentials are always
+      // encrypted, even from peers that still send ordinary chat in plaintext.
+      if (!credential) this.markEncryptedChat(from);
       return { kind: 'message', text: String(msg.content ?? ''), type: msg.type, encrypted: true, credential };
     }
     // Plaintext.
@@ -221,12 +245,20 @@ export class StandalonePairing {
       }
       return { kind: 'control' };
     }
-    // Plaintext from a PAIRED agent is delivered but marked unencrypted (Instar 1.3.1352 still
-    // encrypts ordinary chat only when the relay gave it our X25519 key; spec step 9 makes Instar
-    // encrypt to pinned peers). It can never count as a credential, and we never reply in plaintext.
     if (findInviteToken(text)) return { kind: 'refused', reason: 'a pairing invite arrived as a message; invites are pasted by a person, not relayed' };
+    // Plaintext naming a PINNED sender (spec D6). On the relay path the sender is only the relay's
+    // word, so it counts as from that peer only when the envelope is signed by the pinned key.
+    // Once a peer has sent us encrypted chat, plaintext claiming to be from it is a downgrade and is
+    // refused. Otherwise it is delivered marked as an unverified claim (Instar before step 9 sends
+    // ordinary chat in plaintext). It never counts as a credential, and we never reply in plaintext.
     const pin = this.keys.getProfileByFingerprint(from);
-    return { kind: 'message', text, type, encrypted: false, credential: false, fromPairedPeer: pin?.pairingState === 'mutual-verified' };
+    if (!pin?.peerIdentityPub) return { kind: 'message', text, type, encrypted: false, credential: false };
+    if (this.encryptedChatSeen(from)) return { kind: 'refused', reason: 'plaintext from a paired agent that has sent encrypted messages before (possible downgrade)' };
+    const signed = typeof env.signature === 'string'
+      && verify(Buffer.from(pin.peerIdentityPub, 'hex'), Buffer.from(canonicalizeEnvelope(env as Record<string, unknown>), 'utf-8'), Buffer.from(env.signature, 'base64'));
+    return signed
+      ? { kind: 'message', text, type, encrypted: false, credential: false, fromPairedPeer: true }
+      : { kind: 'message', text, type, encrypted: false, credential: false, unverifiedPairedClaim: true };
   }
 
   /** The newest pairing events as plain lines, for the inbox. */
