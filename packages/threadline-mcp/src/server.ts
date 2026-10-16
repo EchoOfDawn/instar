@@ -863,6 +863,7 @@ class RelayConnection {
       if (!r.sent) throw new Error(r.reason === 'peer-not-mutually-verified'
         ? 'Refused: credentials only go to an agent you have paired with (threadline_pair_invite / threadline_pair_open).'
         : r.reason === INVITE_IN_MESSAGE ? INVITE_REFUSAL
+        : r.reason === 'finish-not-received' ? 'Refused: you accepted this agent\'s invite, but its person never finished the pairing, so messages to it are neither safely encrypted nor sent in the clear. Unpair (threadline_pair_forget) and ask for a new invite.'
         : r.reason === 'not-pairing-owner' ? `Refused: credentials are sent only by the threadline-mcp that owns pairing here (${process.env.THREADLINE_STATE_DIR || 'the default state directory'}).`
         : `Refused: ${r.reason}`);
       const kept = opts.credential ? `[credential, ${Buffer.byteLength(text, 'utf-8')} bytes]` : text;

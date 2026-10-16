@@ -184,6 +184,10 @@ Re-reading the spec against the build found three things it asked for that were 
 - core `cleanLabel`: NFKC-normalised, and C0/C1 controls, bidi overrides and isolates, and zero-width characters removed, so another agent's claimed name cannot reorder or hide text in an approval question or an inbox line. Display only (labels are not in the signed transcript), so the wire format is unchanged. threadline-mcp's look-alike check compares NFKC case-folded names (a full-width "ｃａｒｌ" is flagged).
 - Evidence: `PairingInvite.test.ts` (+1), `pair-tools.test.ts` (full-width look-alike). Breakages: 4 tried, 4 caught.
 
+## Spec-converge round 1: the waiting-for-Finish window ends (SEC-6, ADV-7)
+
+- An acceptor that is still waiting for the inviter's Finish sends as before pairing (plaintext), but only until the pin is older than the longest invite lifetime plus 10 minutes (`FINISH_WAIT_MS`). After that, sends to the peer are refused (`finish-not-received`, with a reason telling the person to unpair and ask for a new invite), and `threadline_pair_status.finishNotReceived` lists it. A paused pin is unaffected (it stays encrypted). Evidence: `standalone-pairing.test.ts` (+1). Breakage: 1 tried, 1 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

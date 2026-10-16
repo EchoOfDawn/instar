@@ -337,6 +337,22 @@ describe('StandalonePairing', () => {
     expect(fs.readFileSync(file, 'utf8')).toBe('{ broken');
   });
 
+  it('the waiting-for-Finish window ends: past the longest invite lifetime plus 10 minutes, sends are refused and status says why (SEC-6/ADV-7)', async () => {
+    const wire = { out: [] as Env[] };
+    let skew = 0;
+    const now = () => new Date(Date.now() + skew);
+    const A = agent('a', wire), B = agent('b', wire, { now });
+    const inv = A.p.flow.createInvite() as { ok: true; iid: string; message: string };
+    const r = await B.p.flow.receiveInvite(inv.message) as { iid: string };
+    B.p.flow.approveAccept(r.iid);
+    await pump(wire, [A, B]); // A's person never finishes
+    expect(B.p.send(A.fp, 'still waiting')).toMatchObject({ sent: true, encrypted: false });
+    skew = 24 * 60 * 60_000 + 11 * 60_000;
+    expect(B.p.send(A.fp, 'a day later')).toEqual({ sent: false, reason: 'finish-not-received' });
+    const st = new PairTools({ pairing: B.p, elicit: null, resolvePeer: () => null }).status() as { finishNotReceived: Array<{ fingerprint: string }> };
+    expect(st.finishNotReceived).toEqual([expect.objectContaining({ fingerprint: A.fp })]);
+  });
+
   it('relay-card key check: a matching key is returned, a mismatch or failure is null', async () => {
     const wire = { out: [] as Env[] };
     const target = generateIdentityKeyPair();

@@ -129,6 +129,7 @@ export class PairTools {
       ok: true,
       paired,
       ...(lookalikes.length ? { lookalikes } : {}),
+      ...(() => { const stuck = p.keys.list().filter((k) => p.finishOverdue(k as never)); return stuck.length ? { finishNotReceived: stuck.map((k) => ({ agent: k.agent, fingerprint: k.fingerprint, note: 'You accepted this invite but the other person never finished. Messages to it are refused; unpair and ask for a new invite.' })) } : {}; })(),
       ...(p.storeProblems.length ? { attention: p.storeProblems.map((x) => ({ at: x.at, problem: x.message, note: 'A pairing file could not be read and was set aside (not deleted). Pairings in it are not in use until it is repaired.' })) } : {}),
       openInvites: p.invites.list().filter((i) => i.state === 'open').map((i) => ({ iid: i.iid, exp: i.exp, boundTo: i.bind })),
       waitingToFinish: p.waitingToFinish().map((i) => ({ iid: i.iid, claimedAgent: i.acceptor?.agent, claimedOwner: i.acceptor?.owner })),

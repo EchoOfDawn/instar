@@ -124,6 +124,14 @@ export class StandalonePairing {
     return this.deps.ownsPairing === false ? new PinnedKeyStore(this.deps.stateDir, this.now, () => {}) : this.keys;
   }
 
+  /** An accepted pairing whose Finish never came: older than the longest invite lifetime plus 10 minutes. */
+  finishOverdue(pin: { pairingState?: string; via?: string }): boolean {
+    if (pin.pairingState !== 'invite-accepted' || String(pin.via ?? '').startsWith('paused:')) return false;
+    const since = Date.parse(String((pin as { updatedAt?: string }).updatedAt ?? ''));
+    return !Number.isNaN(since) && this.now().getTime() - since > StandalonePairing.FINISH_WAIT_MS;
+  }
+  static readonly FINISH_WAIT_MS = 24 * 60 * 60_000 + 10 * 60_000;
+
   private seenFile(): string { return path.join(this.deps.stateDir, 'threadline', 'seen-messages.jsonl'); }
 
   /** Load the replay ledger (last SEEN_MAX ids). */
@@ -255,6 +263,9 @@ export class StandalonePairing {
     // sender. Until the Finish arrives we send as before pairing. A pin PAUSED after a leaked
     // invite was verified on both sides, so the peer can still read it: that stays encrypted.
     const awaitingFinish = pin?.pairingState === 'invite-accepted' && !String(pin.via ?? '').startsWith('paused:');
+    // That window has an end (Echo review SEC-6/ADV-7): past the longest an invite can live plus a
+    // margin, the Finish is not coming. Refuse rather than keep sending plaintext indefinitely.
+    if (awaitingFinish && this.finishOverdue(pin)) return { sent: false, reason: 'finish-not-received' };
     if (pin?.peerIdentityPub && !awaitingFinish) {
       return { sent: true, encrypted: true, threadId: this.sendEncrypted(fp, Buffer.from(pin.peerIdentityPub, 'hex'), { content: text, type: 'chat' }, opts.threadId) };
     }
