@@ -171,6 +171,10 @@ Re-reading the spec against the build found three things it asked for that were 
 - The owner alone pairs (tools and terminal socket), sends credentials, applies pairing messages and writes the encryptedSeen mark. Other instances refuse those with a reason that names the owner's pid, still exchange ordinary messages, and re-read pins from disk for every send and receive, so a pairing the owner just made is honoured at once (never downgraded).
 - Evidence: `state-lock.test.ts` (lock semantics; a non-owner refuses credentials, sees the owner's new pin, does not write the mark), E2E with two real servers on one state directory. Breakages: 6 tried, 6 caught.
 
+## Spec-converge round 1: waitForReply keeps the trust labels (ADV-4)
+
+- `threadline_send` with `waitForReply` returned the reply text and sender only, so a relay-injected plaintext reply under a paired agent's fingerprint read as that agent's reply. It now carries the same labels and notes as the inbox (`encrypted`, `credential`, the unverified-claim note). Evidence: the stdio E2E has a pre-D9 Instar answer in plaintext on the waited thread; the reply comes back labelled as an unverified claim. Breakage: 1 tried, 1 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

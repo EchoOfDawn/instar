@@ -127,6 +127,17 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
 
     const sent = await call('threadline_send', { to: instarFp, message: 'the vault password', credential: true });
     expect(sent.isError).toBe(false);
+    // A reply that resolves waitForReply carries the same trust labels as the inbox (Echo review ADV-4):
+    // a pre-D9 Instar answers in plaintext, so it must come back as an unverified claim, not as the peer.
+    const mcpFp = String((await call('threadline_status')).body.agentId ?? '').toLowerCase();
+    expect(mcpFp).toMatch(/^[0-9a-f]{32}$/);
+    const waiting = call('threadline_send', { to: instarFp, message: 'ping?', threadId: 'thread-wfr-0001', waitForReply: true, timeoutSeconds: 15 });
+    await new Promise((r) => setTimeout(r, 1500));
+    boot.relayClient!.sendPlaintext(mcpFp, 'pong from instar', 'thread-wfr-0001');
+    const answered = await waiting;
+    expect(answered.body.reply).toBe('pong from instar');
+    expect(answered.body.note).toMatch(/neither encrypted nor signed/);
+
     // History keeps only that a credential was sent, never its body (Echo review SEC-11).
     const histDir = path.join(mcpState.stateDir, 'history');
     const hist = fs.readdirSync(histDir).map((f) => fs.statSync(path.join(histDir, f)).isFile() ? fs.readFileSync(path.join(histDir, f), 'utf8') : '').join('\n');
