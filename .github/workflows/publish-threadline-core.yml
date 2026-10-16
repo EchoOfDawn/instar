@@ -18,41 +18,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish threadline-core
+  # Build and every test, with NO secrets: dependency install scripts never run beside a token
+  # (Echo's review of #2192, SEC-2).
+  test:
+    name: Test threadline-core
     runs-on: ubuntu-latest
-    # Publishes only from main: a manual run on any other branch is a no-op (spec D10).
     if: "github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')"
     permissions:
-      contents: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build and test the package
+        working-directory: packages/threadline-core
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm test
+
+      # The protocol (invite, store, flow, pinned keys, the credential gate, the standalone module) is
+      # tested in this repo's suite, including byte-compatibility with Instar.
+      - name: Protocol suite
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npx vitest run tests/unit/threadline-core tests/unit/threadline/threadline-core-compat.test.ts
+
+  # Publishes only from main, only after the tests pass. The npm token is visible to the publish
+  # step alone; the release token only to the push of the version bump.
+  publish:
+    name: Publish threadline-core
+    needs: test
+    runs-on: ubuntu-latest
+    if: "github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')"
+    permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
-          # RELEASE_TOKEN is a PAT that can bypass branch protection for version bump commits.
-          token: ${{ secrets.RELEASE_TOKEN }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Install dependencies
+      - name: Install and build
         working-directory: packages/threadline-core
-        # From the committed lockfile: a job that holds publish rights installs exactly what was reviewed.
-        run: npm ci --no-audit --no-fund
-
-      - name: Build and test
-        working-directory: packages/threadline-core
-        run: npm test
-
-      # The package's own tests cover crypto and envelopes. The protocol (invite, store, flow,
-      # pinned keys, the credential gate, the standalone module) is tested in this repo's suite,
-      # including byte-compatibility with Instar; all of it must pass before a publish.
-      - name: Protocol suite
         run: |
           npm ci --no-audit --no-fund --ignore-scripts
-          npx vitest run tests/unit/threadline-core tests/unit/threadline/threadline-core-compat.test.ts
+          npm run build
 
       - name: Check if version changed
         id: check
@@ -74,7 +94,7 @@ jobs:
 
       - name: Publish to npm
         working-directory: packages/threadline-core
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -82,9 +102,10 @@ jobs:
         if: steps.check.outputs.bumped == 'true'
         env:
           HUSKY: '0'
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add packages/threadline-core/package.json
           git commit -m "chore: release threadline-core v${{ steps.check.outputs.version }} [skip ci]"
-          git push origin main
+          git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main

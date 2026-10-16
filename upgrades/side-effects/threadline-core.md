@@ -192,6 +192,11 @@ Re-reading the spec against the build found three things it asked for that were 
 
 - Every pairing question lists the safe choice first (decline / not them / keep), and a test asserts no question or label matches Instar's permission-prompt auto-resolver (`Do you want to proceed?`, `^(yes|proceed|allow|continue)`). The terminal menu numbering changes accordingly ("2) approve").
 
+## Spec-converge round 1: publish workflow split (SEC-2, part of SEC-1)
+
+- `publish-threadline-core.yml` now has two jobs. `test` holds no secrets (`contents: read`, `persist-credentials: false`, install scripts disabled) and runs the package tests plus the protocol suite. `publish` runs only after `test` passes, on main; checkout does not persist credentials; dependencies install with `--ignore-scripts`; `NPM_TOKEN` is visible only to the publish step and `RELEASE_TOKEN` only to the push of the version bump. The concurrency group (already present) stops two runs racing to bump one version.
+- Not done here, needs repo settings / npm: a protected GitHub Environment `npm-publish` limited to main holding both secrets, and npm trusted publishing (OIDC) so no long-lived npm token exists (SEC-1). Validated by parsing the YAML (jobs, needs, permissions, step order).
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
