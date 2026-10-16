@@ -62,6 +62,8 @@ test('round trip core → core, and the envelope is addressed by fingerprint', (
   // a third party cannot read it
   const c = generateIdentityKeyPair();
   assert.throws(() => new EnvelopeCrypto(c.privateKey, c.publicKey).decrypt(env, a.publicKey, edPublicToX25519(a.publicKey)));
+  // decrypt refuses a static key that does not belong to the signing identity
+  assert.throws(() => B.decrypt(env, a.publicKey, edPublicToX25519(c.publicKey)), /not bound to the sender identity/);
 });
 
 test('sign/verify, and verify never throws on garbage', () => {

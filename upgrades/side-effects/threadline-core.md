@@ -71,6 +71,11 @@ Delete the package directory and the compat test. Nothing depends on it.
 - Decision points added: `credentialSendKey`, `credentialAcceptFrom`, and `PinnedKeyStore`'s transitions.
 - Evidence: Instar's own protocol suites (`PairingInvite`, `PairingInviteStore`, `PairingInviteFlow`) copied into `tests/unit/threadline-core/`, pointed at the package with `PinnedKeyStore` as the trust store: 44 pass unchanged. New `trust.test.ts` (9). Total 53. Breakages: 10 of 10 caught, two of them in the ported engine (the one-alarm-per-invite guard, the MAC tag check), proving the suites exercise the core copy. One survived at first: removing the state check from `credentialSendKey` passed, because no test sent to a PAUSED peer, and a demoted pin keeps its pairing id. So a credential could have gone to a peer whose invite leaked. The test was added and the check is now caught.
 
+## Cross-model review fix (added 2026-10-16)
+
+- `envelope.ts` `decrypt` now refuses a static X25519 key that is not derived from the signing identity (found by an independent GPT 5.4 / Gemini 3.1 Pro review; every caller was already correct, but the API invited misuse). Wire format unchanged; the Instar vectors still pass.
+- Evidence: core test `round trip core → core` asserts decrypt throws on an unbound key. Breakage check: removing the guard fails that test.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
