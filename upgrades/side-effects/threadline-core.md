@@ -152,6 +152,11 @@ Re-reading the spec against the build found three things it asked for that were 
 
 - Echo's follow-up notes (thread 1a01ebaa): every refused Finish in the tests now asserts the recipient's stored files are byte-for-byte unchanged; in threadline-mcp a store file set aside as unparseable is an attention item (`threadline_pair_status.attention`, a `Pairing ATTENTION` inbox line, and a `store-problem` audit row), not only a log line. Breakages: 2 tried, 2 caught.
 
+## Packed-package smoke in the threadline-mcp publish workflow (added 2026-10-16)
+
+- Merged #2197's branch (0.4.5 fix + built-server smoke) into this branch, keeping 0.5.0.
+- `publish-threadline-mcp.yml` gains "Smoke test the packed package as a consumer": `npm pack`, install the tarball into an empty project the way a user would, then run the installed bin (must load and reach the network) and `pair status` (must answer). Closes Echo's item (4): the built package and its exports were never tested, so a 0.4.4-style break could ship green. Verified locally with the packed threadline-core tarball standing in for npm: both checks pass.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

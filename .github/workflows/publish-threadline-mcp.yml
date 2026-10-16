@@ -52,6 +52,24 @@ jobs:
           if ! echo "$OUT" | grep -q "Initial relay connection failed: Error: connect ECONNREFUSED"; then echo "::error::the built server never reached the network"; exit 1; fi
           echo "smoke ok"
 
+      # The PACKED package, installed the way a user installs it, must load too: this catches a
+      # missing file in "files", a dependency that is not on npm yet, or an exports mistake that
+      # the in-repo build cannot see (Echo's review of #2196).
+      - name: Smoke test the packed package as a consumer
+        working-directory: packages/threadline-mcp
+        run: |
+          TGZ=$(npm pack --silent | tail -1)
+          C=$(mktemp -d); SD=$(mktemp -d)
+          (cd "$C" && npm init -y >/dev/null && npm install --no-audit --no-fund "$GITHUB_WORKSPACE/packages/threadline-mcp/$TGZ")
+          BIN="$C/node_modules/threadline-mcp/dist/server.js"
+          OUT=$(THREADLINE_RELAY=ws://127.0.0.1:9/v1/connect THREADLINE_STATE_DIR="$SD" THREADLINE_SEND_PORT=1 timeout 8 node "$BIN" </dev/null 2>&1; echo "exit=$?")
+          echo "$OUT" | tail -5
+          if echo "$OUT" | grep -qE "ReferenceError|SyntaxError|ERR_MODULE_NOT_FOUND|Cannot find module|ERR_REQUIRE|require is not defined|Fatal:"; then echo "::error::the installed package did not load"; exit 1; fi
+          echo "$OUT" | grep -q "Initial relay connection failed: Error: connect ECONNREFUSED" || { echo "::error::the installed package never reached the network"; exit 1; }
+          PAIR=$(THREADLINE_STATE_DIR="$SD" node "$BIN" pair status 2>&1 || true)
+          echo "$PAIR" | grep -q "Nothing is listening for terminal pairing" || { echo "::error::the installed pair command did not answer"; echo "$PAIR"; exit 1; }
+          echo "packed smoke ok"
+
       - name: Check if version changed
         id: check
         working-directory: packages/threadline-mcp
