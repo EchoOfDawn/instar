@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readStoreJson, defaultReporter, type StoreProblemReporter } from './storeFile.js';
-import { derivePairingId, edPublicToX25519 } from './crypto.js';
+import { derivePairingId, edPublicToX25519, isAcceptableIdentityKey } from './crypto.js';
 
 export type PairingState = 'invite-accepted' | 'mutual-verified' | 'identity-verified' | 'pending-verification' | 'verification-failed';
 
@@ -28,6 +28,8 @@ export interface PeerProfile {
   verifiedAt?: string;
   /** How the pin was set; `paused: <reason>` after a leaked invite was used twice. */
   via?: string;
+  /** When this peer first sent us ENCRYPTED ordinary chat (spec D6). From then on, plaintext under its fingerprint is refused. */
+  encryptedSeenAt?: string;
 }
 
 /** What the pairing engine needs from a trust store. Instar's AgentTrustManager fits this shape. */
@@ -49,6 +51,7 @@ interface StoredPeer {
   verifiedAt?: string;
   updatedAt: string;
   via?: string;
+  encryptedSeenAt?: string;
 }
 
 export const PINNED_KEYS_FILE = 'pinned-keys.json';
@@ -87,7 +90,9 @@ export class PinnedKeyStore implements InviteTrust {
   }
 
   private valid(fp: string, key: string, ownFp?: string): boolean {
-    return FP.test(fp) && KEY.test(key) && key.slice(0, 32) === fp && !(ownFp && fp === ownFp.toLowerCase());
+    // The full key is stored and compared; small-order or non-canonical keys are never pinned (D8).
+    return FP.test(fp) && KEY.test(key) && key.slice(0, 32) === fp && !(ownFp && fp === ownFp.toLowerCase())
+      && isAcceptableIdentityKey(Buffer.from(key, 'hex'));
   }
 
   recordInviteAccepted(peerFp: string, args: { peerIdentityPub: string; displayName?: string; ownFp?: string }): boolean {
@@ -97,7 +102,10 @@ export class PinnedKeyStore implements InviteTrust {
     const cur = this.peers.get(fp);
     if (cur && cur.peerIdentityPub === key && (cur.pairingState === 'mutual-verified' || cur.pairingState === 'identity-verified')) return true;
     if (cur && cur.peerIdentityPub !== key && cur.pairingState === 'mutual-verified') return false; // never swap a verified pin
-    this.peers.set(fp, { agent: args.displayName || cur?.agent || fp.slice(0, 8), fingerprint: fp, peerIdentityPub: key, pairingState: 'invite-accepted', updatedAt: this.now().toISOString() });
+    this.peers.set(fp, {
+      agent: args.displayName || cur?.agent || fp.slice(0, 8), fingerprint: fp, peerIdentityPub: key, pairingState: 'invite-accepted', updatedAt: this.now().toISOString(),
+      ...(cur?.peerIdentityPub === key && cur.encryptedSeenAt ? { encryptedSeenAt: cur.encryptedSeenAt } : {}),
+    });
     this.save();
     return true;
   }
@@ -113,6 +121,7 @@ export class PinnedKeyStore implements InviteTrust {
       agent: args.displayName || cur?.agent || fp.slice(0, 8), fingerprint: fp, peerIdentityPub: key, pairingState: 'mutual-verified',
       pairingId: args.ownIdentityPub ? derivePairingId(Buffer.from(args.ownIdentityPub, 'hex'), Buffer.from(key, 'hex')) : undefined,
       verifiedAt: now, updatedAt: now, via: args.via,
+      ...(cur?.peerIdentityPub === key && cur.encryptedSeenAt ? { encryptedSeenAt: cur.encryptedSeenAt } : {}),
     });
     this.save();
     return true;
@@ -137,7 +146,21 @@ export class PinnedKeyStore implements InviteTrust {
     return !!p && p.pairingState === 'mutual-verified' && !!p.pairingId;
   }
 
-  /** Forget a peer entirely (the person chose to unpair). */
+  /**
+   * Record that a pinned peer sent us encrypted ordinary chat (spec D6). Set once, keeping the
+   * earliest time; it lives in the pin record, so it is removed only when the pin is forgotten.
+   */
+  markEncryptedSeen(peerFp: string): boolean {
+    const fp = String(peerFp || '').toLowerCase();
+    const cur = this.peers.get(fp);
+    if (!cur) return false;
+    if (cur.encryptedSeenAt) return true;
+    this.peers.set(fp, { ...cur, encryptedSeenAt: this.now().toISOString() });
+    this.save();
+    return true;
+  }
+
+  /** Forget a peer entirely (the person chose to unpair). Its encryptedSeen mark goes with it. */
   forget(peerFp: string): boolean {
     const ok = this.peers.delete(String(peerFp || '').toLowerCase());
     if (ok) this.save();

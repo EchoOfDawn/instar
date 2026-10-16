@@ -126,6 +126,46 @@ export function edPublicToX25519(edPublicKey: Buffer): Buffer {
   return out;
 }
 
+/** The eight small-order points, canonically encoded (they would let an attacker force a known shared secret). */
+const SMALL_ORDER_ENCODINGS = new Set([
+  '0100000000000000000000000000000000000000000000000000000000000000',
+  'ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f',
+  '0000000000000000000000000000000000000000000000000000000000000000',
+  '0000000000000000000000000000000000000000000000000000000000000080',
+  'c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a',
+  'c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa',
+  '26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05',
+  '26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85',
+]);
+const ED_D = (P25519 - ((121665n * modPow(121666n, P25519 - 2n, P25519)) % P25519)) % P25519;
+
+/**
+ * May this Ed25519 public key be pinned? (Spec D8, Echo's review SEC-16.) It must be 32 bytes, a
+ * canonical encoding (y < p, and not x = 0 with the sign bit set), a point on the curve, and not
+ * one of the small-order points. Never throws.
+ */
+export function isAcceptableIdentityKey(edPublicKey: Buffer): boolean {
+  try {
+    if (!Buffer.isBuffer(edPublicKey) || edPublicKey.length !== 32) return false;
+    if (SMALL_ORDER_ENCODINGS.has(edPublicKey.toString('hex'))) return false;
+    const sign = edPublicKey[31] >> 7;
+    const le = Buffer.from(edPublicKey);
+    le[31] &= 0x7f;
+    let y = 0n;
+    for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(le[i]);
+    if (y >= P25519) return false;
+    // x^2 = (y^2 - 1) / (d*y^2 + 1); the key is on the curve iff that has a square root.
+    const y2 = (y * y) % P25519;
+    const u = (y2 - 1n + P25519) % P25519;
+    const v = (ED_D * y2 + 1n) % P25519;
+    const x2 = (u * modPow(v, P25519 - 2n, P25519)) % P25519;
+    if (x2 === 0n) return sign === 0;
+    return modPow(x2, (P25519 - 1n) / 2n, P25519) === 1n; // Euler's criterion
+  } catch {
+    return false;
+  }
+}
+
 /** True iff `x25519PublicKey` is exactly the key derived from `edPublicKey`. Never throws. */
 export function isX25519BoundToIdentity(edPublicKey: Buffer, x25519PublicKey: Buffer): boolean {
   try {
