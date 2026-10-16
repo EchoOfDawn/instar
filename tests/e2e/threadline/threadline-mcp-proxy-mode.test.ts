@@ -13,7 +13,7 @@ import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { PinnedKeyStore, generateIdentityKeyPair } from '@sagemindai/threadline-core';
+import { PinnedKeyStore, createInvite, encodeInvite, generateIdentityKeyPair } from '@sagemindai/threadline-core';
 
 const pkg = path.resolve(__dirname, '../../../packages/threadline-mcp');
 const hasDeps = fs.existsSync(path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk')) && fs.existsSync(path.join(pkg, 'node_modules', '@sagemindai', 'threadline-core'));
@@ -79,11 +79,14 @@ describe.skipIf(!hasDeps)('threadline-mcp through a listener proxy', () => {
     expect(toPaired.isError).toBe(true);
     expect(String(toPaired.body)).toMatch(/paired with this agent, so messages to it must be encrypted/);
 
-    const leak = await call('threadline_send', { to: stranger, message: 'pair with me: tlinv1:abc.def' });
+    const realInvite = encodeInvite(createInvite({ identityPubHex: generateIdentityKeyPair().publicKey.toString('hex'), owner: 'x', agent: 'y' }));
+    const leak = await call('threadline_send', { to: stranger, message: `pair with me: ${realInvite}` });
     expect(leak.isError).toBe(true);
     expect(String(leak.body)).toMatch(/contains a pairing invite/);
+    // Only a checksum-valid invite is refused; text that merely looks like one is sent (spec r3 D4).
+    expect((await call('threadline_send', { to: stranger, message: 'the format is tlinv1:abc.def' })).isError).toBe(false);
 
     expect((await call('threadline_send', { to: stranger, message: 'an ordinary hello' })).isError).toBe(false);
-    await vi.waitFor(() => expect(relayed.map((r) => r.text)).toEqual(['an ordinary hello']), { timeout: 5000 });
+    await vi.waitFor(() => expect(relayed.map((r) => r.text)).toEqual(['the format is tlinv1:abc.def', 'an ordinary hello']), { timeout: 5000 });
   }, 60_000);
 });

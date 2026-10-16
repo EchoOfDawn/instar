@@ -129,7 +129,7 @@ export class PairTools {
   /** threadline_pair_status: pairings, open invites, accepts waiting, recent events. Never secrets. */
   status(): ToolResult {
     const p = this.deps.pairing;
-    const paired = p.keys.list().map((k) => ({ agent: k.agent, fingerprint: k.fingerprint, state: k.pairingState, verifiedAt: k.verifiedAt }));
+    const paired = p.keys.list().map((k) => ({ agent: k.agent, fingerprint: k.fingerprint, state: k.pairingState, verifiedAt: k.verifiedAt, ...(k.encryptedSeenAt ? { encryptedSince: k.encryptedSeenAt } : {}) }));
     const lookalikes = this.lookalikes(paired);
     return {
       ok: true,
@@ -137,6 +137,8 @@ export class PairTools {
       ...(lookalikes.length ? { lookalikes } : {}),
       ...(() => { const stuck = p.keys.list().filter((k) => p.finishOverdue(k as never)); return stuck.length ? { finishNotReceived: stuck.map((k) => ({ agent: k.agent, fingerprint: k.fingerprint, note: 'You accepted this invite but the other person never finished. Messages to it are refused; unpair and ask for a new invite.' })) } : {}; })(),
       ...(p.storeProblems.length ? { attention: p.storeProblems.map((x) => ({ at: x.at, problem: x.message, note: 'A pairing file could not be read and was set aside (not deleted). Pairings in it are not in use until it is repaired.' })) } : {}),
+      ...(p.alarms.length ? { alarms: p.alarms.map((x) => ({ at: x.at, alarm: x.message })) } : {}),
+      ...(p.refusedPlaintext.size ? { refusedPlaintext: [...p.refusedPlaintext].map(([fingerprint, count]) => ({ fingerprint, count, note: 'Unencrypted messages claiming to be from this paired agent were refused, because it has sent encrypted messages before. The relay may be tampering.' })) } : {}),
       openInvites: p.invites.list().filter((i) => i.state === 'open').map((i) => ({ iid: i.iid, exp: i.exp, boundTo: i.bind })),
       waitingToFinish: p.waitingToFinish().map((i) => ({ iid: i.iid, claimedAgent: i.acceptor?.agent, claimedOwner: i.acceptor?.owner })),
       recent: p.recentEvents().slice(0, 10),

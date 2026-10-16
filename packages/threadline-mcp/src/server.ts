@@ -51,7 +51,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { WebSocket } from 'ws';
 import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
-import { findInviteToken } from '@sagemindai/threadline-core';
+import { classifyInviteText } from '@sagemindai/threadline-core';
 import { PairTools, type Elicit } from './pairTools.js';
 import { servePairSocket, runPairCli } from './pairSocket.js';
 import { acquireStateLock } from './stateLock.js';
@@ -71,6 +71,8 @@ const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'he
 
 // Max message size (4KB)
 const MAX_MESSAGE_SIZE = 4096;
+/** How long a pairing question waits for the person (spec D3). */
+export const ELICIT_TIMEOUT_MS = 10 * 60_000;
 
 // ── Untrusted Content Framing ───────────────────────────────────────
 // Wraps agent-controlled content to prevent prompt injection via bio/notes
@@ -855,7 +857,7 @@ class RelayConnection {
       throw new Error(`Message too large (${text.length} bytes, max ${MAX_MESSAGE_SIZE})`);
     }
 
-    if (findInviteToken(text)) throw new Error(INVITE_REFUSAL);
+    if (classifyInviteText(text) === 'valid') throw new Error(INVITE_REFUSAL);
     // Verified pairing decides the wire: a paired agent is always sent encrypted to its pinned key,
     // and a credential goes only to a mutual-verified pair (never plaintext, never the listener proxy).
     if (this.pairing && !this.listenerProxyMode) {
@@ -1100,11 +1102,19 @@ async function main() {
 
   // Operator acts are asked of the PERSON through the host (MCP elicitation); the model cannot answer.
   const elicit: Elicit = async (message, fields) => {
-    const res = await server.server.elicitInput({
-      mode: 'form',
-      message,
-      requestedSchema: { type: 'object', properties: fields as never, required: Object.keys(fields) },
-    } as never);
+    // A person may take minutes to answer; the SDK's default request timeout is 60 s. After
+    // ELICIT_TIMEOUT_MS the question counts as unanswered, and nothing is decided (spec D3).
+    let res;
+    try {
+      res = await server.server.elicitInput({
+        mode: 'form',
+        message,
+        requestedSchema: { type: 'object', properties: fields as never, required: Object.keys(fields) },
+      } as never, { timeout: ELICIT_TIMEOUT_MS });
+    } catch (err) {
+      if (/timed? ?out/i.test(String((err as Error)?.message ?? err))) return null;
+      throw err;
+    }
     return res.action === 'accept' && res.content ? Object.fromEntries(Object.entries(res.content).map(([k, v]) => [k, String(v)])) : null;
   };
   const pairBase = {

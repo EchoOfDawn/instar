@@ -13,7 +13,7 @@ import net from 'node:net';
 import { PassThrough, Writable } from 'node:stream';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { PairTools } from '../../../packages/threadline-mcp/src/pairTools.js';
-import { servePairSocket, runPairCli } from '../../../packages/threadline-mcp/src/pairSocket.js';
+import { servePairSocket, runPairCli, PAIR_SOCKET_PROTOCOL, pairSocketPathProblem } from '../../../packages/threadline-mcp/src/pairSocket.js';
 import { generateIdentityKeyPair, findInviteToken } from '@sagemindai/threadline-core';
 
 type Env = Record<string, unknown> & { to: string };
@@ -118,13 +118,45 @@ describe('terminal pairing (D5)', () => {
     const raw = net.connect(B.sock);
     await new Promise<void>((resolve) => {
       raw.on('data', (d) => { const m = JSON.parse(String(d).split('\n')[0]); if (m.ask?.startsWith('Paste')) raw.write(JSON.stringify({ answer: { invite: made.message } }) + '\n'); else if (m.ask) { raw.destroy(); resolve(); } });
-      raw.write(JSON.stringify({ cmd: 'open' }) + '\n');
+      raw.write(JSON.stringify({ cmd: 'open', v: PAIR_SOCKET_PROTOCOL }) + '\n');
     });
     await vi.waitFor(() => expect(ended).toEqual([expect.objectContaining({ result: 'declined' })])); // not left hanging
     expect(wire.out).toHaveLength(0);
     // the same invite can still be accepted properly afterwards
     expect(await runPairCli(['open'], B.sock, terminal([made.message, '2']).io)).toBe(0);
     expect(wire.out).toHaveLength(1);
+  });
+
+  it('a client speaking another protocol version is refused, naming both (spec r3 D5)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire);
+    await A.serve();
+    const raw = net.connect(A.sock);
+    const reply = await new Promise<string>((resolve) => {
+      let got = '';
+      raw.on('data', (d) => { got += String(d); });
+      raw.on('close', () => resolve(got));
+      raw.write(JSON.stringify({ cmd: 'status' }) + '\n');
+    });
+    expect(JSON.parse(reply.split('\n')[0]).result).toMatchObject({ ok: false, error: expect.stringContaining(`protocol ${PAIR_SOCKET_PROTOCOL}`) });
+  });
+
+  it('refuses a socket path that is a symlink, a plain file, or too long (spec r3 D5)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-'));
+    const target = path.join(dir, 'elsewhere.sock');
+    const link = path.join(dir, 'pair.sock');
+    fs.symlinkSync(target, link);
+    expect(pairSocketPathProblem(link)).toMatch(/symlink/);
+    await expect(servePairSocket(link, () => { throw new Error('unused'); })).rejects.toThrow(/symlink/);
+    const plain = path.join(dir, 'plain.sock');
+    fs.writeFileSync(plain, 'x');
+    expect(pairSocketPathProblem(plain)).toMatch(/not a socket/);
+    expect(fs.readFileSync(plain, 'utf8')).toBe('x');
+    expect(pairSocketPathProblem(path.join(dir, 'x'.repeat(120)))).toMatch(/longer than/);
+    expect(pairSocketPathProblem(path.join(dir, 'fresh.sock'))).toBeNull();
+    const t = terminal(['']);
+    expect(await runPairCli(['status'], link, t.io)).toBe(1);
+    expect(t.text()).toMatch(/symlink/);
   });
 
   it('runs one command per connection; a second command on it is ignored', async () => {
@@ -135,7 +167,7 @@ describe('terminal pairing (D5)', () => {
     let got = '';
     raw.on('data', (d) => { got += String(d); });
     // open waits on the person; a status smuggled in behind it must not run alongside it
-    raw.write(JSON.stringify({ cmd: 'open' }) + '\n' + JSON.stringify({ cmd: 'status' }) + '\n');
+    raw.write(JSON.stringify({ cmd: 'open', v: PAIR_SOCKET_PROTOCOL }) + '\n' + JSON.stringify({ cmd: 'status', v: PAIR_SOCKET_PROTOCOL }) + '\n');
     await vi.waitFor(() => expect(got).toContain('"ask"'));
     await tick(); await tick();
     raw.destroy();
@@ -154,7 +186,7 @@ describe('terminal pairing (D5)', () => {
     }, { idleMs: 50 }));
     const raw = net.connect(A.sock);
     raw.on('data', () => { /* sees the question, never answers */ });
-    raw.write(JSON.stringify({ cmd: 'open' }) + '\n');
+    raw.write(JSON.stringify({ cmd: 'open', v: PAIR_SOCKET_PROTOCOL }) + '\n');
     await new Promise((r) => raw.on('close', r));
     await vi.waitFor(() => expect(ended).toEqual([expect.objectContaining({ ok: false })]));
   });

@@ -20,7 +20,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   EnvelopeCrypto, PairingInviteFlow, PairingInviteStore, PinnedKeyStore, INVITE_OPS, OP_ACCEPT,
-  canonicalizeEnvelope, credentialAcceptFrom, credentialSendKey, edPublicToX25519, findInviteToken, verify,
+  canonicalizeEnvelope, classifyInviteText, credentialAcceptFrom, credentialSendKey, edPublicToX25519, verify, PINNED_KEYS_FILE,
   type InviteEvent, type MessageEnvelope, type PlaintextMessage,
 } from '@sagemindai/threadline-core';
 
@@ -79,6 +79,10 @@ export class StandalonePairing {
   private readonly recent: StandaloneEvent[] = [];
   /** Store files set aside this run (unparseable): an attention item in status and the inbox. */
   readonly storeProblems: Array<{ at: string; message: string }> = [];
+  /** Things the person should know that are not store problems (an invite seen inside a message). */
+  readonly alarms: Array<{ at: string; message: string }> = [];
+  /** Plaintext refused this run because its sender had spoken encrypted before (spec D6), by fingerprint. */
+  readonly refusedPlaintext = new Map<string, number>();
   /** Encrypted messages already accepted, by sender and messageId, so a captured envelope cannot be replayed. In memory, bounded. */
   private readonly seen = new Set<string>();
   static readonly SEEN_MAX = 10_000;
@@ -106,6 +110,7 @@ export class StandalonePairing {
     this.invites = new PairingInviteStore(deps.stateDir, this.now, report);
     this.crypto = new EnvelopeCrypto(deps.identity.privateKey, deps.identity.publicKey);
     this.loadSeen();
+    this.migrateLegacyEncryptedPeers();
     this.flow = new PairingInviteFlow({
       store: this.invites,
       trust: this.keys,
@@ -159,43 +164,71 @@ export class StandalonePairing {
     } catch { /* the in-memory ledger still refuses replays this run */ }
   }
 
-  /** Peers that have sent us encrypted ordinary chat (the downgrade high-water mark), persisted 0600. */
-  private encryptedPeersFile(): string { return path.join(this.deps.stateDir, 'threadline', 'encrypted-chat-peers.json'); }
+  /**
+   * The downgrade high-water mark (spec D6) lives in the pin record (`encryptedSeenAt`), so it is
+   * created with the pin and removed only when the person forgets the pin. 0.5.0 builds before r3
+   * kept it in `encrypted-chat-peers.json`; the owner folds that file into the pins once.
+   */
+  private legacyEncryptedPeersFile(): string { return path.join(this.deps.stateDir, 'threadline', 'encrypted-chat-peers.json'); }
+  /** True when the legacy mark file existed but could not be read: every pinned peer is then treated as seen. */
+  private legacyMarkUnreadable = false;
 
-  /** null when the file exists but cannot be read: the mark is then unknown, never "not seen". */
-  private readEncryptedPeers(): Record<string, string> | null {
+  private migrateLegacyEncryptedPeers(): void {
+    const file = this.legacyEncryptedPeersFile();
     let text: string;
-    try { text = fs.readFileSync(this.encryptedPeersFile(), 'utf8'); } catch (e) { return (e as NodeJS.ErrnoException).code === 'ENOENT' ? {} : null; }
-    try { const v = JSON.parse(text); return v && typeof v === 'object' ? v : null; } catch { return null; }
+    try { text = fs.readFileSync(file, 'utf8'); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.legacyMarkUnreadable = true;
+      return;
+    }
+    let all: Record<string, unknown>;
+    try { all = JSON.parse(text); if (!all || typeof all !== 'object') throw new Error('not an object'); } catch { this.legacyMarkUnreadable = true; return; }
+    if (this.deps.ownsPairing === false) return; // only the owner writes pairing state; the file is still honoured below
+    for (const fp of Object.keys(all)) this.keys.markEncryptedSeen(fp);
+    try { fs.renameSync(file, `${file}.migrated`); } catch { /* honoured from the pins either way */ }
+    this.audit({ kind: 'encrypted-chat-marks-migrated', count: Object.keys(all).length });
+  }
+
+  /** Is the pinned-keys store itself set aside this run? Then no pin is trustworthy, in either direction. */
+  private pinStoreBroken(): boolean {
+    return this.storeProblems.some((p) => p.message.includes(PINNED_KEYS_FILE));
   }
 
   /**
-   * Has this pinned peer sent us encrypted chat? If the record cannot be read, fail safe: treat every
-   * pinned peer as seen (plaintext in its name is refused) and report it (Echo review LES-12).
+   * Has this pinned peer sent us encrypted chat? Fail safe: if the legacy mark file could not be
+   * read, every pinned peer counts as seen (plaintext in its name is refused), and status says so.
    */
   encryptedChatSeen(fp: string): boolean {
-    const all = this.readEncryptedPeers();
-    if (all === null) {
+    if (this.legacyMarkUnreadable) {
       if (!this.storeProblems.some((p) => p.message.includes('encrypted-chat-peers.json'))) {
-        const message = `${this.encryptedPeersFile()} could not be read, so every paired agent is treated as having sent encrypted chat (plaintext in their name is refused) until it is repaired.`;
+        const message = `${this.legacyEncryptedPeersFile()} could not be read, so every paired agent is treated as having sent encrypted chat (plaintext in their name is refused) until it is repaired or removed.`;
         this.storeProblems.push({ at: this.now().toISOString(), message });
         this.audit({ kind: 'store-problem', message });
       }
       return true;
     }
-    return Boolean(all[fp.toLowerCase()]);
+    if (this.deps.ownsPairing === false) {
+      // A non-owner has not migrated the legacy file; honour it alongside the pins.
+      try { const all = JSON.parse(fs.readFileSync(this.legacyEncryptedPeersFile(), 'utf8')); if (all && all[fp.toLowerCase()]) return true; } catch { /* absent */ }
+    }
+    return Boolean(this.readKeys().getProfileByFingerprint(fp)?.encryptedSeenAt);
   }
 
   private markEncryptedChat(fp: string): void {
-    const all = this.readEncryptedPeers();
-    if (all === null || all[fp]) return; // never overwrite a record we could not read
-    all[fp] = this.now().toISOString();
-    const file = this.encryptedPeersFile();
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    this.audit({ kind: 'encrypted-chat-first-seen', from: fp });
+    const before = this.keys.getProfileByFingerprint(fp)?.encryptedSeenAt;
+    if (before || this.legacyMarkUnreadable) return;
+    if (this.keys.markEncryptedSeen(fp)) this.audit({ kind: 'encrypted-chat-first-seen', from: fp });
+  }
+
+  /**
+   * An invite arrived inside a message (spec D4). It is never shown to the model. The person is told,
+   * because whoever saw it may try to use it: they should cancel it and send a fresh one privately.
+   */
+  private inviteLeak(from: string): Inbound {
+    const message = `An agent (${from.slice(0, 8)}) sent a pairing invite inside a message. It was not shown to your agent. Invites should be pasted by a person into the pairing box, never relayed; if it is yours, cancel it and send a new one privately.`;
+    this.alarms.push({ at: this.now().toISOString(), message });
+    this.alarms.splice(0, Math.max(0, this.alarms.length - 20));
+    this.audit({ kind: 'invite-leak-inbound', from });
+    return { kind: 'refused', reason: 'a pairing invite arrived as a message; invites are pasted by a person, not relayed' };
   }
 
   /** Best effort: the audit must never break messaging. */
@@ -248,7 +281,10 @@ export class StandalonePairing {
     const fp = to.toLowerCase();
     // An invite is handed over privately by a person, never relayed (spec D4): it works once,
     // and whoever sees it first is offered to the inviter's person.
-    if (findInviteToken(text)) return { sent: false, reason: INVITE_IN_MESSAGE };
+    // Refused only for a token that decodes with a valid checksum; a look-alike is sent and logged.
+    const inv = classifyInviteText(text);
+    if (inv === 'valid') { this.audit({ kind: 'invite-send-refused', to: fp }); return { sent: false, reason: INVITE_IN_MESSAGE }; }
+    if (inv === 'lookalike') this.audit({ kind: 'invite-lookalike-sent', to: fp });
     const keys = this.readKeys();
     if (opts.credential && this.deps.ownsPairing === false) return { sent: false, reason: 'not-pairing-owner' };
     if (opts.credential) {
@@ -320,6 +356,7 @@ export class StandalonePairing {
       // The downgrade high-water mark: ordinary chat only. Pairing ops and credentials are always
       // encrypted, even from peers that still send ordinary chat in plaintext.
       if (!credential && this.deps.ownsPairing !== false) this.markEncryptedChat(from);
+      if (classifyInviteText(String(msg.content ?? '')) === 'valid') return this.inviteLeak(from);
       return { kind: 'message', text: String(msg.content ?? ''), type: msg.type, encrypted: true, credential };
     }
     // Plaintext.
@@ -337,15 +374,23 @@ export class StandalonePairing {
       }
       return { kind: 'control' };
     }
-    if (findInviteToken(text)) return { kind: 'refused', reason: 'a pairing invite arrived as a message; invites are pasted by a person, not relayed' };
+    if (classifyInviteText(text) === 'valid') return this.inviteLeak(from);
     // Plaintext naming a PINNED sender (spec D6). On the relay path the sender is only the relay's
     // word, so it counts as from that peer only when the envelope is signed by the pinned key.
     // Once a peer has sent us encrypted chat, plaintext claiming to be from it is a downgrade and is
     // refused. Otherwise it is delivered marked as an unverified claim (Instar before step 9 sends
     // ordinary chat in plaintext). It never counts as a credential, and we never reply in plaintext.
     const pin = keys.getProfileByFingerprint(from);
-    if (!pin?.peerIdentityPub) return { kind: 'message', text, type, encrypted: false, credential: false };
-    if (this.encryptedChatSeen(from)) return { kind: 'refused', reason: 'plaintext from a paired agent that has sent encrypted messages before (possible downgrade)' };
+    if (!pin?.peerIdentityPub) {
+      // With the pin store set aside, a sender that was paired looks unpaired; never present its plaintext as plainly from it.
+      return this.pinStoreBroken()
+        ? { kind: 'message', text, type, encrypted: false, credential: false, unverifiedPairedClaim: true }
+        : { kind: 'message', text, type, encrypted: false, credential: false };
+    }
+    if (this.encryptedChatSeen(from)) {
+      this.refusedPlaintext.set(from, (this.refusedPlaintext.get(from) ?? 0) + 1);
+      return { kind: 'refused', reason: 'plaintext from a paired agent that has sent encrypted messages before (possible downgrade)' };
+    }
     const signed = typeof env.signature === 'string'
       && verify(Buffer.from(pin.peerIdentityPub, 'hex'), Buffer.from(canonicalizeEnvelope(env as Record<string, unknown>), 'utf-8'), Buffer.from(env.signature, 'base64'));
     return signed
@@ -356,7 +401,8 @@ export class StandalonePairing {
   /** The newest pairing events as plain lines, for the inbox. */
   systemLines(limit = 5): string[] {
     const attention = this.storeProblems.map((p) => `${p.at} Pairing ATTENTION: ${p.message} Pairings recorded in it are not in use until the file is repaired; tell your person.`);
-    return [...attention, ...this.recent.slice(0, limit).map((r) => `${r.at} ${describePairingEvent(r.event)}`)];
+    const alarms = this.alarms.map((a) => `${a.at} Pairing ALARM: ${a.message}`);
+    return [...attention, ...alarms, ...this.recent.slice(0, limit).map((r) => `${r.at} ${describePairingEvent(r.event)}`)];
   }
 
   /** Recent pairing events (accepts waiting, leak alarms, paired), newest first. Never secrets. */

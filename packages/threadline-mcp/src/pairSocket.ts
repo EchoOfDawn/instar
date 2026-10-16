@@ -25,6 +25,21 @@ type Fields = Parameters<Elicit>[1];
 export const PAIR_SOCKET_IDLE_MS = 15 * 60_000;
 /** At most this many terminals at once; more are refused by the OS backlog/close. */
 export const PAIR_SOCKET_MAX_CONNECTIONS = 4;
+/** The terminal protocol version; a client and server that disagree refuse, naming both (spec D5). */
+export const PAIR_SOCKET_PROTOCOL = 1;
+/** Unix socket paths longer than this fail or are silently truncated on macOS (104 bytes with the NUL). */
+export const PAIR_SOCKET_MAX_PATH_BYTES = 103;
+
+/** Why this path must not be used as the pair socket, or null. Never follows a symlink. */
+export function pairSocketPathProblem(sockPath: string): string | null {
+  if (Buffer.byteLength(sockPath) > PAIR_SOCKET_MAX_PATH_BYTES) return `the socket path is ${Buffer.byteLength(sockPath)} bytes, longer than the ${PAIR_SOCKET_MAX_PATH_BYTES} a Unix socket allows; use a shorter THREADLINE_STATE_DIR`;
+  try {
+    const st = fs.lstatSync(sockPath);
+    if (st.isSymbolicLink()) return `${sockPath} is a symlink; refusing to use it for pairing`;
+    if (!st.isSocket()) return `${sockPath} exists and is not a socket; refusing to replace it`;
+  } catch { /* absent: fine */ }
+  return null;
+}
 
 function lines(sock: net.Socket, onLine: (msg: Record<string, unknown>) => void): void {
   let buf = '';
@@ -44,11 +59,15 @@ const send = (sock: net.Socket, msg: unknown) => { if (!sock.destroyed) sock.wri
 /** Serve the pair socket. `toolsFor(elicit)` builds PairTools that ask through the connected terminal. */
 export async function servePairSocket(sockPath: string, toolsFor: (elicit: Elicit) => PairTools, opts: { idleMs?: number } = {}): Promise<net.Server> {
   // Never take the socket from a live server on the same state dir; only clear a stale one.
+  const early = pairSocketPathProblem(sockPath);
+  if (early) throw new Error(early);
   const live = await new Promise<boolean>((resolve) => {
     const probe = net.connect(sockPath);
     probe.once('connect', () => { probe.destroy(); resolve(true); });
     probe.once('error', () => resolve(false));
   });
+  const problem = pairSocketPathProblem(sockPath);
+  if (problem) throw new Error(problem);
   if (live) throw new Error('another threadline-mcp is already serving terminal pairing for this state directory');
   try { if (fs.lstatSync(sockPath).isSocket()) fs.unlinkSync(sockPath); } catch { /* none */ }
   const server = net.createServer((sock) => {
@@ -73,6 +92,11 @@ export async function servePairSocket(sockPath: string, toolsFor: (elicit: Elici
       }
       if (started) return;
       started = true;
+      if (msg.v !== PAIR_SOCKET_PROTOCOL) {
+        send(sock, { result: { ok: false, error: `This threadline-mcp speaks terminal protocol ${PAIR_SOCKET_PROTOCOL}; the command you ran speaks ${msg.v === undefined ? 'an older one' : String(msg.v)}. Run the threadline-mcp that your app runs (${process.argv[1] ?? 'unknown'}).` } as ToolResult });
+        sock.end();
+        return;
+      }
       const tools = toolsFor(elicit);
       let result: ToolResult;
       if (msg.cmd === 'open') result = await tools.open();
@@ -167,6 +191,8 @@ export async function runPairCli(args: string[], sockPath: string, io: CliIO): P
     out.write('This asks you, the person, to decide, so it needs an interactive terminal. Run it yourself in a terminal window.\n');
     return 2;
   }
+  const pathProblem = pairSocketPathProblem(sockPath);
+  if (pathProblem) { out.write(`Not done: ${pathProblem}\n`); return 1; }
   const sock = net.connect(sockPath);
   const rl = readline.createInterface({ input: io.input, output: out, terminal: io.isTTY });
   const typed = new LineReader(rl);
@@ -181,7 +207,7 @@ export async function runPairCli(args: string[], sockPath: string, io: CliIO): P
         finish(1);
       });
       sock.on('close', () => finish(1));
-      sock.on('connect', () => send(sock, { cmd, ...(iid ? { iid } : {}) }));
+      sock.on('connect', () => send(sock, { cmd, v: PAIR_SOCKET_PROTOCOL, ...(iid ? { iid } : {}) }));
       lines(sock, async (msg) => {
         if ('ask' in msg) {
           const a = await askOnTerminal(typed, out, String(msg.ask), msg.fields as Fields);

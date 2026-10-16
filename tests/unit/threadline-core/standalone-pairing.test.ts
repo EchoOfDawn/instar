@@ -200,10 +200,36 @@ describe('StandalonePairing', () => {
     await pump(wire, [A, B]);
     expect(B.p.encryptedChatSeen(A.fp)).toBe(true);
     expect(await B.p.receive(pt as never)).toEqual({ kind: 'refused', reason: 'plaintext from a paired agent that has sent encrypted messages before (possible downgrade)' });
-    // persisted: a restarted B still refuses
-    const file = path.join(B.p.auditPath, '..', 'encrypted-chat-peers.json');
-    expect(JSON.parse(fs.readFileSync(file, 'utf8'))[A.fp]).toBeTruthy();
+    // persisted in the pin record (spec r3 D6): a restarted B still refuses
+    const file = path.join(B.dir, 'threadline', 'pinned-keys.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).peers.find((x: { fingerprint: string }) => x.fingerprint === A.fp).encryptedSeenAt).toBeTruthy();
     expect(fs.statSync(file).mode & 0o077).toBe(0);
+    const B2 = agent('b', wire, { dir: B.dir, kp: B.kp });
+    expect(await B2.p.receive(pt as never)).toMatchObject({ kind: 'refused' });
+    expect(B2.p.refusedPlaintext.get(A.fp)).toBe(1);
+  });
+
+  it('forgetting a pin removes its encryptedSeen mark with it (spec r3 D6, D8)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    A.p.send(B.fp, 'ordinary encrypted chat');
+    await pump(wire, [A, B]);
+    expect(B.p.encryptedChatSeen(A.fp)).toBe(true);
+    B.p.keys.forget(A.fp);
+    expect(B.p.encryptedChatSeen(A.fp)).toBe(false);
+  });
+
+  it('a pre-r3 encrypted-chat-peers.json is folded into the pins once, then renamed', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    const legacy = path.join(B.dir, 'threadline', 'encrypted-chat-peers.json');
+    fs.writeFileSync(legacy, JSON.stringify({ [A.fp]: '2026-10-15T00:00:00.000Z' }), { mode: 0o600 });
+    const B2 = agent('b', wire, { dir: B.dir, kp: B.kp });
+    expect(B2.p.encryptedChatSeen(A.fp)).toBe(true);
+    expect(fs.existsSync(legacy)).toBe(false);
+    expect(fs.existsSync(legacy + '.migrated')).toBe(true);
   });
 
   it('the audit log records pairing, credential sends and refusals, privately, with no message content', async () => {
@@ -329,12 +355,41 @@ describe('StandalonePairing', () => {
     await pair(wire, A, B);
     const file = path.join(B.dir, 'threadline', 'encrypted-chat-peers.json');
     fs.writeFileSync(file, '{ broken');
+    const B2 = agent('b', wire, { dir: B.dir, kp: B.kp });
     const pt = { from: A.fp, to: B.fp, payload: Buffer.from(JSON.stringify({ type: 'chat', text: 'plain' })).toString('base64') };
-    expect(await B.p.receive(pt as never)).toMatchObject({ kind: 'refused' });
-    expect(B.p.storeProblems.some((p) => /encrypted-chat-peers\.json could not be read/.test(p.message))).toBe(true);
+    expect(await B2.p.receive(pt as never)).toMatchObject({ kind: 'refused' });
+    expect(B2.p.storeProblems.some((p) => /encrypted-chat-peers\.json could not be read/.test(p.message))).toBe(true);
     A.p.send(B.fp, 'encrypted chat');
-    await pump(wire, [A, B]);
+    await pump(wire, [A, B2]);
     expect(fs.readFileSync(file, 'utf8')).toBe('{ broken');
+  });
+
+  it('with the pin store set aside, plaintext from a formerly paired sender is labelled unverified, never plainly from it', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    fs.writeFileSync(path.join(B.dir, 'threadline', 'pinned-keys.json'), '{ broken');
+    const B2 = agent('b', wire, { dir: B.dir, kp: B.kp });
+    const pt = { from: A.fp, to: B.fp, payload: Buffer.from(JSON.stringify({ type: 'chat', text: 'plain' })).toString('base64') };
+    expect(await B2.p.receive(pt as never)).toMatchObject({ kind: 'message', unverifiedPairedClaim: true });
+  });
+
+  it('an invite inside a message never reaches the model and raises an alarm; a look-alike is sent with a signal (spec r3 D4)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    const inv = A.p.flow.createInvite() as { ok: true; message: string };
+    // inbound, plaintext
+    const pt = { from: A.fp, to: B.fp, payload: Buffer.from(JSON.stringify({ type: 'chat', text: `pair with me: ${inv.message}` })).toString('base64') };
+    expect(await B.p.receive(pt as never)).toMatchObject({ kind: 'refused' });
+    expect(B.p.alarms.length).toBe(1);
+    expect(B.p.systemLines().some((l) => /Pairing ALARM/.test(l))).toBe(true);
+    // outbound: a real invite is refused, a look-alike is sent
+    expect(B.p.send(A.fp, inv.message)).toMatchObject({ sent: false });
+    expect(B.p.send(A.fp, 'my history shows tlinv1:abc.def')).toMatchObject({ sent: true });
+    const audit = fs.readFileSync(B.p.auditPath, 'utf8');
+    expect(audit).toMatch(/invite-leak-inbound/);
+    expect(audit).toMatch(/invite-lookalike-sent/);
+    expect(audit).not.toContain(inv.message.split('\n').pop()!);
   });
 
   it('the waiting-for-Finish window ends: past the longest invite lifetime plus 10 minutes, sends are refused and status says why (SEC-6/ADV-7)', async () => {
