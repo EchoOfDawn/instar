@@ -175,6 +175,10 @@ Re-reading the spec against the build found three things it asked for that were 
 
 - `threadline_send` with `waitForReply` returned the reply text and sender only, so a relay-injected plaintext reply under a paired agent's fingerprint read as that agent's reply. It now carries the same labels and notes as the inbox (`encrypted`, `credential`, the unverified-claim note). Evidence: the stdio E2E has a pre-D9 Instar answer in plaintext on the waited thread; the reply comes back labelled as an unverified claim. Breakage: 1 tried, 1 caught.
 
+## Spec-converge round 1: encryptedSeen fails safe (LES-12)
+
+- An `encrypted-chat-peers.json` that exists but cannot be read no longer reads as "nothing seen" (which silently reopened the downgrade). Every pinned peer is treated as seen (plaintext in its name refused), the problem is an attention item, and the file is never overwritten. Evidence: `standalone-pairing.test.ts` (+1). Breakages: 2 tried, 2 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

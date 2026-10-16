@@ -154,15 +154,33 @@ export class StandalonePairing {
   /** Peers that have sent us encrypted ordinary chat (the downgrade high-water mark), persisted 0600. */
   private encryptedPeersFile(): string { return path.join(this.deps.stateDir, 'threadline', 'encrypted-chat-peers.json'); }
 
-  private readEncryptedPeers(): Record<string, string> {
-    try { const v = JSON.parse(fs.readFileSync(this.encryptedPeersFile(), 'utf8')); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
+  /** null when the file exists but cannot be read: the mark is then unknown, never "not seen". */
+  private readEncryptedPeers(): Record<string, string> | null {
+    let text: string;
+    try { text = fs.readFileSync(this.encryptedPeersFile(), 'utf8'); } catch (e) { return (e as NodeJS.ErrnoException).code === 'ENOENT' ? {} : null; }
+    try { const v = JSON.parse(text); return v && typeof v === 'object' ? v : null; } catch { return null; }
   }
 
-  encryptedChatSeen(fp: string): boolean { return Boolean(this.readEncryptedPeers()[fp.toLowerCase()]); }
+  /**
+   * Has this pinned peer sent us encrypted chat? If the record cannot be read, fail safe: treat every
+   * pinned peer as seen (plaintext in its name is refused) and report it (Echo review LES-12).
+   */
+  encryptedChatSeen(fp: string): boolean {
+    const all = this.readEncryptedPeers();
+    if (all === null) {
+      if (!this.storeProblems.some((p) => p.message.includes('encrypted-chat-peers.json'))) {
+        const message = `${this.encryptedPeersFile()} could not be read, so every paired agent is treated as having sent encrypted chat (plaintext in their name is refused) until it is repaired.`;
+        this.storeProblems.push({ at: this.now().toISOString(), message });
+        this.audit({ kind: 'store-problem', message });
+      }
+      return true;
+    }
+    return Boolean(all[fp.toLowerCase()]);
+  }
 
   private markEncryptedChat(fp: string): void {
     const all = this.readEncryptedPeers();
-    if (all[fp]) return;
+    if (all === null || all[fp]) return; // never overwrite a record we could not read
     all[fp] = this.now().toISOString();
     const file = this.encryptedPeersFile();
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

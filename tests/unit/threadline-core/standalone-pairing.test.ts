@@ -323,6 +323,20 @@ describe('StandalonePairing', () => {
     expect(await B.p.receive(wire.out.shift()! as never)).toMatchObject({ kind: 'refused' });
   });
 
+  it('an unreadable encryptedSeen record fails safe: plaintext from a paired agent is refused, it is reported, and the file is not overwritten', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    await pair(wire, A, B);
+    const file = path.join(B.dir, 'threadline', 'encrypted-chat-peers.json');
+    fs.writeFileSync(file, '{ broken');
+    const pt = { from: A.fp, to: B.fp, payload: Buffer.from(JSON.stringify({ type: 'chat', text: 'plain' })).toString('base64') };
+    expect(await B.p.receive(pt as never)).toMatchObject({ kind: 'refused' });
+    expect(B.p.storeProblems.some((p) => /encrypted-chat-peers\.json could not be read/.test(p.message))).toBe(true);
+    A.p.send(B.fp, 'encrypted chat');
+    await pump(wire, [A, B]);
+    expect(fs.readFileSync(file, 'utf8')).toBe('{ broken');
+  });
+
   it('relay-card key check: a matching key is returned, a mismatch or failure is null', async () => {
     const wire = { out: [] as Env[] };
     const target = generateIdentityKeyPair();
