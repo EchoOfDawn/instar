@@ -168,6 +168,20 @@ These tools are registered as an MCP server and called by Claude Code (or any MC
 | GET | `/messages/outbox` | Inter-agent outbox |
 | GET | `/messages/dead-letter` | Dead letter queue |
 | POST | `/messages/send` | Send a message (used internally by MCP tools) |
+| POST | `/threadline/pairing/invites` | Make a pairing invite (`ttlMinutes`, optional `bindFp`) |
+| GET | `/threadline/pairing/invites` | List own invites, pending accepts and known peers |
+| DELETE | `/threadline/pairing/invites/:iid` | Revoke an open invite |
+| POST | `/threadline/pairing/invites/inspect` | Recipient: check and hold a received invite |
+| POST | `/threadline/pairing/invites/:iid/approve` | Recipient approves (PIN) |
+| POST | `/threadline/pairing/invites/:iid/decline` | Recipient declines |
+| POST | `/threadline/pairing/invites/:iid/finish` | Inviter confirms the acceptor (PIN) |
+| POST | `/threadline/pairing/invites/:iid/not-them` | Inviter rejects the acceptor (PIN) |
+
+## Parallel-Work Awareness
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/parallel-work/sentinel` | Is the overlap sentinel ticking? Live counters, `tickAgeMs`, `cadenceMinutes`; 503 when dark |
 
 ## Serendipity Protocol
 

@@ -29,6 +29,21 @@ Then check `GET /threadline/pairing`: both sides show `mutual-verified`. **Never
 
 The dashboard card sits at the top of the Threadline tab. Anything waiting for you is shown first and counted on the tab. The PIN is asked once per page, and nothing on the card resets while you use it.
 
+### HTTP routes
+
+The dashboard and `threadline_pair` drive these Bearer routes (503 when pairing is off). Routes marked PIN also need the operator's mandate PIN.
+
+| Method | Path | Who | What it does |
+|--------|------|-----|--------------|
+| POST | `/threadline/pairing/invites` | inviter | Make an invite. Body: `ttlMinutes` (1-1440), optional `bindFp` to bind it to one peer |
+| GET | `/threadline/pairing/invites` | either | Your invites (never their secrets), invites waiting for your approval, known peers |
+| DELETE | `/threadline/pairing/invites/:iid` | inviter | Revoke an open invite |
+| POST | `/threadline/pairing/invites/inspect` | recipient | Check an invite you were sent and hold it for a decision. Grants and sends nothing |
+| POST | `/threadline/pairing/invites/:iid/approve` | recipient (PIN) | Approve: pins the inviter and sends the accept |
+| POST | `/threadline/pairing/invites/:iid/decline` | recipient | Decline the invite |
+| POST | `/threadline/pairing/invites/:iid/finish` | inviter (PIN) | Finish: pins the acceptor as verified and sends the signed finish |
+| POST | `/threadline/pairing/invites/:iid/not-them` | inviter (PIN) | The acceptor is not who you meant. Nothing is pinned and the invite stays used |
+
 ## How it works under the hood
 
 - **`PairingInvite`**: the invite format (`tlinv1:` + base64url JSON + a checksum), the transcript, the HKDF-derived MAC key, and an optional four-character check code two operators on a call can read to each other.
