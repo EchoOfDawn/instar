@@ -8,7 +8,11 @@
 
 import type { StandalonePairing } from './pairing.js';
 
-/** One elicitation: a message and the fields to ask for. Returns null when the person declines or cancels. */
+/**
+ * One elicitation: a message and the fields to ask for. Returns null when the person declines or cancels.
+ * Choices list the SAFE option first (Echo review LES-4), and no choice label starts with the words Instar's
+ * permission-prompt auto-resolver presses (yes / proceed / allow / continue).
+ */
 export type Elicit = (message: string, fields: Record<string, { type: 'string'; title: string; enum?: string[]; description?: string }>) => Promise<Record<string, string> | null>;
 
 export interface PairToolsDeps {
@@ -80,7 +84,7 @@ export class PairTools {
     const owner = r.claimedOwner ? `, which says it belongs to ${String(r.claimedOwner)}` : '';
     const answer = await this.deps.elicit(
       `Pair with the agent that calls itself "${String(r.claimedAgent)}"${owner}? Only approve if you know who sent you this invite. Check code (optional, to read to them): ${String(r.checkCode)}`,
-      { decision: { type: 'string', title: 'Your decision', enum: ['approve', 'decline'] } },
+      { decision: { type: 'string', title: 'Your decision', enum: ['decline', 'approve'] } },
     );
     const iid = String(r.iid);
     if (answer?.decision !== 'approve') {
@@ -107,7 +111,7 @@ export class PairTools {
     const owner = target.acceptor?.owner ? `, which says it belongs to ${target.acceptor.owner}` : '';
     const answer = await this.deps.elicit(
       `The agent that calls itself "${target.acceptor?.agent}"${owner} accepted your pairing invite. Finish only if that is who you sent it to.`,
-      { decision: { type: 'string', title: 'Your decision', enum: ['finish', 'not them'] } },
+      { decision: { type: 'string', title: 'Your decision', enum: ['not them', 'finish'] } },
     );
     if (answer?.decision === 'finish') {
       const r = this.deps.pairing.flow.approveFinish(target.iid);
@@ -151,7 +155,7 @@ export class PairTools {
     if (!fp || !pin) return { ok: false, error: `You are not paired with "${args.peer}".` };
     const answer = await this.deps.elicit(
       `Unpair from the agent "${pin.agent}" (${fp})? Messages to it will no longer be guaranteed encrypted, and it can no longer receive credentials. To pair again you will need a new invite.`,
-      { decision: { type: 'string', title: 'Your decision', enum: ['unpair', 'keep'] } },
+      { decision: { type: 'string', title: 'Your decision', enum: ['keep', 'unpair'] } },
     );
     if (answer?.decision !== 'unpair') return { ok: true, result: 'kept', note: 'Nothing changed.' };
     this.deps.pairing.keys.forget(fp);

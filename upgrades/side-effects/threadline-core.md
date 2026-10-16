@@ -188,6 +188,10 @@ Re-reading the spec against the build found three things it asked for that were 
 
 - An acceptor that is still waiting for the inviter's Finish sends as before pairing (plaintext), but only until the pin is older than the longest invite lifetime plus 10 minutes (`FINISH_WAIT_MS`). After that, sends to the peer are refused (`finish-not-received`, with a reason telling the person to unpair and ask for a new invite), and `threadline_pair_status.finishNotReceived` lists it. A paused pin is unaffected (it stays encrypted). Evidence: `standalone-pairing.test.ts` (+1). Breakage: 1 tried, 1 caught.
 
+## Spec-converge round 1: safe choice first (LES-4)
+
+- Every pairing question lists the safe choice first (decline / not them / keep), and a test asserts no question or label matches Instar's permission-prompt auto-resolver (`Do you want to proceed?`, `^(yes|proceed|allow|continue)`). The terminal menu numbering changes accordingly ("2) approve").
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.

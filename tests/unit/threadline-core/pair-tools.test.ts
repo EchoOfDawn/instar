@@ -184,6 +184,29 @@ describe('pair tools', () => {
     expect(new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, knownAgents: () => known.slice(0, 1) }).status()).not.toHaveProperty('lookalikes');
   });
 
+  it('every pairing question lists the safe choice first and never matches the permission auto-resolver (LES-4)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = agent('a', wire), B = agent('b', wire);
+    const seen: Array<{ message: string; choices: string[] }> = [];
+    const recordAs = (answers: Array<Record<string, string> | null>): Elicit => async (message, fields) => {
+      const enumField = Object.values(fields).find((f) => f.enum);
+      if (enumField) seen.push({ message, choices: enumField.enum! });
+      return answers.shift() ?? null;
+    };
+    const made = A.tools(null).invite({}) as { message: string };
+    await B.tools(recordAs([{ invite: made.message }, { decision: 'approve' }])).open();
+    await pump(wire, [A, B]);
+    await A.tools(recordAs([{ decision: 'finish' }])).finish({});
+    await tick(); await pump(wire, [A, B]);
+    await A.tools(recordAs([{ decision: 'keep' }])).forget({ peer: B.fp });
+    expect(seen.map((q) => q.choices[0])).toEqual(['decline', 'not them', 'keep']);
+    // Instar's PermissionPromptAutoResolver approves prompts matching these (src/monitoring/PermissionPromptAutoResolver.ts).
+    for (const q of seen) {
+      expect(q.message).not.toMatch(/Do you want to proceed\?/i);
+      for (const c of q.choices) expect(c).not.toMatch(/^(yes|proceed|allow|continue)\b/i);
+    }
+  });
+
   it('cancel revokes an open invite once', () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire);

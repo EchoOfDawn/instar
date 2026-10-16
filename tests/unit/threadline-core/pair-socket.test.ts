@@ -64,7 +64,7 @@ describe('terminal pairing (D5)', () => {
     await A.serve(); await B.serve();
     const made = A.pairing.flow.createInvite({}) as { ok: true; message: string };
 
-    const bob = terminal([made.message, '1']); // a multi-line paste (blank lines inside), then "1) approve"
+    const bob = terminal([made.message, '2']); // a multi-line paste (blank lines inside), then "2) approve" (the safe choice is listed first)
     expect(await runPairCli(['open'], B.sock, bob.io)).toBe(0);
     expect(bob.text()).toContain('calls itself "scout"');
     const result = bob.text().slice(bob.text().lastIndexOf('{'));
@@ -123,7 +123,7 @@ describe('terminal pairing (D5)', () => {
     await vi.waitFor(() => expect(ended).toEqual([expect.objectContaining({ result: 'declined' })])); // not left hanging
     expect(wire.out).toHaveLength(0);
     // the same invite can still be accepted properly afterwards
-    expect(await runPairCli(['open'], B.sock, terminal([made.message, '1']).io)).toBe(0);
+    expect(await runPairCli(['open'], B.sock, terminal([made.message, '2']).io)).toBe(0);
     expect(wire.out).toHaveLength(1);
   });
 
