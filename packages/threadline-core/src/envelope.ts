@@ -10,7 +10,7 @@
 
 import crypto from 'node:crypto';
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
-import {
+import { isX25519BoundToIdentity,
   computeFingerprint, deriveX25519PublicKey, ecdh, edPrivateToX25519, generateEphemeralKeyPair, sign, verify,
 } from './crypto.js';
 
@@ -100,6 +100,9 @@ export class EnvelopeCrypto {
 
   /** Verify the sender's signature, then decrypt. Throws on any failure (never returns plaintext unverified). */
   decrypt(envelope: MessageEnvelope, senderEdPubKey: Buffer, senderX25519PubKey: Buffer): PlaintextMessage {
+    // The static key must belong to the identity that signed; a caller cannot pair one sender's
+    // signature with another key's secret.
+    if (!isX25519BoundToIdentity(senderEdPubKey, senderX25519PubKey)) throw new Error('X25519 key is not bound to the sender identity');
     const { signature, ...withoutSig } = envelope;
     if (!verify(senderEdPubKey, Buffer.from(canonicalizeEnvelope(withoutSig), 'utf-8'), Buffer.from(signature, 'base64'))) {
       throw new Error('Invalid message signature');

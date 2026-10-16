@@ -95,6 +95,15 @@ Delete the package directory and the compat test. Nothing depends on it.
 - Pasted invites span lines with a blank line inside, so input ends at the line carrying `tlinv1:` (or two blank lines); a blank first line cancels. Found by the test: ending at the first blank line dropped the code.
 - Evidence: `tests/unit/threadline-core/pair-socket.test.ts` (8). The stdio E2E now also runs the built `pair status` from a second process against the live server. Breakages: 8 tried, 8 caught. Three caught only after adding tests: a closed terminal leaving the tool hung, an unoffered choice not reported, and a second command on one connection running alongside the first.
 
+## Cross-model review fixes (added 2026-10-16)
+
+An independent review by GPT 5.4 and Gemini 3.1 Pro (Grok unreachable) found no path for a credential to reach an unpaired agent, for the model to complete a pairing through MCP, or for control ops to be spoofed. Three real findings, fixed:
+- `envelope.ts` `decrypt` now refuses a static X25519 key that is not derived from the signing identity (was: the caller's responsibility; every caller was correct, but the API invited misuse). Wire format unchanged; the Instar vectors still pass.
+- `pairing.ts` drops a replayed encrypted envelope (same sender + messageId), recorded only after verification so a forgery cannot burn an id. In memory, bounded at 10,000; a restart reopens the window for messages received before it (Instar's inbound ledger is the persistent equivalent; porting it is step 9 territory).
+- `pairSocket.ts` closes a terminal connection idle for 15 minutes (the pending question is answered with nothing) and caps connections at 4.
+- Accepted, not changed: plaintext from a paired peer stays delivered-and-marked until Instar encrypts to pinned peers (D6 as built, step 9); the stale-socket probe→unlink→listen race fails safe (the loser gets EADDRINUSE and logs); `handleFinish` matches Instar's semantics.
+- Evidence: core test (decrypt refuses an unbound key), `standalone-pairing.test.ts` (replay refused; a forgery first does not burn the id), `pair-socket.test.ts` (idle terminal closed, question answered with nothing). Breakages: 3 tried, 3 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
