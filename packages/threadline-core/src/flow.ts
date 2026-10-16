@@ -75,6 +75,9 @@ export type Result = { ok: true; [k: string]: unknown } | { ok: false; reason: s
 interface PendingAccept { invite: PairingInvite; K: Buffer }
 interface SentFinish { acceptorFp: string; acceptorKey: string; exp: string; nonce: string; acked: boolean; tries: number }
 
+/** A Finish may follow the invite's expiry (the inviter's person may take a while, and retries run ~10 min), but not by more than this. */
+export const FINISH_GRACE_MS = 24 * 60 * 60_000;
+
 const isHex = (s: unknown, bytes: number) => typeof s === 'string' && new RegExp(`^[0-9a-f]{${bytes * 2}}$`).test(s);
 
 export class PairingInviteFlow {
@@ -264,17 +267,25 @@ export class PairingInviteFlow {
     if (!me || !pa) return { ok: false, reason: 'no invite waiting for approval (forward or paste it again)' };
     const inv = pa.invite;
     if (isExpired(inv, this.now())) { this.pendingAccepts.delete(inv.iid); return { ok: false, reason: 'this invite has expired' }; }
+    const hadPin = !!this.deps.trust.getProfileByFingerprint(inv.fp);
     if (!this.deps.trust.recordInviteAccepted(inv.fp, { peerIdentityPub: inv.key, displayName: inv.agent, ownFp: me.fp })) {
       return { ok: false, reason: 'could not record the inviter' };
     }
     const nonce = this.random(16).toString('hex');
     const T = transcript({ iid: inv.iid, fpA: inv.fp, idA: inv.key, fpB: me.fp, idB: me.publicKeyHex, exp: inv.exp, nonce, direction: 'accept' });
     const names = this.deps.ownName();
-    this.deps.sendPlaintext(inv.fp, OP_ACCEPT, {
-      iid: inv.iid, idB: me.publicKeyHex, fpB: me.fp, owner: names.owner, agent: names.agent, nonce,
-      tag: inviteTag(pa.K, T), sig: sign(me.privateKey, T).toString('hex'),
-    });
+    try {
+      this.deps.sendPlaintext(inv.fp, OP_ACCEPT, {
+        iid: inv.iid, idB: me.publicKeyHex, fpB: me.fp, owner: names.owner, agent: names.agent, nonce,
+        tag: inviteTag(pa.K, T), sig: sign(me.privateKey, T).toString('hex'),
+      });
+    } catch (err) {
+      // Not sent: undo a pin this approval created, keep the invite waiting so it can be tried again.
+      if (!hadPin) this.deps.trust.forget?.(inv.fp);
+      return { ok: false, reason: `could not send the accept (${err instanceof Error ? err.message : String(err)}); nothing was paired, try again` };
+    }
     this.pendingAccepts.delete(inv.iid); // S leaves memory once the accept is built
+    this.deps.store.recordApprovedAccept(inv.iid, inv.fp, inv.exp);
     this.deps.store.appendEvent({ iid: inv.iid, event: 'approved', peerFp: inv.fp });
     return { ok: true, inviterFp: inv.fp };
   }
@@ -309,12 +320,25 @@ export class PairingInviteFlow {
     const nonce = String(p.nonce ?? '').toLowerCase();
     const exp = String(p.exp ?? '');
     if (!isHex(iid, 16) || !isHex(nonce, 16) || Number.isNaN(Date.parse(exp))) return { ok: false, reason: 'malformed finish' };
+    // Only a Finish for an invite THIS operator approved, from that inviter, for that invite's
+    // expiry, within the grace window, and only once. Anything else (a Finish kept by a relay and
+    // replayed later, one for an invite we never accepted) changes nothing (Echo's review of #2195).
+    const approved = this.deps.store.getApprovedAccept(iid);
+    if (!approved || approved.inviterFp !== from || approved.exp !== exp) return { ok: false, reason: 'finish for an invite this agent did not accept' };
+    if (this.now().getTime() > Date.parse(exp) + FINISH_GRACE_MS) return { ok: false, reason: 'finish arrived too long after the invite expired' };
     const T = transcript({ iid, fpA: from, idA: prof.peerIdentityPub, fpB: me.fp, idB: me.publicKeyHex, exp, nonce, direction: 'finish' });
     if (!this.verifySig(prof.peerIdentityPub, T, p.sig)) return { ok: false, reason: 'bad signature' };
-    if (prof.pairingState !== 'mutual-verified') {
-      this.deps.trust.markInviteVerified(from, { peerIdentityPub: prof.peerIdentityPub, displayName: prof.agent, ownFp: me.fp, ownIdentityPub: me.publicKeyHex, via: `invite ${iid.slice(0, 8)} finished by inviter` });
-      this.deps.notify({ kind: 'paired', peerFp: from, claimedAgent: prof.agent, role: 'recipient' });
-      this.deps.store.appendEvent({ iid, event: 'paired', peerFp: from });
+    if (approved.finishedNonce !== undefined) {
+      // The inviter retries a Finish until it is acked: the same one is re-acked and changes nothing.
+      if (approved.finishedNonce !== nonce) return { ok: false, reason: 'this invite was already finished' };
+    } else {
+      if (String(prof.via ?? '').startsWith('paused:')) return { ok: false, reason: 'this pairing is paused; a new invite is needed' };
+      if (prof.pairingState !== 'mutual-verified') {
+        this.deps.trust.markInviteVerified(from, { peerIdentityPub: prof.peerIdentityPub, displayName: prof.agent, ownFp: me.fp, ownIdentityPub: me.publicKeyHex, via: `invite ${iid.slice(0, 8)} finished by inviter` });
+        this.deps.notify({ kind: 'paired', peerFp: from, claimedAgent: prof.agent, role: 'recipient' });
+        this.deps.store.appendEvent({ iid, event: 'paired', peerFp: from });
+      }
+      this.deps.store.markAcceptFinished(iid, nonce);
     }
     const n2 = this.random(16).toString('hex');
     const Ta = transcript({ iid, fpA: from, idA: prof.peerIdentityPub, fpB: me.fp, idB: me.publicKeyHex, exp, nonce: n2, direction: 'ack' });

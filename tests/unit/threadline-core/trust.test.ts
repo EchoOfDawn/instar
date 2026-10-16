@@ -104,3 +104,17 @@ describe('credential gate', () => {
     expect(credentialAcceptFrom(broken, 'a'.repeat(32))).toBe(false);
   });
 });
+
+describe('credentialAcceptFrom checks the pairing is bound to our current key (Echo, PR #2195)', () => {
+  it('bound: accepted; a pairing bound to another key of ours: refused; no key given: the old rule', async () => {
+    const { PinnedKeyStore, credentialAcceptFrom, generateIdentityKeyPair: gen } = await import('../../../packages/threadline-core/src/index.js');
+    const me = gen(), other = gen(), peer = gen();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cred-accept-'));
+    const store = new PinnedKeyStore(dir);
+    const fp = peer.publicKey.subarray(0, 16).toString('hex');
+    store.markInviteVerified(fp, { peerIdentityPub: peer.publicKey.toString('hex'), via: 't', ownIdentityPub: me.publicKey.toString('hex') });
+    expect(credentialAcceptFrom(store, fp, me.publicKey.toString('hex'))).toBe(true);
+    expect(credentialAcceptFrom(store, fp, other.publicKey.toString('hex'))).toBe(false);
+    expect(credentialAcceptFrom(store, fp)).toBe(true);
+  });
+});

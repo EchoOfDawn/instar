@@ -14,6 +14,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { readStoreJson, defaultReporter, type StoreProblemReporter } from './storeFile.js';
 import { derivePairingId, edPublicToX25519 } from './crypto.js';
 
 export type PairingState = 'invite-accepted' | 'mutual-verified' | 'identity-verified' | 'pending-verification' | 'verification-failed';
@@ -35,6 +36,8 @@ export interface InviteTrust {
   recordInviteAccepted(fp: string, args: { peerIdentityPub: string; displayName?: string; ownFp?: string }): boolean;
   markInviteVerified(fp: string, args: { peerIdentityPub: string; displayName?: string; ownFp?: string; via: string; ownIdentityPub?: string }): boolean;
   demoteInvitePairing(fp: string, reason: string): boolean;
+  /** Optional: remove a pin. Used to roll back a pin the flow created when its accept could not be sent. */
+  forget?(fp: string): boolean;
 }
 
 interface StoredPeer {
@@ -56,16 +59,15 @@ export class PinnedKeyStore implements InviteTrust {
   private readonly file: string;
   private peers = new Map<string, StoredPeer>();
 
-  constructor(stateDir: string, private readonly now: () => Date = () => new Date()) {
+  constructor(stateDir: string, private readonly now: () => Date = () => new Date(), private readonly report: StoreProblemReporter = defaultReporter) {
     this.file = path.join(stateDir, 'threadline', PINNED_KEYS_FILE);
     this.load();
   }
 
   private load(): void {
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8')) as { peers?: StoredPeer[] };
-      for (const p of raw.peers ?? []) if (FP.test(p.fingerprint) && KEY.test(p.peerIdentityPub)) this.peers.set(p.fingerprint, p);
-    } catch { /* no file yet, or unreadable: nothing is pinned, which is the safe default */ }
+    // A corrupt file is set aside and reported, never wiped by the next save; an unreadable one throws.
+    const raw = readStoreJson(this.file, this.now, this.report) as { peers?: StoredPeer[] } | null;
+    for (const p of raw?.peers ?? []) if (p && FP.test(p.fingerprint) && KEY.test(p.peerIdentityPub)) this.peers.set(p.fingerprint, p);
   }
 
   private save(): void {
@@ -166,11 +168,16 @@ export function credentialSendKey(trust: Pick<InviteTrust, 'getProfileByFingerpr
   }
 }
 
-/** May a credential that ARRIVED from `senderFp` be accepted? Only from a mutual-verified peer. */
-export function credentialAcceptFrom(trust: Pick<InviteTrust, 'getProfileByFingerprint'>, senderFp: string): boolean {
+/**
+ * May a credential that ARRIVED from `senderFp` be accepted? Only from a mutual-verified peer, and,
+ * when our key is given, only if the pairing is bound to it (the same check credentialSendKey makes).
+ */
+export function credentialAcceptFrom(trust: Pick<InviteTrust, 'getProfileByFingerprint'>, senderFp: string, ownIdentityPubHex?: string): boolean {
   try {
     const p = trust.getProfileByFingerprint(String(senderFp || '').toLowerCase());
-    return !!p && p.pairingState === 'mutual-verified' && !!p.peerIdentityPub;
+    if (!p || p.pairingState !== 'mutual-verified' || !p.peerIdentityPub || !KEY.test(p.peerIdentityPub)) return false;
+    if (ownIdentityPubHex === undefined) return true;
+    return !!p.pairingId && p.pairingId === derivePairingId(Buffer.from(ownIdentityPubHex, 'hex'), Buffer.from(p.peerIdentityPub, 'hex'));
   } catch {
     return false;
   }

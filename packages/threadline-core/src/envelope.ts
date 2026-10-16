@@ -98,7 +98,10 @@ export class EnvelopeCrypto {
     return { ...envelope, signature: signature.toString('base64') };
   }
 
-  /** Verify the sender's signature, then decrypt. Throws on any failure (never returns plaintext unverified). */
+  /**
+   * Verify the sender's signature, then decrypt. Throws on any failure (never returns plaintext
+   * unverified). It does NOT check that `to` is you, the envelope's age, or replay: the caller owns those.
+   */
   decrypt(envelope: MessageEnvelope, senderEdPubKey: Buffer, senderX25519PubKey: Buffer): PlaintextMessage {
     // The static key must belong to the identity that signed; a caller cannot pair one sender's
     // signature with another key's secret.
