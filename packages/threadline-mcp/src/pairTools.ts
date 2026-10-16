@@ -38,11 +38,11 @@ export class PairTools {
   /** Unpaired agents that claim the display name of a paired one: a rotation or an impostor, never the same agent (D8). */
   private lookalikes(paired: Array<{ agent: string; fingerprint?: string }>): Array<{ agent: string; fingerprint: string; claimsNameOf: string; note: string }> {
     const pinnedFps = new Set(paired.map((p) => String(p.fingerprint || '').toLowerCase()));
-    const byName = new Map(paired.map((p) => [p.agent.trim().toLowerCase(), p]));
+    const byName = new Map(paired.map((p) => [p.agent.normalize('NFKC').trim().toLowerCase(), p]));
     return (this.deps.knownAgents?.() ?? [])
-      .filter((k) => !pinnedFps.has(k.fingerprint.toLowerCase()) && byName.has(k.name.trim().toLowerCase()))
+      .filter((k) => !pinnedFps.has(k.fingerprint.toLowerCase()) && byName.has(k.name.normalize('NFKC').trim().toLowerCase()))
       .map((k) => {
-        const p = byName.get(k.name.trim().toLowerCase())!;
+        const p = byName.get(k.name.normalize('NFKC').trim().toLowerCase())!;
         return { agent: k.name, fingerprint: k.fingerprint, claimsNameOf: String(p.fingerprint), note: `Claims the name of "${p.agent}", which you are paired with, but has a different key, so it is not that pairing. If that agent changed its identity, unpair the old one and pair again.` };
       });
   }

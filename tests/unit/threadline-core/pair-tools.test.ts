@@ -176,9 +176,10 @@ describe('pair tools', () => {
     await A.tools(person([{ decision: 'finish' }]).elicit).finish({});
     await tick(); await pump(wire, [A, B]);
     const impostor = 'd'.repeat(32);
-    const known = [{ fingerprint: B.fp, name: 'carl' }, { fingerprint: impostor, name: 'Carl ' }, { fingerprint: 'e'.repeat(32), name: 'someone' }];
+    const wide = 'a'.repeat(32);
+    const known = [{ fingerprint: B.fp, name: 'carl' }, { fingerprint: impostor, name: 'Carl ' }, { fingerprint: wide, name: 'ｃａｒｌ' }, { fingerprint: 'e'.repeat(32), name: 'someone' }];
     const st = new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, knownAgents: () => known }).status() as { lookalikes: Array<Record<string, string>> };
-    expect(st.lookalikes).toEqual([expect.objectContaining({ fingerprint: impostor, claimsNameOf: B.fp })]);
+    expect(st.lookalikes).toEqual([expect.objectContaining({ fingerprint: impostor, claimsNameOf: B.fp }), expect.objectContaining({ fingerprint: wide, claimsNameOf: B.fp })]);
     expect(st.lookalikes[0].note).toMatch(/different key/);
     expect(new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, knownAgents: () => known.slice(0, 1) }).status()).not.toHaveProperty('lookalikes');
   });

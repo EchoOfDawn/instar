@@ -140,4 +140,13 @@ describe('optional check code', () => {
     const others = new Set([checkCode(K, key(), b), checkCode(K, a, key()), checkCode(macKey('1'.repeat(64), 'a'.repeat(32)), a, b)]);
     expect(others.has(c)).toBe(false);
   });
+
+  it('cleanLabel removes bidi overrides, zero-width and control characters, and NFKC-normalises (SEC-12)', () => {
+    expect(cleanLabel('ca\u202Erl')).toBe('carl');
+    expect(cleanLabel('c\u200Ba\u200Dr\uFEFFl')).toBe('carl');
+    expect(cleanLabel('ca\u2066rl\u2069')).toBe('carl');
+    expect(cleanLabel('\u0085carl\u009b')).toBe('carl');
+    expect(cleanLabel('ｃａｒｌ')).toBe('carl'); // full-width letters fold to ASCII
+    expect(cleanLabel('Échø agent')).toBe('Échø agent'); // ordinary letters and spaces are kept
+  });
 });

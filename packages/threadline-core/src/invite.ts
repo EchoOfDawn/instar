@@ -53,8 +53,18 @@ export type DecodeResult = { ok: true; invite: PairingInvite } | { ok: false; re
 const HEX = (n: number) => new RegExp(`^[0-9a-f]{${n * 2}}$`);
 
 /** Self-described labels: trimmed, control characters removed, capped. */
+/**
+ * A name the OTHER agent chose, made safe to show a person or a model (Echo's review of #2192, SEC-12):
+ * NFKC-normalised; control characters (C0, C1), bidirectional overrides and isolates, and zero-width
+ * characters removed, so a name cannot reorder or hide text in a question or an inbox line. Display
+ * only: labels are not part of the signed transcript.
+ */
 export function cleanLabel(s: unknown): string {
-  return String(s ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, MAX_LABEL);
+  return String(s ?? '')
+    .normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '')
+    .trim()
+    .slice(0, MAX_LABEL);
 }
 
 function b64url(buf: Buffer): string {
