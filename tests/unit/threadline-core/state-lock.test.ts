@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireStateLock, parseLock } from '../../../packages/threadline-mcp/src/stateLock.js';
+import { acquireStateLock, parseLock, friendlyAppName } from '../../../packages/threadline-mcp/src/stateLock.js';
 import { notOwnerRefusal } from '../../../packages/threadline-mcp/src/pairTools.js';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { generateIdentityKeyPair } from '@sagemindai/threadline-core';
@@ -54,6 +54,22 @@ describe('state lock', () => {
     expect(parseLock('garbage')).toEqual({ pid: null, app: null });
   });
 
+  it('maps MCP client names to what a person calls the app (case-insensitive substring), else the raw name, else "another app"', () => {
+    expect(friendlyAppName('claude-ai')).toBe('Claude Desktop');
+    expect(friendlyAppName('Claude-AI-desktop')).toBe('Claude Desktop');
+    expect(friendlyAppName('claude-code')).toBe('Claude Code');
+    expect(friendlyAppName('cursor-vscode')).toBe('Cursor'); // cursor wins: it is checked before vscode
+    expect(friendlyAppName('Visual Studio Code')).toBe('VS Code');
+    expect(friendlyAppName('vscode-insiders')).toBe('VS Code');
+    expect(friendlyAppName('codex-mcp-client')).toBe('the ChatGPT app');
+    expect(friendlyAppName('ChatGPT')).toBe('the ChatGPT app');
+    expect(friendlyAppName('goose')).toBe('Goose');
+    expect(friendlyAppName('my-host')).toBe('my-host');
+    expect(friendlyAppName('  ')).toBe('another app');
+    expect(friendlyAppName(undefined)).toBe('another app');
+    expect(friendlyAppName('bad\nname')).toBe('bad name');
+  });
+
   it('the non-owner refusal names the app in plain words, never a pid or a setting', () => {
     expect(notOwnerRefusal('Claude Desktop')).toBe('Tell your person this, in these words: "Pairing is open in Claude Desktop. Finish it there, or close that app and try again."');
     expect(notOwnerRefusal(null)).toContain('Pairing is open in another app.');
@@ -75,6 +91,30 @@ describe('a threadline-mcp that does not own pairing', () => {
   async function pump(wire: { out: Env[] }, agents: Array<ReturnType<typeof mk>>) {
     while (wire.out.length) { const e = wire.out.shift()!; const to = agents.find((a) => a.fp === e.to); if (to) await to.p.receive(e as never); }
   }
+
+  it('ownership is live: an instance that takes over re-reads the stores and then handles pairing ops (becomeOwner)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = mk('a', wire), B = mk('b', wire);
+    let owns = false;
+    const k = B.k;
+    const B2 = { fp: B.fp, p: new StandalonePairing({ stateDir: B.dir, identity: { fp: B.fp, publicKey: k.publicKey, privateKey: k.privateKey }, ownName: () => ({ owner: 'o', agent: 'b' }), sendEnvelope: (e) => wire.out.push(e as Env), relayHttpBase: null, ownsPairing: () => owns }) };
+    // The owner B accepts A's invite AFTER B2 started; then B exits and B2 takes over.
+    const inv = A.p.flow.createInvite() as { ok: true; iid: string; message: string };
+    const r = await B.p.flow.receiveInvite(inv.message) as { iid: string };
+    B.p.flow.approveAccept(r.iid);
+    await pump(wire, [A, B]);
+    expect(B2.p.send(A.fp, 'x', { credential: true })).toEqual({ sent: false, reason: 'not-pairing-owner' });
+    owns = true;
+    expect(B2.p.keys.getProfileByFingerprint(A.fp)).toBeFalsy(); // stale in-memory stores until re-read
+    B2.p.becomeOwner();
+    expect(B2.p.keys.getProfileByFingerprint(A.fp)).toBeTruthy();
+    // A's Finish now reaches B2 (B is gone) and is handled as owner: mutual-verified.
+    A.p.flow.approveFinish(inv.iid);
+    await tick();
+    await pump(wire, [A, B2 as never]);
+    expect(B2.p.keys.isCredentialShareAllowedByFingerprint(A.fp)).toBe(true);
+    expect(B2.p.send(A.fp, 'secret', { credential: true })).toMatchObject({ sent: true, encrypted: true });
+  });
 
   it('refuses credentials and pairing messages, and sees pins the owner made after it started', async () => {
     const wire = { out: [] as Env[] };

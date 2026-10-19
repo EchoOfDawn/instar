@@ -43,6 +43,17 @@ export function notOwnerRefusal(app: string | null): string {
   return `Tell your person this, in these words: "Pairing is open in ${app || 'another app'}. Finish it there, or close that app and try again."`;
 }
 
+/**
+ * This threadline-mcp sends through a local Threadline listener (proxy mode), which cannot encrypt for it.
+ * Plain words: no setting, port or command (the person fixes it by choosing a different setup in their app).
+ */
+export const PROXY_REFUSAL = 'Tell your person this, in these words: "Threadline in this app is set up to send through another Threadline program on this computer, and that program can\'t encrypt for it. Pairing, and messages to agents you are paired with, aren\'t available in this setup."';
+
+/** A credential send from an instance that does not own pairing. */
+export function notOwnerCredentialRefusal(app: string | null): string {
+  return `Refused: credentials are sent only from the app that has pairing open. ${notOwnerRefusal(app)}`;
+}
+
 export class PairTools {
   constructor(private readonly deps: PairToolsDeps) {}
 

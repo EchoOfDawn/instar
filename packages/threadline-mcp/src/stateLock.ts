@@ -34,6 +34,22 @@ export function parseLock(text: string): { pid: number | null; app: string | nul
 }
 const clean = (name: string) => name.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 100);
 
+/**
+ * What a person calls the app, from the MCP client name it sent at initialize (case-insensitive
+ * substring match). Unknown names are kept as sent; an empty name is "another app".
+ */
+export function friendlyAppName(raw: string | null | undefined): string {
+  const n = clean(String(raw ?? ''));
+  const l = n.toLowerCase();
+  if (l.includes('claude-ai')) return 'Claude Desktop';
+  if (l.includes('claude-code')) return 'Claude Code';
+  if (l.includes('cursor')) return 'Cursor';
+  if (l.includes('visual studio code') || l.includes('vscode')) return 'VS Code';
+  if (l.includes('codex') || l.includes('chatgpt')) return 'the ChatGPT app';
+  if (l.includes('goose')) return 'Goose';
+  return n || 'another app';
+}
+
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; } };
 
 export function acquireStateLock(stateDir: string, pid = process.pid): StateLock {

@@ -10,7 +10,7 @@ The page refuses any request whose Host is not exactly `127.0.0.1:<port>` (and a
 
 Apps with elicitation are unchanged: the choice is made by the client's declared elicitation capability alone, never by the app's name.
 
-A threadline-mcp that does not own pairing now refuses in plain words that name the owning app ("Pairing is open in <app>. Finish it there, or close that app and try again."), never a pid or a setting. The owner records its MCP client's name on the second line of its owner lock; a lock holding only a pid (0.5.x) is still read.
+A threadline-mcp that does not own pairing now refuses in plain words that name the owning app ("Pairing is open in Claude Desktop. Finish it there, or close that app and try again."), never a pid or a setting. The owner records the app's name (mapped from its MCP client name to what a person calls it: Claude Desktop, Claude Code, Cursor, VS Code, the ChatGPT app, Goose) on the second line of its owner lock; a lock holding only a pid (0.5.x) is still read. Ownership is live: when the owning app closes, the next pairing step or credential send in another app takes ownership and works there. The proxy-mode and credential refusals are plain words too, with no setting names, ports or file paths.
 
 The README now has a no-terminal install section per app: Claude Desktop (one-click extension, coming with this release), Cursor and VS Code (install links pinned to `threadline-mcp@0.6.0`), ChatGPT desktop (settings), and Claude Code (ask your agent). Every route except the Claude Desktop extension needs Node.js, from the nodejs.org installer.
 
