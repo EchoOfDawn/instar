@@ -4278,6 +4278,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Bounded twice: the state machine's wall-clock budget, and an iteration cap that holds even if
     // the clock or the sleep misbehaves (No Unbounded Loops).
     const maxIterations = Math.ceil(CONFINED_STARTUP_BUDGET_MS / 500) + 20;
+    this.confinedStartupHolders.add(tmuxSession);
+    try {
     for (let iteration = 0; ; iteration++) {
       if (iteration >= maxIterations) { failNow('startup-iteration-cap', 'starting'); break; }
       await sleep(500);
@@ -4293,6 +4295,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // dialog on screen, and only then press Enter: a dialog that appeared in between must never
         // receive the Enter (spec D2, `ready` row).
         try {
+          // confined-write-allowed: the D2 startup driver itself, which holds this session in confinedStartupHolders; the line is instar-built from a validated path
           withSyncOp(() => execFileSync(this.config.tmuxPath, buildLiteralSendArgs(`=${tmuxSession}:`, line), { encoding: 'utf-8', timeout: 5000 }));
         } catch { failNow('fixed-line-not-typed', 'ready'); break; }
         await sleep(300);
@@ -4332,6 +4335,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
       if (state.phase === 'delivered') return true;
       if (state.phase === 'failed') break;
+    }
+    } finally {
+      this.confinedStartupHolders.delete(tmuxSession);
     }
     this.reportConfinedDialog(tmuxSession, `startup ${state.failure?.rule ?? 'unknown'} (observed ${state.failure?.observation ?? 'unknown'})`, capture());
     try { this.killSession(session.id); } catch { /* @silent-fallback-ok — the lifetime cap still ends it */ }
@@ -5744,15 +5750,25 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * D3). Killing it stays allowed. Refusals are logged once per session.
    */
   private confinedWriteRefused(tmuxSession: string, what: string): boolean {
+    // The D2 startup driver is the ONLY writer allowed into a confined session, and only while it
+    // holds the session (from its first capture to `delivered` or `failed`).
+    if (this.confinedStartupHolders.has(tmuxSession)) return false;
     const session = this.state.listSessions({ status: 'running' }).find((s) => s.tmuxSession === tmuxSession);
-    if (!session?.confinedConfigHome || !session.confinedDeliveredAt) return false;
+    if (!session?.confinedConfigHome) return false;
     if (!this.confinedWriteRefusals.has(session.id)) {
       this.confinedWriteRefusals.add(session.id);
-      console.warn(`[SessionManager] refused ${what} into delivered confined session "${tmuxSession}" (D3: no Instar writer may press a key in it after delivery)`);
+      console.warn(`[SessionManager] refused ${what} into confined session "${tmuxSession}" (D3: only the startup driver may press a key in a confined session)`);
     }
     return true;
   }
   private readonly confinedWriteRefusals = new Set<string>();
+  /** tmux sessions the D2 startup driver currently holds (the one writer a confined session admits). */
+  private readonly confinedStartupHolders = new Set<string>();
+
+  /** Public form of the D3 guard for writers outside SessionManager (the server's tmuxOps.sendKeys). */
+  isConfinedWriteRefused(tmuxSession: string): boolean {
+    return this.confinedWriteRefused(tmuxSession, 'text');
+  }
 
   sendKey(tmuxSession: string, key: string): boolean {
     if (this.confinedWriteRefused(tmuxSession, `key ${key}`)) return false;
@@ -5780,6 +5796,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * stays synchronous because its timing IS the correctness mechanism).
    */
   private async sendKeyAsync(tmuxSession: string, key: string): Promise<boolean> {
+    if (this.confinedWriteRefused(tmuxSession, `key ${key}`)) return false;
     if (this.tmuxInflightCount >= this.tmuxMaxInFlight) return false;
     this.tmuxInflightCount += 1;
     try {
@@ -8018,6 +8035,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
 
   /** The sole tmux mutation body; Stage B calls it only while holding the physical-effect lease. */
   private performTmuxInjectionEffect(tmuxSession: string, text: string, framework: string | null): void {
+    // D3 (docs/specs/confined-spawn-subscription-reroute.md): the real text chokepoint. A confined
+    // session takes text from no Instar writer (prompt delivery, control commands, retries).
+    if (this.confinedWriteRefused(tmuxSession, 'text')) return;
     const exactTarget = `=${tmuxSession}:`;
     const postPasteDelaySec = framework === 'codex-cli' ? '1.5' : '0.5';
     const enterPresses = framework === 'codex-cli' ? 2 : 1;
@@ -8318,6 +8338,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   private performStuckInputKeyEffect(target: string, tmuxPath: string, attempt: number): void {
+    // D3: the stuck-input recovery keys are raw sends; a confined session takes none of them.
+    if (this.confinedWriteRefused(target.replace(/^=/, '').replace(/:$/, ''), 'stuck-input recovery key')) return;
     if (attempt === 0 || attempt === 1) {
       withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
     } else if (attempt === 2) {
@@ -8404,6 +8426,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // If we don't accept, any injected text selects "No" and crashes the session.
     const fullText = lines.join('\n');
     if (fullText.includes('Yes, I accept') && fullText.includes('No, exit')) {
+      // D3: a confined session's only answerer is its startup driver (exact-match frames); this
+      // generic auto-accept never presses a key in one. Readiness stays false; the driver decides.
+      if (this.confinedWriteRefused(tmuxSession, 'consent auto-accept keys')) return false;
       console.log(`[SessionManager] Consent dialog detected in "${tmuxSession}" — auto-accepting`);
       try {
         // Press Down to select "Yes, I accept", then Enter to confirm

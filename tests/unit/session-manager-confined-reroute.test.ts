@@ -318,17 +318,28 @@ describe('D3 and the restart boundary', () => {
     expect(sentKeys).toEqual([]);
   });
 
-  it('after delivery, no Instar writer can press a key or type into a confined session; before delivery, the driver can', async () => {
+  it('no Instar writer can press a key or type into a confined session, before or after delivery; only the startup driver while it holds it', async () => {
     const { manager, state } = makeManager(tmpDir);
     const before = rec('conf-before', { confinedConfigHome: '/cfg', launchLane: 'rerouted-interactive' });
     const after = rec('conf-after', { confinedConfigHome: '/cfg', launchLane: 'rerouted-interactive', confinedDeliveredAt: new Date().toISOString() });
-    for (const s of [before, after]) { state.saveSession(s); mockTmuxSessions.add(s.tmuxSession); }
-    expect(manager.sendKey(before.tmuxSession, 'Enter')).toBe(true);
-    expect(manager.injectMessage(before.tmuxSession, 'x', { firstParty: { source: 'test' } })).toBe(true);
+    const headless = rec('conf-headless', { confinedConfigHome: '/cfg', launchLane: 'headless' });
+    const plain = rec('plain', {});
+    for (const s of [before, after, headless, plain]) { state.saveSession(s); mockTmuxSessions.add(s.tmuxSession); }
     sentKeys.length = 0;
-    expect(manager.sendKey(after.tmuxSession, 'Enter')).toBe(false);
-    expect(manager.injectMessage(after.tmuxSession, 'nudge', { firstParty: { source: 'test' } })).toBe(false);
-    expect(sentKeys).toEqual([]);
+    for (const s of [before, after, headless]) {
+      expect(manager.sendKey(s.tmuxSession, 'Enter')).toBe(false);
+      expect(manager.injectMessage(s.tmuxSession, 'nudge', { firstParty: { source: 'test' } })).toBe(false);
+      expect(manager.injectInternalControlCommand(s.tmuxSession, s.tmuxSession, '/compact')).toBe(true); // returns true (legacy contract) but...
+      expect(manager.isConfinedWriteRefused(s.tmuxSession)).toBe(true);
+    }
+    expect(sentKeys).toEqual([]); // ...nothing reached tmux, including the /compact control command
+    expect(manager.sendKey(plain.tmuxSession, 'Enter')).toBe(true);
+    expect(manager.isConfinedWriteRefused(plain.tmuxSession)).toBe(false);
+    // The driver's own keys pass while it holds the session (proved end to end by the driver tests above).
+    (manager as unknown as { confinedStartupHolders: Set<string> }).confinedStartupHolders.add(before.tmuxSession);
+    expect(manager.sendKey(before.tmuxSession, 'Down')).toBe(true);
+    (manager as unknown as { confinedStartupHolders: Set<string> }).confinedStartupHolders.delete(before.tmuxSession);
+    expect(manager.sendKey(before.tmuxSession, 'Down')).toBe(false);
     expect(manager.killSession(after.id)).toBe(true); // ending it stays allowed
   });
 

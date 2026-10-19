@@ -14,7 +14,7 @@ Interactive mode shows two start-up questions that one-shot mode skips: "do you 
 - "Yes, trust this folder", but only when the question names the exact folder the executor just built itself. That folder's own settings, hooks and plug-in servers are already switched off by the lock, which is the thing the question protects against.
 - "No browser tools", which is the safe default.
 
-Any other question, or a question that looks slightly different, means nothing is typed and the session is stopped with a clear error. It never guesses. Once the task has been handed over, nothing in Instar can press a key or type into that session again; it can only be stopped.
+Any other question, or a question that looks slightly different, means nothing is typed and the session is stopped with a clear error. It never guesses. From the moment a locked session starts, nothing in Instar can press a key or type into it except that start-up script, and only while it is running; afterwards the session can only be stopped. A test lists every place Instar presses tmux keys and checks each one either asks that rule first or is named with a reason.
 
 One limit, said plainly: a question could appear in the few milliseconds between the last look at the screen and a key press. The locks set at launch cannot be changed that way; Claude's own file permissions could be, in principle. Right after the task is submitted, the screen is checked again and the session is stopped if anything changed, so this is caught, not prevented. The other choice was to keep refusing, which means no locked session ever runs on this agent.
 
