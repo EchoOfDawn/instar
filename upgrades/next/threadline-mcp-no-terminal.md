@@ -19,3 +19,5 @@ Pairing is approved by you, through your app asking you directly. Claude Code ca
 - `tests/unit/threadline-core/pair-tools.test.ts`: without elicitation, open, finish and forget all return the same refusal, which names Claude Code and says pairing isn't available here, and contains none of "terminal", "npx", "THREADLINE_PAIR_TERMINAL" or "command"; status, invite and cancel still work. Putting "terminal" back into the refusal makes this test fail.
 - `tests/e2e/threadline/threadline-mcp-stdio-pairing.test.ts`: the built server over stdio still pairs with a real Instar agent through elicitation and delivers a credential, now without the terminal setting.
 - `tests/unit/threadline-core/pair-socket.test.ts` is deleted with the code it tested.
+
+- threadline-mcp now exits when the app closes its connection (stdin end or transport close). Before, it lingered holding the state folder's owner lock and the relay connection, so a server the app restarted could not pair.

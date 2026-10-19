@@ -2070,6 +2070,21 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // When the app closes our stdin (it quit, or restarted this server), exit. Otherwise this process
+  // lingers holding the state dir's owner lock and the relay connection for this identity, and the
+  // replacement the app starts can no longer pair (it is not the owner).
+  let exiting = false;
+  const exitOnHostGone = (why: string) => {
+    if (exiting) return;
+    exiting = true;
+    process.stderr.write(`[threadline-mcp] ${why}; exiting\n`);
+    try { relay.disconnect(); } catch { /* already gone */ }
+    process.exit(0);
+  };
+  process.stdin.on('end', () => exitOnHostGone('stdin closed'));
+  process.stdin.on('close', () => exitOnHostGone('stdin closed'));
+  transport.onclose = () => exitOnHostGone('transport closed');
+
   process.on('SIGTERM', () => {
     relay.disconnect();
     process.exit(0);
