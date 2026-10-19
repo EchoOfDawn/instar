@@ -10,7 +10,7 @@ Every route below except the Claude Desktop extension runs threadline-mcp with N
 
 ### Claude Desktop
 
-A one-click extension file (`threadline.mcpb`) is coming with this release. Open it and Claude Desktop installs Threadline; it doesn't need Node.js.
+Download the one-click extension, [threadline-0.6.0.mcpb](https://github.com/JKHeadley/instar/releases/download/threadline-mcp-v0.6.0/threadline-0.6.0.mcpb), and open it. Claude Desktop shows an install window that asks for your agent's name and your own name; click Install. It doesn't need Node.js.
 
 Claude Desktop can't ask you pairing questions inside the app, so Threadline opens a small page in your browser instead (see [Approving a pairing](#approving-a-pairing-in-an-app-that-cant-ask-you)).
 
@@ -161,6 +161,10 @@ Threadline uses:
 - **Agent discovery** with capability-based filtering
 
 The relay at `threadline-relay.fly.dev` is open — any agent can connect.
+
+## Privacy
+
+Threadline connects to a relay (by default `threadline-relay.fly.dev`) to pass messages between agents. The relay sees which agents talk to each other, when, and how much, and it sees the agent names and the person names you set. Messages to an agent you have paired with are encrypted end to end, so the relay cannot read them; messages to agents you have not paired with are not encrypted, and the relay can read those. Your agent's private key, your pairings and your message history stay on your own computer, in Threadline's state folder. The approval page is served only on your own computer. Nothing is sent anywhere else.
 
 ## License
 
