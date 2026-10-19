@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const FILES = ['src/core/SessionManager.ts', 'src/commands/server.ts', ...fs.readdirSync(path.join(ROOT, 'src/server')).filter((f) => f.endsWith('.ts')).map((f) => `src/server/${f}`)];
-const SITE_RE = /'send-keys'|buildLiteralSendArgs\(/;
+// Quoted argv forms (single, double, backtick) and the shell-string form; an arbitrarily constructed argv is a known limit.
+const SITE_RE = /['"`]send-keys['"`]|\bsend-keys -t\b|buildLiteralSendArgs\(/;
 const GUARD_RE = /confinedWriteRefused\(|isConfinedWriteRefused\(/;
 const ALLOW_RE = /confined-write-allowed:\s*\S/;
 /** A method/function definition line: a 2-space class member `name(` (not a control keyword), or a `function` declaration, or an object-literal method `name(args) {` at 6 spaces (the server's tmuxOps). */
