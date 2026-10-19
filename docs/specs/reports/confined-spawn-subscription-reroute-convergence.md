@@ -1,8 +1,10 @@
 # Convergence Report — Confined spawns on the subscription path
 
-## ⚠ Convergence status: CONVERGENCE-FAILED at the 10-round hard cap (final round clean)
+## Converged at round 12 (rounds 10, 11 and 12 each without a design-class finding)
 
-Round 10 produced **zero design-class findings**. Both external families returned MINOR, with only precision items, which are folded in. Round 9 produced one design-class finding: `ready` was defined only by absence, now a positive composer check, fixed and tested. The skill's criterion is two CONSECUTIVE rounds without design-class findings, and the hard cap is 10, so this run stops here. Per the skill, a retry needs a decision from a human or the coordinating session. One more round on the current text would most likely converge. **No `review-convergence` tag has been written.**
+The first run stopped at the 10-round hard cap with one clean round (round 10). The coordinating session approved up to two more rounds (a desk-level process decision). Rounds 11 and 12 both came back MINOR from both external families, with every finding declared a refinement ("no finding invalidates the architecture"), and were folded in. By the skill's rule (the reviewer declares the class; two consecutive clean rounds), the spec converged at round 12.
+
+**Author's disclosure on classification.** Two round-11/12 refinements changed behaviour, not only text, and the author would have been inclined to call one of them design-class had the reviewers not declared otherwise: the D3 totality point (the exclusion enumerated two answerers while claiming that no Instar writer could press a key after delivery). It is now enforced at the `sendKey`/`rawInject` chokepoint and pinned by a test, rather than argued. The other, the trust-focus rule (an unexpected focused option now fails at once instead of at the 5 s deadline), tightens a tolerance.
 
 ## Cross-model review: codex-cli:gpt-6-astra
 
@@ -48,6 +50,8 @@ The feedback system writes fixes in a locked sandbox. This agent runs Claude onl
 | 8 | codex 3 | (clean-door no output) | ran (2 flags) | Goal narrowed (Frontloaded 6), post-submit state, canary bound, P20 table |
 | 9 | clean-door 1 | codex 3; clean-door 3 | ran (2 flags) | positive composer shape |
 | 10 | **0** | codex 3; clean-door 5 | ran (1 flag: Framework-Agnostic, the parent spec's accepted gap) | precision only |
+| 11 | **0** (both families MINOR) | codex 3; clean-door 4 | ran (1 flag: Verify the State — the post-submit check, already declared detection-not-prevention) | table restructured per state; restart precedence; charged-claims wording; post-submit check samples up to 3 frames; whitespace-path refusal by name |
+| 12 | **0** (both families MINOR) | codex 4; clean-door 4 | ran (2 standing flags: Framework-Agnostic; Verify the State, both argued) | deadline-before-observation precedence; focus enumeration; build-only failure argument; completion/persistence ordering; 120 s budget with basis; D3 enforced at the send chokepoint; timing-constant basis |
 
 Standing gate flags that were argued rather than changed:
 - **Framework-Agnostic:** the parent spec's explicit, accepted gap; confinement is claude-code only by canary eligibility.
@@ -86,6 +90,12 @@ The executor's session canary was run twice through this branch's built `Session
 
 The single failing probe, `session-git-status`, fails because Claude Code 2.1.303's Bash wrapper writes `/tmp/claude-501/cwd-*`, which the executor's sandbox policy denies (it allows `/tmp/claude`). Every Bash command therefore exits 1. That is in the executor's sandbox policy, outside this spec, and is the next executor blocker.
 
+## Round 11 and 12 findings
+
+- **R11 codex:** table placement of the two-frame tolerance; restart precedence (jobSlug × confined); "daily start" meaning. **R11 clean door:** single-sample post-submit check; option-B/upstream asymmetry; table clarity; whitespace-path precondition.
+- **R12 codex:** dismissal deadline behind the wait rule; focus-mismatch outcomes; build-only startup failures; completion racing persistence. **R12 clean door:** 90 s budget headroom; D3 totality; bespoke-expect pattern; timing constants.
+All addressed in text or code; the upstream request and the option-B question remain the coordinating session's (not filed, per its instruction).
+
 ## Convergence verdict
 
-Not converged at the 10-round cap: one quiet round (round 10) where two are required. The design is stable: the last two rounds' findings were all precision except the composer check, which is built and tested. Recommended: one more round under a fresh run, which would either converge or surface a real defect.
+Converged at iteration 12. No design-class findings in rounds 10, 11 or 12. Spec is ready for approval.

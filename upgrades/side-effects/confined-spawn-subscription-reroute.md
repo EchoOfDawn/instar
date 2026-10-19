@@ -3,7 +3,7 @@
 **Version / slug:** `confined-spawn-subscription-reroute`
 **Date:** `2026-10-19`
 **Author:** `Echo`
-**Spec:** `docs/specs/confined-spawn-subscription-reroute.md` (converged; see its report)
+**Spec:** `docs/specs/confined-spawn-subscription-reroute.md` (converged at round 12; see its report)
 **Second-pass reviewer:** required (session lifecycle, confinement, a gate). See the end of this file.
 
 ## Summary of the change
@@ -13,7 +13,7 @@ Under `intelligence.subscriptionPath.mode: force` (the operated host's mode), `S
 - no agent authority in the tmux env;
 - the prompt delivered as a 0600 file behind one fixed typed line (D1);
 - a deterministic startup state machine that answers only the measured trust dialog (exact path, verified focus) and the browser offer's safe default, and kills the session on anything else (D2);
-- generic auto-answerers (PermissionPromptAutoResolver, PromptGate) skip confined sessions (D3);
+- generic auto-answerers (PermissionPromptAutoResolver, PromptGate) skip confined sessions, and after delivery `sendKey`/`rawInject` refuse every key or text to a confined session (D3, enforced at the chokepoint);
 - boot kills an undelivered confined rerouted session;
 - the executor defers claims while the lane is full and maps a typed `RerouteRefusedError` to `stopped` / `reroute-capacity`, with an exactly-once, capped start refund.
 
@@ -51,7 +51,7 @@ Under `intelligence.subscriptionPath.mode: force` (the operated host's mode), `S
 ## 5. Interactions
 
 - **Reroute cap/gate:** confined spawns count toward `maxRerouted` like any reroute.
-- **PromptGate/AutoApprover:** on the operated host the PromptGate is enabled with `autoApprove`. Without D3 its Enter on the trust dialog would select `No, exit`. D3 removes that race.
+- **PromptGate/AutoApprover and every other pane writer:** on the operated host the PromptGate is enabled with `autoApprove`. Without D3 its Enter on the trust dialog would select `No, exit`. D3 removes that race, and the post-delivery chokepoint refusal covers sentinel nudges and recovery keys too (a stuck confined session is ended by its lifetime cap or `killSession`, never nudged).
 - **OrphanProcessReaper:** cleans an untracked pane left by a crash between the tmux spawn and the first save.
 - **Restart adoption:** headless confined sessions are untouched by the new boot kill; it applies to the rerouted lane only.
 
