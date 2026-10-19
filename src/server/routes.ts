@@ -613,6 +613,8 @@ import { matchesSystemTemplate } from '../messaging/system-templates.js';
 import { resolvePendingRelayPath } from '../messaging/pending-relay-store.js';
 import Database from 'better-sqlite3';
 import { SUPPORTED_FRAMEWORKS } from '../core/TopicFrameworksStore.js';
+import { refuseUnsupportedFields } from './refuseUnsupportedFields.js';
+import { INITIATIVE_UPDATE_FIELDS } from '../core/InitiativeTracker.js';
 
 /**
  * Build the /whoami request handler.
@@ -6249,6 +6251,7 @@ export function createRoutes(ctx: RouteContext): Router {
   });
 
   router.put('/reflection/thresholds', (req, res) => {
+    if (refuseUnsupportedFields(res, req.body, ['toolCalls', 'sessions', 'minutes'])) return;
     const { toolCalls, sessions, minutes } = req.body;
     reflectionMetrics.updateThresholds({
       toolCalls: typeof toolCalls === 'number' ? toolCalls : undefined,
@@ -6288,6 +6291,7 @@ export function createRoutes(ctx: RouteContext): Router {
   });
 
   router.put('/homeostasis/thresholds', (req, res) => {
+    if (refuseUnsupportedFields(res, req.body, ['commits', 'minutes'])) return;
     const { commits, minutes } = req.body;
     homeostasisMonitor.updateThresholds({
       commits: typeof commits === 'number' ? commits : undefined,
@@ -19201,6 +19205,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
     try {
+      if (refuseUnsupportedFields(res, req.body, ['enabled', 'autoCreateTopics', 'mirrorExisting', 'allowList', 'denyList'])) return;
       const body = req.body as {
         enabled?: unknown;
         autoCreateTopics?: unknown;
@@ -19875,11 +19880,19 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
 
-    const status = normalizeAttentionStatus(req.body.status);
+    // `reason` is the alias the release-readiness wiring sends; `resolution` is the documented field.
+    if (refuseUnsupportedFields(res, req.body, ['status', 'resolution', 'reason'])) return;
+    const status = normalizeAttentionStatus(req.body?.status);
     if (!status) {
       res.status(400).json({ error: `"status" must be one of: ${ATTENTION_STATUSES.join(', ')} (aliases: resolved, done, ack, in_progress, wontdo, reopen)` });
       return;
     }
+    const rawResolution = req.body?.resolution ?? req.body?.reason;
+    if (rawResolution !== undefined && (typeof rawResolution !== 'string' || !rawResolution.trim())) {
+      res.status(400).json({ error: '"resolution" must be a non-empty string' });
+      return;
+    }
+    const resolution = typeof rawResolution === 'string' ? rawResolution.trim().slice(0, 2000) : undefined; // bounded-input-reviewed: stored display text on the attention item, never fed to a model
 
     // Standby-write reconciliation §3.4 (I1): admission first after validation.
     if (refuseInadmissibleWrite(req, res)) return;
@@ -19914,7 +19927,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       }
     }
 
-    const success = await ctx.telegram.updateAttentionStatus(req.params.id, status);
+    const success = await ctx.telegram.updateAttentionStatus(req.params.id, status, resolution === undefined ? undefined : { resolution });
     if (!success) {
       res.status(404).json({ error: 'Attention item not found' });
       return;
@@ -20132,6 +20145,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(400).json({ error: 'invalid initiative id' });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, INITIATIVE_UPDATE_FIELDS)) return;
     try {
       const updated = await ctx.initiativeTracker.update(req.params.id, req.body ?? {});
       res.json(updated);
@@ -22631,6 +22645,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'machine registry not available (single-machine install)' });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, ['nickname'])) return;
     const nickname = (req.body ?? {}).nickname;
     if (typeof nickname !== 'string') {
       res.status(400).json({ error: 'nickname (string) is required' });
@@ -23782,6 +23797,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
   });
 
   router.patch('/updates/config', (req, res) => {
+    if (refuseUnsupportedFields(res, req.body, ['autoApply'])) return;
     const { autoApply } = req.body ?? {};
     if (typeof autoApply !== 'boolean') {
       res.status(400).json({ error: 'autoApply must be a boolean' });
@@ -24240,6 +24256,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
 
+    if (refuseUnsupportedFields(res, req.body, ['title', 'markdown'])) return;
     const { title, markdown } = req.body;
     if (!title || typeof title !== 'string' || title.length > 256) {
       res.status(400).json({ error: '"title" must be a string under 256 characters' });
@@ -24572,6 +24589,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
 
+    if (refuseUnsupportedFields(res, req.body, ['title', 'markdown'])) return;
     const { title, markdown } = req.body;
     if (!title || typeof title !== 'string' || title.length > 256) {
       res.status(400).json({ error: '"title" must be a string under 256 characters' });
@@ -26293,6 +26311,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'Evolution system not configured' });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, ['status', 'resolution'])) return;
     const { status, resolution } = req.body;
     const validStatuses = ['proposed', 'approved', 'in_progress', 'implemented', 'rejected', 'deferred'];
     if (!status || !validStatuses.includes(status)) {
@@ -26409,6 +26428,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'Evolution system not configured' });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, ['appliedTo'])) return;
     const { appliedTo } = req.body;
     if (!appliedTo || typeof appliedTo !== 'string') {
       res.status(400).json({ error: '"appliedTo" is required' });
@@ -26467,6 +26487,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(503).json({ error: 'Evolution system not configured' });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, ['resolution'])) return;
     const { resolution } = req.body;
     if (!resolution || typeof resolution !== 'string') {
       res.status(400).json({ error: '"resolution" is required' });
@@ -28709,6 +28730,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
     const profileId = req.params.id;
+    if (refuseUnsupportedFields(res, req.body, ['service', 'identity', 'lastAsserted', 'lastVerifiedAt', 'note'])) return;
     const { service, identity, lastAsserted, lastVerifiedAt, note } = req.body || {};
     if (typeof service !== 'string' || !service || typeof identity !== 'string' || !identity) {
       res.status(400).json({ error: 'service and identity are required' });
@@ -28979,6 +29001,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const pinOk = pin.length === expected.length && pin.length > 0
       && timingSafeEqual(Buffer.from(pin), Buffer.from(expected));
     if (!pinOk) { res.status(403).json({ error: 'operator PIN required' }); return; }
+    if (refuseUnsupportedFields(res, req.body, ['pin', 'arm', 'outcome'])) return;
     const arm = req.body?.arm;
     const outcome = req.body?.outcome;
     if (!['standard', 'process'].includes(arm) || !['ratified', 'shipped', 'rejected', 'deferred'].includes(outcome)) {
@@ -29007,6 +29030,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const expected = ctx.config.dashboardPin ?? '';
     const pinOk = pin.length === expected.length && pin.length > 0 && timingSafeEqual(Buffer.from(pin), Buffer.from(expected));
     if (!pinOk) { res.status(403).json({ error: 'operator PIN required' }); return; }
+    if (refuseUnsupportedFields(res, req.body, ['pin', 'action', 'supersededBy', 'reason'])) return;
     const action = req.body?.action;
     let record = null;
     if (action === 'reopen') record = ctx.classReviewStore.reopen(req.params.dedupeKey);
@@ -30942,6 +30966,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!ctx.autonomyManager) {
       return res.status(404).json({ error: 'Autonomy system not configured' });
     }
+    // Merged as given, so an unknown key would be stored with no effect: refuse it instead.
+    if (refuseUnsupportedFields(res, req.body, ['evolutionDigest', 'trustElevationSuggestions', 'migrationNotifications'])) return;
     ctx.autonomyManager.setNotificationPreferences(req.body);
     res.json({ notifications: ctx.autonomyManager.getNotificationPreferences() });
   });
@@ -31164,6 +31190,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return res.status(404).json({ error: 'soul.md is not enabled for this agent' });
     }
 
+    if (refuseUnsupportedFields(res, req.body, ['section', 'operation', 'content', 'source'])) return;
     const { section, operation, content, source } = req.body;
 
     // Validate request
@@ -31344,6 +31371,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!ctx.memoryMonitor) {
       return res.status(404).json({ error: 'MemoryPressureMonitor not configured' });
     }
+    if (refuseUnsupportedFields(res, req.body, ['warning', 'elevated', 'critical'])) return;
     const { warning, elevated, critical } = req.body;
     const update: Partial<{ warning: number; elevated: number; critical: number }> = {};
 
@@ -34370,6 +34398,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, ['nickname', 'framework', 'configHome', 'status', 'lastQuota', 'lastUsedAt'])) return;
     try {
       const updated = ctx.subscriptionPool.update(
         req.params.id,
@@ -39108,6 +39137,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(400).json({ error: 'topicId must be a number' });
       return;
     }
+    if (refuseUnsupportedFields(res, req.body, ['autoApproveAll', 'relayAll'])) return;
     const { autoApproveAll, relayAll } = req.body ?? {};
     if (autoApproveAll !== undefined && typeof autoApproveAll !== 'boolean') {
       res.status(400).json({ error: 'autoApproveAll must be a boolean' });
