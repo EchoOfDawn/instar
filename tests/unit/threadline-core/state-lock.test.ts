@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireStateLock, parseLock, friendlyAppName, PairingOwnership, PID_REUSE_AGE_MS } from '../../../packages/threadline-mcp/src/stateLock.js';
+import { acquireStateLock, parseLock, friendlyAppName, PairingOwnership, PID_REUSE_AGE_MS, EMPTY_LOCK_GRACE_MS } from '../../../packages/threadline-mcp/src/stateLock.js';
 import { notOwnerRefusal } from '../../../packages/threadline-mcp/src/pairTools.js';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { generateIdentityKeyPair } from '@sagemindai/threadline-core';
@@ -68,6 +68,20 @@ describe('state lock', () => {
     expect(parseLock(fs.readFileSync(file, 'utf8')).pid).toBe(process.ppid);
     expect(b!.stillHeld()).toBe(true);
     expect(fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith('owner.lock.'))).toEqual([]); // nothing left behind
+  });
+
+  it('an empty lock is respected while young (a 0.5.x owner mid-write) and retired once older than the grace (Echo #2215 note 2)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-lock-empty-'));
+    const file = path.join(dir, 'threadline', 'owner.lock');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '');
+    const young = acquireStateLock(dir, process.pid);
+    expect(young.held).toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe(''); // not retired
+    const mtime = fs.statSync(file).mtimeMs;
+    const old = acquireStateLock(dir, process.pid, { now: () => mtime + EMPTY_LOCK_GRACE_MS + 1 });
+    expect(old.held).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe(String(process.pid));
   });
 
   it('a lock whose pid was reused (older than a day, process started after it) is stale; a fresh one is respected', () => {

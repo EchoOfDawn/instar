@@ -104,6 +104,9 @@ function createWithContent(file: string, content: string): boolean {
   }
 }
 
+/** How long an empty (pid-less) lock is treated as one still being written. */
+export const EMPTY_LOCK_GRACE_MS = 5_000;
+
 const readLock = (file: string) => { try { return { ...parseLock(fs.readFileSync(file, 'utf8')), mtimeMs: fs.statSync(file).mtimeMs }; } catch { return null; } };
 
 export function acquireStateLock(stateDir: string, pid = process.pid, hooks: LockHooks = {}): StateLock {
@@ -115,6 +118,9 @@ export function acquireStateLock(stateDir: string, pid = process.pid, hooks: Loc
     if (!cur) continue; // removed in between: try to create again
     if (cur.pid === pid) return heldLock(file, pid); // already ours (e.g. a re-acquire)
     if (cur.pid !== null && holderAlive(cur.pid, cur.mtimeMs, hooks.now?.())) return notHeldLock(file, cur.pid);
+    // A 0.5.x owner creates its lock empty and writes the pid just after; an empty lock that young is
+    // being written, not abandoned (Echo, #2215 note 2: otherwise a 0.6 instance retires a live 0.5 lock).
+    if (cur.pid === null && (hooks.now?.() ?? Date.now()) - cur.mtimeMs < EMPTY_LOCK_GRACE_MS) return notHeldLock(file, null);
     // Stale (dead holder, reused pid, or unreadable). Retire it without ever deleting a live lock.
     hooks.beforeRetire?.();
     const stale = `${file}.stale-${pid}-${crypto.randomBytes(6).toString('hex')}`;
