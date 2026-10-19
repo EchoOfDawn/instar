@@ -312,6 +312,9 @@ export function describeResult(r: ToolResult): string {
 
 type Fallback = 'link-in-chat';
 
+/** A different pairing step asked for while an approval page is open (Echo review MINOR b). */
+export const ANOTHER_OPEN = 'Another approval is already open in your browser; finish it first.';
+
 /**
  * At most one page session per server. `start` runs a pairing action with a page-backed elicit and
  * returns as soon as the action asks its first question (pending) or ends without asking (its own
@@ -325,6 +328,9 @@ export class ApprovalCoordinator {
   constructor(private readonly opts: ApprovalCoordinatorOptions) {}
 
   private async present(s: { action: ApprovalAction; page: ApprovalPage; fallback?: Fallback }): Promise<ToolResult> {
+    // Also used when the agent asks again while the page is open: the browser is opened again (the person
+    // may have closed the tab). Deliberately, if THAT open fails, the live page's link goes into the chat
+    // as the flagged 'link-in-chat' fallback, the same as when the first open fails (Echo review MINOR a).
     let opened = false;
     try { opened = await (this.opts.openBrowser ?? openInBrowser)(s.page.link); } catch { opened = false; }
     const expiresAt = new Date(s.page.expiresAt).toISOString();
@@ -336,7 +342,10 @@ export class ApprovalCoordinator {
   /** Throws if the page cannot listen (the caller then refuses in plain words). */
   async start(action: ApprovalAction, run: (elicit: Elicit) => Promise<ToolResult>): Promise<ToolResult> {
     // One page at a time: asking again re-opens the same page (the person may have closed the tab).
-    if (this.active && this.active.page.isOpen) return this.present(this.active);
+    if (this.active && this.active.page.isOpen) {
+      if (this.active.action !== action) return { ok: false, error: ANOTHER_OPEN };
+      return this.present(this.active);
+    }
     const page = await ApprovalPage.open({ timeoutMs: this.opts.timeoutMs, resultGraceMs: this.opts.resultGraceMs, postWaitMs: this.opts.postWaitMs, title: 'Threadline pairing' });
     const session: { action: ApprovalAction; page: ApprovalPage; fallback?: Fallback } = { action, page };
     this.active = session;

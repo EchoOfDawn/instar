@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireStateLock, parseLock, friendlyAppName } from '../../../packages/threadline-mcp/src/stateLock.js';
+import { acquireStateLock, parseLock, friendlyAppName, PairingOwnership, PID_REUSE_AGE_MS } from '../../../packages/threadline-mcp/src/stateLock.js';
 import { notOwnerRefusal } from '../../../packages/threadline-mcp/src/pairTools.js';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { generateIdentityKeyPair } from '@sagemindai/threadline-core';
@@ -54,6 +54,47 @@ describe('state lock', () => {
     expect(parseLock('garbage')).toEqual({ pid: null, app: null });
   });
 
+  it('takeover race: a second instance taking over between our read and our retire is never deleted; exactly one owner (SHOULD-FIX 1)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-lock-race-'));
+    const file = path.join(dir, 'threadline', 'owner.lock');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '2147483646'); // the owner exited
+    let b: ReturnType<typeof acquireStateLock> | null = null;
+    // A reads the dead holder; before A retires it, B (another live instance) takes over.
+    const a = acquireStateLock(dir, process.pid, { beforeRetire: () => { b = acquireStateLock(dir, process.ppid); } });
+    expect(b!.held).toBe(true);
+    expect(a.held).toBe(false);
+    expect(a.holderPid).toBe(process.ppid);
+    expect(parseLock(fs.readFileSync(file, 'utf8')).pid).toBe(process.ppid);
+    expect(b!.stillHeld()).toBe(true);
+    expect(fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith('owner.lock.'))).toEqual([]); // nothing left behind
+  });
+
+  it('a lock whose pid was reused (older than a day, process started after it) is stale; a fresh one is respected', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-lock-reuse-'));
+    const file = path.join(dir, 'threadline', 'owner.lock');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, String(process.ppid)); // a live process, but it started minutes ago
+    expect(acquireStateLock(dir, process.pid).held).toBe(false); // fresh lock: respected
+    const old = (Date.now() - PID_REUSE_AGE_MS - 60 * 60_000) / 1000;
+    fs.utimesSync(file, old, old);
+    expect(acquireStateLock(dir, process.pid).held).toBe(true); // written two days before that process started: reused pid
+  });
+
+  it('an owner whose lock was replaced stops acting as owner: credentials refused, no takeover of a live lock', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-lock-lost-'));
+    const own = new PairingOwnership(dir, process.pid);
+    expect(own.owns()).toBe(true);
+    const k = generateIdentityKeyPair();
+    const fp = k.publicKey.subarray(0, 16).toString('hex');
+    const p = new StandalonePairing({ stateDir: dir, identity: { fp, publicKey: k.publicKey, privateKey: k.privateKey }, ownName: () => ({ owner: 'o', agent: 'x' }), sendEnvelope: () => {}, relayHttpBase: null, ownsPairing: () => own.owns(), claimOwnership: () => own.ensure() });
+    fs.writeFileSync(path.join(dir, 'threadline', 'owner.lock'), `${process.ppid}\nCursor`); // another live instance replaced it
+    expect(own.owns()).toBe(false);
+    expect(p.send('c'.repeat(32), 'secret', { credential: true })).toEqual({ sent: false, reason: 'not-pairing-owner' });
+    expect(own.ensure()).toBe(false); // the new holder is alive
+    expect(own.holderApp()).toBe('Cursor');
+  });
+
   it('maps MCP client names to what a person calls the app (case-insensitive substring), else the raw name, else "another app"', () => {
     expect(friendlyAppName('claude-ai')).toBe('Claude Desktop');
     expect(friendlyAppName('Claude-AI-desktop')).toBe('Claude Desktop');
@@ -91,6 +132,33 @@ describe('a threadline-mcp that does not own pairing', () => {
   async function pump(wire: { out: Env[] }, agents: Array<ReturnType<typeof mk>>) {
     while (wire.out.length) { const e = wire.out.shift()!; const to = agents.find((a) => a.fp === e.to); if (to) await to.p.receive(e as never); }
   }
+
+  it('an inbound accept reaching a non-owner after the owner exited, before any tool call, takes ownership and is handled (SHOULD-FIX 2)', async () => {
+    const wire = { out: [] as Env[] };
+    const A = mk('a', wire), B = mk('b', wire);
+    const file = path.join(B.dir, 'threadline', 'owner.lock');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${process.ppid}\nClaude Desktop`); // B's process (simulated by ppid) owns pairing
+    const own = new PairingOwnership(B.dir, process.pid);
+    expect(own.owns()).toBe(false);
+    const B2 = { fp: B.fp, p: new StandalonePairing({ stateDir: B.dir, identity: { fp: B.fp, publicKey: B.k.publicKey, privateKey: B.k.privateKey }, ownName: () => ({ owner: 'o', agent: 'b' }), sendEnvelope: (e) => wire.out.push(e as Env), relayHttpBase: null, ownsPairing: () => own.owns(), claimOwnership: () => own.ensure() }) };
+    own.onAcquired = () => B2.p.becomeOwner();
+    // The owner made an invite, then exited.
+    const inv = B.p.flow.createInvite() as { ok: true; iid: string; message: string };
+    fs.writeFileSync(file, '2147483646');
+    // A's person opens and approves it; the plaintext accept reaches B2. No tool call on B2 first.
+    const r = await A.p.flow.receiveInvite(inv.message) as { iid: string };
+    expect(A.p.flow.approveAccept(r.iid)).toMatchObject({ ok: true });
+    await pump(wire, [A, B2 as never]);
+    expect(own.owns()).toBe(true);
+    expect(parseLock(fs.readFileSync(file, 'utf8')).pid).toBe(process.pid);
+    expect(B2.p.waitingToFinish().map((i) => i.iid)).toEqual([inv.iid]);
+    // And the pairing completes from there.
+    expect(B2.p.flow.approveFinish(inv.iid)).toMatchObject({ ok: true });
+    await tick(); await pump(wire, [A, B2 as never]);
+    expect(B2.p.keys.isCredentialShareAllowedByFingerprint(A.fp)).toBe(true);
+    expect(A.p.keys.isCredentialShareAllowedByFingerprint(B.fp)).toBe(true);
+  });
 
   it('ownership is live: an instance that takes over re-reads the stores and then handles pairing ops (becomeOwner)', async () => {
     const wire = { out: [] as Env[] };

@@ -7,10 +7,18 @@
  * whose pid is no longer running is stale and is taken over. Only the owner pairs and writes
  * pairing state; the others refuse pairing and credentials and re-read
  * pins from disk for every message.
+ *
+ * Takeover is race-safe (Echo review of #2215, SHOULD-FIX 1): a stale lock is never deleted in place.
+ * It is renamed atomically to a unique name, the renamed file is re-read, and only if it still names
+ * the dead holder is it discarded; otherwise (another instance took over in between) it is put back
+ * and that instance owns pairing. A lock is created with its content in one step (write a temp file,
+ * then hard-link it into place, which fails if a lock exists), so a lock is never seen half-written.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 export interface StateLock {
   held: boolean;
@@ -20,6 +28,8 @@ export interface StateLock {
   setApp(name: string): void;
   /** The app named by the current owner, read fresh from the lock, or null. */
   holderApp(): string | null;
+  /** True while the lock file on disk still names this instance (false once it was replaced or removed). */
+  stillHeld(): boolean;
 }
 
 /**
@@ -52,41 +62,134 @@ export function friendlyAppName(raw: string | null | undefined): string {
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; } };
 
-export function acquireStateLock(stateDir: string, pid = process.pid): StateLock {
-  const file = path.join(stateDir, 'threadline', 'owner.lock');
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fs.writeFileSync(file, String(pid), { flag: 'wx', mode: 0o600 });
-      const ours = () => { try { return parseLock(fs.readFileSync(file, 'utf8')).pid === pid; } catch { return false; } };
-      return {
-        held: true, holderPid: pid,
-        release: () => { try { if (ours()) fs.unlinkSync(file); } catch { /* gone */ } },
-        setApp: (name: string) => {
-          const n = clean(name);
-          if (!n || !ours()) return;
-          const tmp = `${file}.${pid}.tmp`;
-          try { fs.writeFileSync(tmp, `${pid}\n${n}`, { mode: 0o600 }); fs.renameSync(tmp, file); } catch { try { fs.unlinkSync(tmp); } catch { /* none */ } }
-        },
-        holderApp: () => { try { return parseLock(fs.readFileSync(file, 'utf8')).app; } catch { return null; } },
-      };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      const holder = parseLock(fs.readFileSync(file, 'utf8')).pid;
-      if (holder !== null && holder !== pid && alive(holder)) return notHeld(file, holder);
-      // Stale (dead holder or unreadable): remove and try once more. A racing starter that wins
-      // the exclusive create in between is respected.
-      try { fs.unlinkSync(file); } catch { /* someone else removed it */ }
-    }
-  }
-  let holder: number | null = null;
-  try { holder = parseLock(fs.readFileSync(file, 'utf8')).pid; } catch { /* gone */ }
-  return notHeld(file, holder);
+/** A lock this old whose pid now belongs to a process started after the lock was written is a reused pid. */
+export const PID_REUSE_AGE_MS = 24 * 60 * 60_000;
+
+function processStartMs(pid: number): number | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 2_000 });
+    const t = Date.parse(String(r.stdout || '').trim());
+    return Number.isNaN(t) ? null : t;
+  } catch { return null; }
 }
 
-function notHeld(file: string, holderPid: number | null): StateLock {
+/**
+ * Is the lock's holder still the process that wrote it? A dead pid is stale. A live pid is stale only
+ * when the lock is older than a day AND that pid's process started after the lock was written (the
+ * pid was reused by an unrelated process). If the start time cannot be read, a live pid counts as alive.
+ */
+function holderAlive(pid: number, lockMtimeMs: number, now = Date.now()): boolean {
+  if (!alive(pid)) return false;
+  if (now - lockMtimeMs < PID_REUSE_AGE_MS) return true;
+  const started = processStartMs(pid);
+  return started === null || started <= lockMtimeMs + 1_000;
+}
+
+/** Test hooks for the race-safety tests: called at the moments a racing instance could act. */
+export interface LockHooks { beforeRetire?: () => void; now?: () => number }
+
+/** Create `file` with `content` only if it does not exist, in one step (temp file + hard link). */
+function createWithContent(file: string, content: string): boolean {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  try {
+    fs.linkSync(tmp, file);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw err;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* gone */ }
+  }
+}
+
+const readLock = (file: string) => { try { return { ...parseLock(fs.readFileSync(file, 'utf8')), mtimeMs: fs.statSync(file).mtimeMs }; } catch { return null; } };
+
+export function acquireStateLock(stateDir: string, pid = process.pid, hooks: LockHooks = {}): StateLock {
+  const file = path.join(stateDir, 'threadline', 'owner.lock');
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (createWithContent(file, String(pid))) return heldLock(file, pid);
+    const cur = readLock(file);
+    if (!cur) continue; // removed in between: try to create again
+    if (cur.pid === pid) return heldLock(file, pid); // already ours (e.g. a re-acquire)
+    if (cur.pid !== null && holderAlive(cur.pid, cur.mtimeMs, hooks.now?.())) return notHeldLock(file, cur.pid);
+    // Stale (dead holder, reused pid, or unreadable). Retire it without ever deleting a live lock.
+    hooks.beforeRetire?.();
+    const stale = `${file}.stale-${pid}-${crypto.randomBytes(6).toString('hex')}`;
+    try { fs.renameSync(file, stale); } catch { continue; } // someone else retired it first
+    const moved = readLock(stale);
+    if (!moved || moved.pid !== cur.pid) {
+      // Between our read and our rename another instance took over: what we moved is ITS live lock.
+      // Put it back (link fails if yet another lock appeared meanwhile; that one then stands) and yield.
+      try { fs.linkSync(stale, file); } catch { /* another lock is in place */ }
+      try { fs.unlinkSync(stale); } catch { /* gone */ }
+      const now = readLock(file);
+      return notHeldLock(file, now?.pid ?? moved?.pid ?? null);
+    }
+    try { fs.unlinkSync(stale); } catch { /* gone */ }
+  }
+  return notHeldLock(file, readLock(file)?.pid ?? null);
+}
+
+function heldLock(file: string, pid: number): StateLock {
+  const ours = () => readLock(file)?.pid === pid;
   return {
-    held: false, holderPid, release: () => {}, setApp: () => {},
-    holderApp: () => { try { return parseLock(fs.readFileSync(file, 'utf8')).app; } catch { return null; } },
+    held: true, holderPid: pid,
+    release: () => { try { if (ours()) fs.unlinkSync(file); } catch { /* gone */ } },
+    setApp: (name: string) => {
+      const n = clean(name);
+      if (!n || !ours()) return;
+      const tmp = `${file}.${pid}.tmp`;
+      try { fs.writeFileSync(tmp, `${pid}\n${n}`, { mode: 0o600 }); fs.renameSync(tmp, file); } catch { try { fs.unlinkSync(tmp); } catch { /* none */ } }
+    },
+    holderApp: () => readLock(file)?.app ?? null,
+    stillHeld: ours,
   };
+}
+
+function notHeldLock(file: string, holderPid: number | null): StateLock {
+  return { held: false, holderPid, release: () => {}, setApp: () => {}, holderApp: () => readLock(file)?.app ?? null, stillHeld: () => false };
+}
+
+/**
+ * Pairing ownership for one threadline-mcp, kept current. `owns()` is true only while the lock on disk
+ * still names this instance (a replaced lock stops it acting as owner). `ensure()` makes one attempt to
+ * take over when it does not own pairing (the owner exited), and calls `onAcquired` when it does.
+ */
+export class PairingOwnership {
+  private lock: StateLock;
+  private app = '';
+  /** Called when this instance takes ownership after startup (re-read the pairing stores). */
+  onAcquired: (() => void) | null = null;
+
+  constructor(private readonly stateDir: string, private readonly pid = process.pid, private readonly log: (m: string) => void = () => {}, private readonly hooks: LockHooks = {}) {
+    this.lock = acquireStateLock(stateDir, pid, hooks);
+  }
+
+  get holderPid(): number | null { return this.lock.holderPid; }
+  holderApp(): string | null { return this.lock.holderApp(); }
+  setApp(name: string): void { this.app = name; this.lock.setApp(name); }
+  release(): void { this.lock.release(); }
+
+  owns(): boolean {
+    if (!this.lock.held) return false;
+    if (this.lock.stillHeld()) return true;
+    const file = path.join(this.stateDir, 'threadline', 'owner.lock');
+    this.lock = notHeldLock(file, readLock(file)?.pid ?? null);
+    this.log('The pairing lock no longer names this instance; it stops acting as the pairing owner.');
+    return false;
+  }
+
+  ensure(): boolean {
+    if (this.owns()) return true;
+    const next = acquireStateLock(this.stateDir, this.pid, this.hooks);
+    this.lock = next;
+    if (!next.held) return false;
+    if (this.app) next.setApp(this.app);
+    this.log('The previous pairing owner exited; this instance now owns pairing.');
+    this.onAcquired?.();
+    return true;
+  }
 }

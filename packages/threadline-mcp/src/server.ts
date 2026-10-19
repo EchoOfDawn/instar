@@ -54,7 +54,7 @@ import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
 import { classifyInviteText } from '@sagemindai/threadline-core';
 import { PairTools, notOwnerRefusal, notOwnerCredentialRefusal, PROXY_REFUSAL, type Elicit, type ToolResult } from './pairTools.js';
 import { ApprovalCoordinator, type ApprovalAction } from './approvalPage.js';
-import { acquireStateLock, friendlyAppName, type StateLock } from './stateLock.js';
+import { PairingOwnership, friendlyAppName } from './stateLock.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -1075,40 +1075,29 @@ async function main() {
     try { const u = new URL(RELAY_URL); return `${u.protocol === 'ws:' ? 'http:' : 'https:'}//${u.host}`; } catch { return null; }
   })();
   const pubKey = Buffer.from(identity.publicKey, 'base64');
-  // One instance per state directory owns pairing (Echo's review, SEC-5).
-  let stateLock: StateLock = acquireStateLock(STATE_DIR);
-  if (!stateLock.held) process.stderr.write(`[threadline-mcp] Another threadline-mcp (pid ${stateLock.holderPid}) owns pairing for ${STATE_DIR}; this one will message but not pair or send credentials, until that one exits.\n`);
-  process.on('exit', () => stateLock.release());
-  let clientName = '';
-  let pairingRef: StandalonePairing | null = null;
-  /**
-   * A non-owner tries to take ownership whenever it needs it (each pairing tool call, each credential
-   * send): if the owner has exited, its lock is stale and is taken over here, the stores are re-read, and
-   * from then on this instance pairs, serves the approval page and handles inbound pairing ops.
-   */
-  const ensureOwner = (): boolean => {
-    if (stateLock.held) return true;
-    const next = acquireStateLock(STATE_DIR);
-    if (!next.held) { stateLock = next; return false; }
-    stateLock = next;
-    if (clientName) stateLock.setApp(friendlyAppName(clientName));
-    pairingRef?.becomeOwner();
-    process.stderr.write(`[threadline-mcp] The previous pairing owner exited; this one now owns pairing for ${STATE_DIR}.\n`);
-    return true;
-  };
+  // One instance per state directory owns pairing (Echo's review, SEC-5). Ownership is kept current:
+  // owns() is true only while the lock on disk still names this process, and ensure() makes one attempt
+  // to take over a stale lock (the owner exited). A non-owner calls it at each pairing tool call, each
+  // credential send and each inbound pairing op, then pairs, serves the approval page and handles
+  // inbound pairing ops from then on.
+  const ownership = new PairingOwnership(STATE_DIR, process.pid, (m) => process.stderr.write(`[threadline-mcp] ${m} (${STATE_DIR})\n`));
+  if (!ownership.owns()) process.stderr.write(`[threadline-mcp] Another threadline-mcp (pid ${ownership.holderPid}) owns pairing for ${STATE_DIR}; this one will message but not pair or send credentials, until that one exits.\n`);
+  process.on('exit', () => ownership.release());
+  const ensureOwner = (): boolean => ownership.ensure();
   // The refusal names the owning app (recorded in its lock), never a pid or a setting (Echo review R2-2).
-  const notOwner = () => notOwnerRefusal(stateLock.holderApp());
-  relay.ownerApp = () => stateLock.holderApp();
+  const notOwner = () => notOwnerRefusal(ownership.holderApp());
+  relay.ownerApp = () => ownership.holderApp();
   const pairing = new StandalonePairing({
-    ownsPairing: () => stateLock.held,
+    ownsPairing: () => ownership.owns(),
+    claimOwnership: () => ownership.ensure(),
     stateDir: STATE_DIR,
     identity: { fp: identity.agentId, publicKey: pubKey, privateKey: Buffer.from(identity.privateKey, 'base64') },
     ownName: () => ({ owner: process.env.THREADLINE_OWNER || os.userInfo().username, agent: profile.get().name }),
     sendEnvelope: (envelope) => relay.sendRawEnvelope(envelope),
     relayHttpBase,
   });
+  ownership.onAcquired = () => pairing.becomeOwner();
   relay.setPairing(pairing);
-  pairingRef = pairing;
 
   try {
     await relay.connect();
@@ -1160,8 +1149,7 @@ async function main() {
   const prevInitialized = server.server.oninitialized;
   server.server.oninitialized = () => {
     prevInitialized?.();
-    clientName = server.server.getClientVersion()?.name ?? '';
-    stateLock.setApp(friendlyAppName(clientName));
+    ownership.setApp(friendlyAppName(server.server.getClientVersion()?.name ?? ''));
   };
 
   // Without elicitation, the person answers on a local approval page that this process (the pairing

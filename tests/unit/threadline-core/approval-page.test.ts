@@ -179,10 +179,13 @@ describe('approval coordinator', () => {
     expect(st).toContain('pendingApproval');
     expect(st).not.toContain(token);
     expect(st).not.toContain('http://');
-    // A second request while open re-opens the same page and returns the same pending result.
-    const again = await c.start('open', async () => ({ ok: true }));
+    // Asking again for the same step re-opens the same page and returns the same pending result.
+    const again = await c.start('finish', async () => ({ ok: true }));
     expect(again).toMatchObject({ pending: true, action: 'finish' });
     expect(opened).toEqual([opened[0], opened[0]]);
+    // A different step while this page is open is refused in plain words, and opens nothing (MINOR b).
+    expect(await c.start('open', async () => ({ ok: true }))).toEqual({ ok: false, error: 'Another approval is already open in your browser; finish it first.' });
+    expect(opened).toHaveLength(2);
     c.close();
   });
 

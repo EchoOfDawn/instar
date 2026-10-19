@@ -50,6 +50,12 @@ export interface StandaloneDeps {
    * call becomeOwner() at that moment so the stores are re-read from disk.
    */
   ownsPairing?: boolean | (() => boolean);
+  /**
+   * One attempt to take pairing ownership (the owner may have exited), made before an inbound pairing op
+   * is decided, so the other side's accept or finish is not refused just because no tool call came first.
+   * Returns whether this instance owns pairing now. Defaults to the ownsPairing check.
+   */
+  claimOwnership?: () => boolean;
   fetchImpl?: typeof fetch;
 }
 
@@ -110,6 +116,11 @@ export class StandalonePairing {
   }
 
   /** Does this instance own pairing right now? */
+  /** Before deciding an inbound pairing op: try to take ownership if the owner has gone. */
+  private claim(): boolean {
+    return this.deps.claimOwnership ? this.deps.claimOwnership() : this.owns();
+  }
+
   private owns(): boolean {
     const o = this.deps.ownsPairing;
     return typeof o === 'function' ? o() : o !== false;
@@ -123,8 +134,12 @@ export class StandalonePairing {
     this.loadStores();
   }
 
+  /** Bumped on each reload; a replaced flow's pending Finish retries see a stale generation and do nothing. */
+  private flowGen = 0;
+
   private loadStores(): void {
     const deps = this.deps;
+    const gen = ++this.flowGen;
     // A store file that could not be parsed is set aside by threadline-core; the person must see that.
     const report = (message: string) => {
       this.storeProblems.push({ at: this.now().toISOString(), message });
@@ -145,6 +160,8 @@ export class StandalonePairing {
       notify: (event) => { this.recent.unshift({ at: this.now().toISOString(), event }); this.recent.splice(50); this.audit({ ...event }); this.events.emit('event', event); },
       ownName: deps.ownName,
       now: this.now,
+      // Disposal: when becomeOwner() replaces this flow, its scheduled Finish retries become no-ops.
+      schedule: (fn, ms) => { setTimeout(() => { if (gen === this.flowGen) fn(); }, ms).unref?.(); },
     });
   }
 
@@ -362,7 +379,7 @@ export class StandalonePairing {
       if (this.seen.has(id)) return { kind: 'refused', reason: 'replayed message (already received)' };
       this.rememberSeen(id);
       if (msg.type && INVITE_OPS.has(msg.type)) {
-        if (!this.owns()) return { kind: 'refused', reason: 'pairing message reached an instance that does not own pairing' };
+        if (!this.claim()) return { kind: 'refused', reason: 'pairing message reached an instance that does not own pairing' };
         await this.flow.handleControl(msg.type, from, msg as unknown as Record<string, unknown>);
         return { kind: 'control' };
       }
@@ -391,7 +408,7 @@ export class StandalonePairing {
     } catch { /* raw payload */ }
     if (type && INVITE_OPS.has(type)) {
       // Only the accept travels in plaintext; any other invite op in plaintext is dropped.
-      if (type === OP_ACCEPT && this.owns()) {
+      if (type === OP_ACCEPT && this.claim()) {
         let payload: Record<string, unknown> = {};
         try { payload = JSON.parse(text); } catch { /* malformed: the engine refuses it */ }
         await this.flow.handleControl(type, from, payload);
