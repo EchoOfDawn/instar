@@ -6,7 +6,7 @@ eli16-overview: "telegram-button-approval.eli16.md"
 parent-principle: "Structure beats Willpower"
 lessons-engaged: "Structure beats Willpower; Know Your Principal; L15 Authorization Policy; Canonical Pipeline Operational Completeness; Self-Unblock rung FLOOR (capability is not authority); Signal vs Authority; Verify the State Not Its Symbol; Mobile-Complete Operator Actions; Agent Proposes, Operator Approves; Maturation Path; Migration Parity"
 related-feedback: "fb-bc5da66f-f46"
-review-status: "convergence-failed: 10-iteration cap reached 2026-10-19 with design findings still arriving; not tagged review-convergence"
+review-status: "not converged: 11 rounds on 2026-10-19; round 11 (desk-approved extra round) still produced build-changing findings on the class-map test, applied here unreviewed; not tagged review-convergence"
 review-report: "docs/specs/reports/telegram-button-approval-convergence.md"
 related-specs: "docs/specs/a2a-pairing-invite-link.md (§6.1 Honest boundary); docs/specs/OPERATOR-AUTHORIZATION-REQUEST-SPEC.md (display-integrity rule); docs/specs/feedback-triage-and-execution.md (§4 review gate, per-PR floor, §5 action list)"
 ---
@@ -147,6 +147,10 @@ Telegram account.
 | T2 | Does not stop: read the vault or the log (G1, G3) | Does not stop: read the lifeline secret and post to the route (G5), or press a real button through an operator Telegram session where one exists (G6) |
 | T3 | Does not stop: the PIN is in the chat (G3) — and with a reachable dashboard it yields the full API token (G11) | Does not stop |
 
+One more attacker is specific to taps: on an install with no owner configured, **any chat member** can answer
+prompt-gate buttons (G5) without holding the PIN; that is the fail-open check in ACT-115, a repair independent
+of the PIN migration.
+
 **Today neither the PIN nor a tap is a boundary against anyone who matters.** The API token is full control of the host
 (G11), so T1 is T2 with one extra request. The PIN's real function is the dashboard door: it is exchanged for
 the API token. Per-action PIN re-entry is therefore an *intent record* — proof that a PIN-shaped step
@@ -284,25 +288,35 @@ a phone cannot open (a Mobile-Complete gap owned by the tunnel feature).
    not where the approval happens.
 2. **A class map keyed on annotated code sites, with a failing test (code, built after approval through
    `/instar-dev`).** Spec review does not see every path that adds a tap handler (feedback-executor PRs,
-   ordinary fix PRs, a phase of an already-approved spec), and most button payloads have no fixed prefix
-   (pairing passes `b.data` through `sendPairingPrompt`, burn alerts encode signed JSON, the prompt gate sends
-   `{id}`). So every **site** carries an annotation comment `// callback-site: <site-id>` on its line: each
-   construction of `callback_data` or `inline_keyboard`, each call of a method that turns caller-supplied
-   `{text, data}` pairs into buttons (today `sendPairingPrompt`), and each branch that dispatches
-   `callback_query` data (`processCallbackQuery`'s prefix and JSON branches, the callback route's pairing
-   branch). The map `src/data/telegramCallbackClasses.json` lists each site id with the actions it produces or
-   handles, each classed S, R or P. A P action carries either an exception record — reason, ending event, and a
-   review-by date (2026-12-01 for the three below) — or the status `unwired`. Exceptions: `pi:` approve/finish
-   and `tc:g` until dashboard-pin-structural item 2; prompt-gate answers until ACT-120. `unwired`: burn-alert
-   Release and Snooze (produced, handled nowhere). The unit test fails when: a line containing `callback_data`,
-   `inline_keyboard` or a call of a listed button method lacks an annotation; an annotated id is missing from
-   the map, or a map id has no annotation; a P action is neither `unwired` nor excepted; an exception is past
-   its review-by date; or an `unwired` action's id appears on a dispatch site. A substitution (one button
-   removed, a different one added) changes the site's annotation or forces a new one, so it shows in the diff.
-   Honest limits: the map and the annotations are files the agent can edit, so the test catches *forgetting* to
-   classify, not *misclassifying* — review of the diff does that (making the map a code-owned path would put
-   that review on GitHub, at an operator approval per change; listed as an operator decision); and a new
-   generic button method must itself be added to the test's method list, which the test cannot discover.
+   ordinary fix PRs, a phase of an already-approved spec), and most button payloads have no fixed prefix. So
+   every **site** carries an annotation comment `// callback-site: <site-id>`, and the map
+   `src/data/telegramCallbackClasses.json` lists each site id with the actions it produces or handles, each
+   classed S, R or P. Sites are of three kinds, and the test discovers each kind mechanically:
+   - **Button-building sites:** a code line (comments and type declarations skipped by the TypeScript parser,
+     not by a regex) that constructs `callback_data` or `inline_keyboard`, calls a listed generic button method
+     (today `sendPairingPrompt`), or builds the `{text, data}` literal passed to one (today in
+     `PairingInviteTelegram`). A multi-line construction is one site, annotated on its first line.
+   - **Dispatch sites:** every branch inside a listed dispatch entry point — `TelegramAdapter.processCallbackQuery`,
+     the `/internal/telegram-callback` route handler, `PairingInviteTelegram.onCallback`, `BurnAlertButtons.handle`
+     — that reads callback data (a `startsWith`, `JSON.parse`, or `switch` on it). Any such branch without an
+     annotation fails, so a new handler for an `unwired` action is caught whether or not its author annotates.
+   - **Slack prompt buttons** (`SlackAdapter` `prompt::` build and handle) are the same surface by consequence
+     and are mapped as P under the prompt-gate exception; the scan covers `src/**/*.ts` for both adapters.
+   A P action carries either an exception record — reason, ending **event**, granted date — or the status
+   `unwired` (burn-alert Release and Snooze: handled by `BurnAlertButtons.handle`, but nothing constructs the
+   class yet). Exceptions: `pi:` approve/finish and `tc:g` until dashboard-pin-structural item 2; prompt-gate
+   answers (Telegram and Slack) until sibling item 7 moves every authority-bearing answer to the dashboard (ACT-120
+   narrows the keyboard first; it does not end the exception). The test fails when: an annotation is missing
+   from a discovered site; a map id has no annotation or an annotation has no map entry; a P action is neither
+   `unwired` nor excepted; an `unwired` action's id appears on a dispatch site; or a new generic button method or
+   dispatch entry point is added to the lists without a map entry. An exception older than 90 days from its
+   granted date makes the test **print a warning** (the attention queue gets one deduped item from the daily
+   job), never a failure — a date that turns the suite red fleet-wide would only teach date-bumping. Honest
+   limits: the map, the annotations and the entry-point lists are files the agent can edit, so the test catches
+   *forgetting* to classify, not *misclassifying* — review of the diff does that; a replaced action under an
+   unchanged annotation passes; and a new generic method or entry point must be added to the lists by hand.
+   The recommended way to give the map teeth is to make it a code-owned path (operator decision, one GitHub
+   review per reclassification).
 
 Supersession notes (docs, in this PR): `OPERATOR-AUTHORIZATION-REQUEST-SPEC.md` ("the agent can never approve
 its own request") and `a2a-pairing-invite-link.md` (the Bearer token alone never approves) each gain a dated
@@ -330,7 +344,8 @@ This spec's conclusions do not depend on it.
    the exposed PIN earlier keeps what it bought; and in the same release rewrite the
    agent instructions to say what the PIN does and does not protect (for Claude, Codex and Gemini agents).
 3. Decide whether `POST /dashboard/unlock` should keep handing out the full API token now that an
-   operator-session token exists (G11).
+   operator-session token exists (G11), and whether session-spawning should need a scoped credential distinct
+   from the read-level Bearer token.
 4. Do **not** treat a hashed PIN as a fix: a generated PIN is six digits (a million values), and a short
    operator-chosen one is little better; a readable hash falls to an offline search quickly.
 5. Extend and audit the existing operator-session pattern (G8) so P-class routes accept that token in place of
@@ -359,7 +374,7 @@ This spec's conclusions do not depend on it.
 
 ## Maturation plan
 
-- **test-agent-live:** not applicable to the documentation; the class-map test runs in the unit tier of the throwaway build's suite — it passes on the annotated tree and fails on each seeded case in its own unit test.
+- **test-agent-live:** not applicable to the documentation; the class-map test runs in the unit tier of the throwaway build's suite — it passes on the annotated tree, fails on each seeded case in its own unit test, and warns (not fails) on an aged exception.
 - **dev-agent-live:** the test runs in Echo's suite from the merge of the `/instar-dev` build; it has no runtime surface.
 - **fleet:** not applicable — nothing is installed on agents; the test runs in instar's own CI and pre-push tiers.
 - **graduation criterion:** the test is green on main, and its own unit test shows it failing on each seeded case.
@@ -367,9 +382,11 @@ This spec's conclusions do not depend on it.
 
 ## Tests
 
-- **Unit:** the class-map test above; its own test seeds an unannotated button line, a removed exception with
-  the handler still present, an expired exception, and an `unwired` id on a dispatch site, expects all four to
-  fail, and expects the annotated current tree to pass.
+- **Unit:** the class-map test above; its own test seeds every failure case listed in §4 (an unannotated
+  button line, an unannotated `{text, data}` literal, an unannotated dispatch branch, a map id without an
+  annotation, an annotation without a map entry, a P action neither `unwired` nor excepted, an `unwired` id on a
+  dispatch site, an unlisted entry point) and expects each to fail, seeds a 91-day-old exception and expects a
+  warning without failure, and expects the annotated current tree to pass.
 - **Integration / E2E:** not applicable — no route, job or runtime path changes.
 
 ## Approval volume — the options, with their real costs
@@ -529,17 +546,17 @@ and the PR body already names the test.
 
 | Decision point | Classification | Justification / floor |
 |---|---|---|
-| An unannotated or unmapped button/dispatch site, a P action neither `unwired` nor excepted, or an expired exception fails the class-map test (§4) | **invariant** | A closed allowlist on an authority surface; unclassified defaults to P, so the conservative outcome is a failing build that a human classifies. |
+| An unannotated or unmapped button/dispatch site, or a P action neither `unwired` nor excepted, fails the class-map test; an old exception warns (§4) | **invariant** | A closed allowlist on an authority surface; unclassified defaults to P, so the conservative outcome is a failing build that a human classifies. |
 
 The approval classes themselves (§1) are assigned by spec review, not at runtime.
 
 ## Verify the State, Not Its Symbol
 
-- **Class-map test.** Symbol: every button-building or dispatch line carries a site annotation present in the
-  map, and every P action is `unwired` or excepted within its review-by date. Claimed state: no tap handler acts on a P-class
+- **Class-map test.** Symbol: every discovered button-building or dispatch site carries a site annotation
+  present in the map, and every P action is `unwired` or excepted. Claimed state: no tap handler acts on a P-class
   operation outside the recorded exceptions. Gaps both ways: a misclassified action passes (review of the map's
   diff is the check); a site whose behaviour changes under the same annotation passes; a new generic button
-  method is invisible until listed. Unmeasurable (a file cannot be read): the test fails rather than passes.
+  method or dispatch entry point is invisible until listed. Unmeasurable (a file cannot be read): the test fails rather than passes.
 - The spec's factual claims are measured in Ground truth, each with the query that could have returned the
   opposite.
 
