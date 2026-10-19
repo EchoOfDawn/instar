@@ -230,6 +230,10 @@ const FLAKY_TESTS = [
 const ISOLATED_CACHE_DIR = process.env.INSTAR_VITEST_CACHE_DIR?.trim();
 
 export default defineConfig(withTestRunnerBound('push', {
+  // Inline (empty) PostCSS config: without it Vite searches parent directories for one and
+  // aborts on the first unreadable package.json (EPERM). The feedback executor's sandbox
+  // read-denies the agent home around its workspace, so every confined vitest run failed.
+  css: { postcss: {} },
   ...(ISOLATED_CACHE_DIR ? { cacheDir: ISOLATED_CACHE_DIR } : {}),
   test: {
     include: ['tests/unit/**/*.test.ts', 'tests/integration/**/*.test.ts', 'tests/e2e/**/*.test.ts'],
