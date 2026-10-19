@@ -4033,6 +4033,12 @@ export interface InstarConfig {
      */
     jevCorrectionShadow?: {
       enabled?: boolean;
+      /**
+       * Live input to the Correction & Preference Learning Sentinel
+       * (jev-correction-live.md): a Jev flag Layer 0 missed is distilled as a
+       * learning signal. Omitted ⇒ dev gate; explicit false is the kill switch.
+       */
+      feedSentinel?: boolean;
       /** Pinned model id — never an alias (default "jev-1.13.0"). */
       model?: string;
       /** Hard abort per call (default 1500, max 10000). */
@@ -4543,11 +4549,21 @@ export interface InstarConfig {
        * Who chooses each sign-in step (spec agent-driven-relogin): `agent` = a model reading the
        * page's floor-filtered controls; `closed` = the fixed page-class table; `agent-session` = one
        * short-lived agent session follows /subscription-signin section 3 like a person (spec
-       * skill-driven-signin-repair; macOS only, approval forced until graduation — off macOS it
-       * resolves to the existing driver). Omitted ⇒ `agent-session` on a macOS development agent,
+       * skill-driven-signin-repair; macOS only — off macOS it resolves to the existing driver).
+       * Every path honors `mode` the same way: `unattended` skips the tap only for an opted-in,
+       * floor-clearing identity. Omitted ⇒ `agent-session` on a macOS development agent,
        * otherwise the development-agent gate (agent on a development agent, closed on the fleet).
        */
       navigation?: 'agent' | 'closed' | 'agent-session';
+      /**
+       * Slow automatic retry of a FAILED repair while its sign-in incident stays open (spec
+       * relogin-unattended-agent-session-and-slow-retry). Absent ⇒ on: first retry 6 h after the
+       * failure, later ones 24 h apart, at most 3 per incident. Safety refusals and operator
+       * cancels are never retried. `enabled: false` turns it off.
+       */
+      slowRetry?: { enabled?: boolean; delaysMs?: number[]; maxRetries?: number;
+        /** Local hours in which an approval re-offer is never sent (default 23 → 8); `null` disables. */
+        quietHours?: { startHour: number; endHour: number } | null };
     };
     /** Soft binding-window utilization % above which an account is "at pressure"
      *  and excluded from proactive selection (default 90). */
