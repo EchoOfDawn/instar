@@ -71,42 +71,147 @@ Delete the package directory and the compat test. Nothing depends on it.
 - Decision points added: `credentialSendKey`, `credentialAcceptFrom`, and `PinnedKeyStore`'s transitions.
 - Evidence: Instar's own protocol suites (`PairingInvite`, `PairingInviteStore`, `PairingInviteFlow`) copied into `tests/unit/threadline-core/`, pointed at the package with `PinnedKeyStore` as the trust store: 44 pass unchanged. New `trust.test.ts` (9). Total 53. Breakages: 10 of 10 caught, two of them in the ported engine (the one-alarm-per-invite guard, the MAC tag check), proving the suites exercise the core copy. One survived at first: removing the state check from `credentialSendKey` passed, because no test sent to a PAUSED peer, and a demoted pin keeps its pairing id. So a credential could have gone to a peer whose invite leaked. The test was added and the check is now caught.
 
-## Cross-model review fix (added 2026-10-16)
+## Steps 5 and 7: the standalone module and the cross-implementation test (added 2026-10-16)
 
-- `envelope.ts` `decrypt` now refuses a static X25519 key that is not derived from the signing identity (found by an independent GPT 5.4 / Gemini 3.1 Pro review; every caller was already correct, but the API invited misuse). Wire format unchanged; the Instar vectors still pass.
-- Evidence: core test `round trip core → core` asserts decrypt throws on an unbound key. Breakage check: removing the guard fails that test.
+- `packages/threadline-mcp/src/pairing.ts` (new, no MCP SDK import): `StandalonePairing` runs the core engine over threadline-mcp's relay socket. Accepts go plaintext as Instar frames them; finish, used, ack and every message to a pinned peer go encrypted to the pinned key; an encrypted message is only ever decrypted with a pinned key; pairing ops are handled and never surfaced as messages; `send(..., { credential: true })` uses `credentialSendKey`; an invite arriving as a relayed message is refused; and the relay-card key check works as Instar's does.
+- Interop finding: Instar 1.3.1352 encrypts ordinary chat only when the relay gave it the peer's X25519 key, so a paired Instar agent may send the standalone plaintext. The standalone delivers it marked unencrypted (never as a credential), and spec D6 records Instar's step 9 to encrypt to pinned peers.
+- `vitest.config.ts` and `vitest.e2e.config.ts` alias `threadline-core` to the package source, so cross-implementation tests run against live code with no install. `threadline-mcp` declares `threadline-core ^0.1.0`.
+- Evidence: `tests/e2e/threadline/standalone-instar-pairing.test.ts` (3, a real in-process RelayServer + a real bootstrapThreadline Instar agent): Instar invites → standalone accepts → Instar finishes; standalone invites → Instar accepts → standalone finishes; standalone → Instar credential encrypted to the pin and read by Instar; a credential to an unpaired agent refused before sending. `tests/unit/threadline-core/standalone-pairing.test.ts` (8). Breakages: 7 tried, 6 caught. One survived by design: letting any pairing op arrive as plaintext changed nothing, because the engine still requires the pinned inviter's valid signature on a Finish. The plaintext-only-for-accept rule keeps Finish contents from the relay; it is not what authenticates.
 
-## PeerProfile.via (added 2026-10-16)
+## Step 6: threadline-mcp's tools (added 2026-10-16)
 
-- Type only: `PeerProfile` gains optional `via` (the store already wrote it; `paused: <reason>` marks a pin paused after a leaked invite). threadline-mcp 0.5.0 reads it to tell a paused pin (encrypt) from one still waiting for the inviter's Finish (send as before pairing, so nothing is lost). No runtime change in this package.
-- The first commit of this change inserted the field twice into `StoredPeer` and did not compile; the follow-up removed the duplicate. The repo's commit gate type-checks the root project only, not `packages/*`; the package's own CI workflow (`npm test` = `tsc` + tests) is what catches it.
+- `server.ts`: every inbound envelope goes through `StandalonePairing.receive` (pairing ops are handled and never reach the inbox; refusals are logged to stderr; decrypted messages are stored in the plaintext payload format, flagged `encrypted` / `credential` / `plaintextFromPairedPeer`). Every send goes through `StandalonePairing.send` (pinned peers always encrypted; `credential: true` gated). New tools: `threadline_pair_invite`, `threadline_pair_open` (no arguments: the person pastes the invite through elicitation), `threadline_pair_finish`, `threadline_pair_status`, `threadline_pair_cancel`. `threadline_send` gains `credential`.
+- `pairTools.ts` (new, no SDK import): the tool logic, with `elicit` injected. Elicitation is offered only when the client declared the capability. Without it, accept and finish refuse with a plain explanation and point the person to the terminal fallback (D5, below).
+- **Pre-existing defect fixed: published `threadline-mcp` 0.4.4 cannot connect at all.** `isListenerAvailable`/`sendViaListener` call `require('http')` in an ES module, so every `connect()` throws `ReferenceError: require is not defined` before reaching the relay (confirmed in the published 0.4.4 tarball, released 2026-04-05). Now `import http from 'node:http'`. Found by the stdio test below.
+- Over-block: an agent whose host has no elicitation can't complete accept or finish (by design: the person must answer). Under-block: none new.
+- Evidence: `tests/unit/threadline-core/pair-tools.test.ts` (8, a fake elicitation as the person: the full flow; the invite is never in a tool result; no elicitation means refusal with nothing sent; decline and cancel send nothing; a bad invite asks nothing further; not-them pins nothing and is decided once; a dismissed Finish finishes nothing; binding and TTL). `tests/e2e/threadline/threadline-mcp-stdio-pairing.test.ts` (1, THE PRODUCT: the built server over stdio, an MCP client answering elicitations, a real Instar agent and relay; a credential is refused before pairing, the pairing goes through the tools, and the credential is delivered after). It skips where the package's own deps are not installed (CI unit shards). Breakages: 6 tried, 6 caught. The last one (a dismissed Finish counted as Finish) caught only after adding its test.
+
+## Step 6b: the terminal fallback, D5 (added 2026-10-16)
+
+- `pairSocket.ts` (new): the running server listens on `<stateDir>/pair.sock` (chmod 0600, inside the 0700 state dir). `threadline-mcp pair open|finish|status` connects and the server runs the SAME PairTools with an `elicit` that asks over the socket. One process keeps the relay connection and pairing state, so nothing is duplicated or raced. It never takes the socket from a live server on the same state dir (probe first; only a stale socket file is replaced). A closed terminal answers null, so the tool returns 'declined' or 'undecided' and does not hang. One command per connection.
+- `server.ts`: `argv[2] === 'pair'` runs the CLI instead of the MCP server; main serves the socket (a failure to listen is logged and the MCP tools are unaffected).
+- `pairTools.ts`: the no-elicitation refusal now names the terminal commands and says plainly that the boundary is cooperative.
+- Over-block: open/finish refuse without a TTY (status does not). Under-block: an agent with a shell AND a pseudo-terminal could answer; stated in the tool text and README, as the spec's D5 requires.
+- Pasted invites span lines with a blank line inside, so input ends at the line carrying `tlinv1:` (or two blank lines); a blank first line cancels. Found by the test: ending at the first blank line dropped the code.
+- Evidence: `tests/unit/threadline-core/pair-socket.test.ts` (8). The stdio E2E now also runs the built `pair status` from a second process against the live server. Breakages: 8 tried, 8 caught. Three caught only after adding tests: a closed terminal leaving the tool hung, an unoffered choice not reported, and a second command on one connection running alongside the first.
+
+## Cross-model review fixes (added 2026-10-16)
+
+An independent review by GPT 5.4 and Gemini 3.1 Pro (Grok unreachable) found no path for a credential to reach an unpaired agent, for the model to complete a pairing through MCP, or for control ops to be spoofed. Three real findings, fixed:
+- `envelope.ts` `decrypt` now refuses a static X25519 key that is not derived from the signing identity (was: the caller's responsibility; every caller was correct, but the API invited misuse). Wire format unchanged; the Instar vectors still pass.
+- `pairing.ts` drops a replayed encrypted envelope (same sender + messageId), recorded only after verification so a forgery cannot burn an id. In memory, bounded at 10,000; a restart reopens the window for messages received before it (Instar's inbound ledger is the persistent equivalent; porting it is step 9 territory).
+- `pairSocket.ts` closes a terminal connection idle for 15 minutes (the pending question is answered with nothing) and caps connections at 4.
+- Accepted, not changed: plaintext from a paired peer stays delivered-and-marked until Instar encrypts to pinned peers (D6 as built, step 9); the stale-socket probe→unlink→listen race fails safe (the loser gets EADDRINUSE and logs); `handleFinish` matches Instar's semantics.
+- Evidence: core test (decrypt refuses an unbound key), `standalone-pairing.test.ts` (replay refused; a forgery first does not burn the id), `pair-socket.test.ts` (idle terminal closed, question answered with nothing). Breakages: 3 tried, 3 caught.
+
+## Hardening: the pairing audit log (added 2026-10-16)
+
+- `pairing.ts`: every pairing event, every refusal (with sender and reason), and every credential send, refusal or receipt is appended to `<stateDir>/threadline/pairing-audit.jsonl` (0600, rotated to `.1` past 1 MB). Before this, events lived in memory (last 50) and refusals only on stderr, which an MCP host may hide. Never message content, invite text or keys. Best effort: an unwritable state dir never breaks messaging.
+- `pairTools.ts`: `threadline_pair_status` names the audit file.
+- Evidence: `standalone-pairing.test.ts` (2: what is recorded and what never is, 0600; rotation and an unwritable dir). Breakages: 5 tried, 5 caught.
+
+## Fix: no lost messages while the inviter has not finished (added 2026-10-16)
+
+- Found while assessing step 9: an acceptor holds the inviter's key from the moment it approves, but the inviter holds no key for the acceptor until its person finishes. `pairing.ts` sent every message to a pinned peer encrypted, so a message in that window reached an inviter that could not open it (Instar: unknown-sender, dropped; standalone: refused). Now an `invite-accepted` pin that is NOT paused sends as before pairing (plaintext, reported `encrypted: false`); paired and paused pins stay encrypted (a paused pin was verified on both sides, so the peer can read it).
+- `threadline-core` `PeerProfile` gains optional `via` (type only; the store already wrote it).
+- Evidence: `standalone-pairing.test.ts` (a message in the window is delivered; after finish it is encrypted; after a pause it is still encrypted and delivered). Breakages: 2 tried, 2 caught.
+- Step 9 consequence: Instar's equivalent change (encrypt ordinary chat to pinned peers) must use the same rule, encrypting only to `mutual-verified` (or paused) pins, never to a pin still waiting for the inviter's Finish.
+
+## Spec re-check: three gaps closed (added 2026-10-16)
+
+Re-reading the spec against the build found three things it asked for that were missing:
+- D4: nothing refused sending an invite as a message (only the receiver refused it, after it had crossed the relay). `StandalonePairing.send` and `server.ts sendMessage` now refuse any `tlinv1:` text, in every mode.
+- D6: in listener proxy mode (a local listener on 7711, which is the default on Dawn's machines) `sendMessage` skipped pairing entirely, so a paired agent got plaintext, and pairing ops could not go out at all. Now the pair tools (MCP and terminal) refuse with the reason, via a new `PairTools` `unavailable` dep, and a message to a pinned agent through the proxy is refused.
+- §4: pairing events were not in `threadline_inbox`. `StandalonePairing.systemLines()` gives plain lines; the inbox shows them as `pairing`.
+- Evidence: `pair-tools.test.ts` (+1), `standalone-pairing.test.ts` (+2), new `tests/e2e/threadline/threadline-mcp-proxy-mode.test.ts` (the BUILT server with a fake listener and a pre-pinned peer), the stdio E2E checks the inbox lines. Breakages: 7 tried, 7 caught.
+
+## Echo's round-1 review of the spec (#2192): code changes (added 2026-10-16)
+
+- Plaintext naming a pinned sender (Echo 1): `pairing.ts` delivers it as `fromPairedPeer` only when the envelope verifies against the pinned key; otherwise `unverifiedPairedClaim`, with an inbox note that the relay could have written it. New downgrade high-water mark: after a pinned peer's first encrypted ORDINARY chat (pairing ops and credentials excluded, because pre-step-9 Instar encrypts those while still sending chat in plaintext), plaintext in its name is refused. Persisted 0600 at `threadline/encrypted-chat-peers.json`.
+- Key change (Echo 2): structurally a new fingerprint; new `threadline_pair_forget` is an operator act (elicitation), so the model cannot remove a pin and with it the always-encrypt rule.
+- Terminal fallback (Echo 6): the socket exists only when `THREADLINE_PAIR_TERMINAL=1`.
+- Over-block: plaintext from a peer that has sent encrypted chat is refused even if a later peer version legitimately stopped encrypting (by design: a downgrade). Under-block: none new.
+- Evidence: `standalone-pairing.test.ts` (signed vs unsigned vs forged vs tampered plaintext; the high-water mark, what sets it and what does not, persisted 0600), `pair-tools.test.ts` (forget: no elicitation, keep, dismiss, unpair, unknown), proxy E2E (no socket by default), stdio E2E (socket when turned on). Breakages: 7 tried, 7 caught.
+
+## Spec r2.1 reconciliation with instar-codey's r2 (added 2026-10-16)
+
+- Env var renamed to `THREADLINE_PAIR_TERMINAL` (instar-codey's name). Without it, the no-elicitation refusal no longer mentions the terminal at all; with it, the refusal names the commands and states that any same-user program could use them.
+- `threadline_pair_status` gains `lookalikes`: an unpaired known agent whose display name matches a paired agent's (case- and space-insensitive) is flagged as a different key, never the same pairing (D8). Source: the contacts store.
+- `publish-threadline-core.yml`: the job runs only when `github.ref` is `refs/heads/main`, so a manual run on another branch publishes nothing (D10 says so).
+- Evidence: `pair-tools.test.ts` (+2: refusal text with and without the terminal; look-alike flagged, the real peer and an unrelated name not). Breakages: 3 tried, 3 caught. Proxy and stdio E2Es pass.
 
 ## Echo's review of #2195 (core): fixes (added 2026-10-16)
 
 - `flow.ts` `handleFinish` (Medium): a Finish is applied only for an invite this agent's operator approved, from that inviter, with that invite's expiry, no later than 24 h after expiry (`FINISH_GRACE_MS`; the inviter allows a late Finish and retries for ~10 min), and only once. A retry of the applied Finish (same nonce) is re-acked with no state change; a different Finish for the same invite is refused; a first Finish for a paused pin is refused. Approvals are persisted in the invite store (`accepted`), so a Finish after a restart still works. Closes "a relay replays an old Finish to undo a pause".
 - `flow.ts` `approveAccept`: the accept is sent before the approval is recorded; if the send throws, a pin this approval created is rolled back (`InviteTrust.forget?`), the invite stays waiting, and a reason is returned instead of a raw exception.
 - `storeFile.ts` (new), used by `PinnedKeyStore` and `PairingInviteStore`: no file starts empty; invalid JSON is moved to `<file>.unreadable-<time>` and reported (never wiped by the next save); any other read error throws instead of starting empty.
-- `credentialAcceptFrom(trust, fp, ownIdentityPubHex?)`: with our key, also requires the pairing to be bound to it (as `credentialSendKey` does); threadline-mcp (#2196) passes it.
+- `credentialAcceptFrom(trust, fp, ownIdentityPubHex?)`: with our key, also requires the pairing to be bound to it (as `credentialSendKey` does); threadline-mcp passes it.
 - Docs: README says ESM only; `decrypt`'s doc says the caller owns `to`, age and replay.
 - `publish-threadline-core.yml`: `npm ci` from a committed `package-lock.json`, and a "Protocol suite" step runs this repo's `tests/unit/threadline-core` plus the Instar compatibility test before any publish.
-- Evidence: `PairingInviteFlow.test.ts` (+8, also on #2196: replay after pause; replay after an unlabelled pause; first Finish on a paused pin; foreign iid; other expiry; a second validly signed Finish; late vs in-grace Finish; failed accept send), `trust.test.ts` (+1 binding). Breakages: 10 tried, 10 caught (3 only after adding the tests that isolate each layer of the replay defence). Lockfile: `npm ci` + `npm test` pass in a clean copy.
+- Evidence: `PairingInviteFlow.test.ts` (+8: replay after pause; replay after an unlabelled pause; first Finish on a paused pin; foreign iid; other expiry; a second validly signed Finish; late vs in-grace Finish; failed accept send), `trust.test.ts` (+1 binding). Breakages: 10 tried, 10 caught (3 only after adding the tests that isolate each layer of the replay defence). Lockfile: `npm ci` + `npm test` pass in a clean copy.
 
 - Echo's follow-up notes (thread 1a01ebaa): every refused Finish in the tests now asserts the recipient's stored files are byte-for-byte unchanged; in threadline-mcp a store file set aside as unparseable is an attention item (`threadline_pair_status.attention`, a `Pairing ATTENTION` inbox line, and a `store-problem` audit row), not only a log line. Breakages: 2 tried, 2 caught.
+
+## Packed-package smoke in the threadline-mcp publish workflow (added 2026-10-16)
+
+- Merged #2197's branch (0.4.5 fix + built-server smoke) into this branch, keeping 0.5.0.
+- `publish-threadline-mcp.yml` gains "Smoke test the packed package as a consumer": `npm pack`, install the tarball into an empty project the way a user would, then run the installed bin (must load and reach the network) and `pair status` (must answer). Closes Echo's item (4): the built package and its exports were never tested, so a 0.4.4-style break could ship green. Verified locally with the packed threadline-core tarball standing in for npm: both checks pass.
+
+## Spec-converge round 1 (Echo, 2026-10-16): first code fixes
+
+- Replay (SEC-3, LES-8): the (sender, messageId) ledger is persisted (`threadline/seen-messages.jsonl`, 0600, compacted at 2x10,000) so a replay is refused after a restart; a credential outside [-10 min, +1 h] of its signed timestamp is refused (ordinary chat has no window: it may be queued while offline); an explicit `to == own fp` check is defence in depth (an envelope for another agent already fails to decrypt).
+- Credentials in history (SEC-11): history keeps `[credential, N bytes]` in both directions; the inbox still delivers the body once.
+- Identity (SEC-15): an `identity.json` that exists but is unreadable makes the server refuse to start, and the file is left untouched (never silently replaced by a new identity).
+- Listener proxy mode is opt-in (SEC-9): only with `THREADLINE_USE_LISTENER=1`.
+- Evidence: `standalone-pairing.test.ts` (+3), proxy E2E (+1: a listener is ignored without opt-in), stdio E2E (history redaction), new `threadline-mcp-identity-guard.test.ts`. Breakages: 6 tried, 5 caught; the `to` check survives by construction (defence in depth, see above).
+
+## Spec-converge round 1: one owner per state directory (SEC-5)
+
+- New `stateLock.ts`: `<stateDir>/threadline/owner.lock` (pid, exclusive create, 0600); a lock whose pid is not running is taken over; released on exit, and only by its owner.
+- The owner alone pairs (tools and terminal socket), sends credentials, applies pairing messages and writes the encryptedSeen mark. Other instances refuse those with a reason that names the owner's pid, still exchange ordinary messages, and re-read pins from disk for every send and receive, so a pairing the owner just made is honoured at once (never downgraded).
+- Evidence: `state-lock.test.ts` (lock semantics; a non-owner refuses credentials, sees the owner's new pin, does not write the mark), E2E with two real servers on one state directory. Breakages: 6 tried, 6 caught.
+
+## Spec-converge round 1: waitForReply keeps the trust labels (ADV-4)
+
+- `threadline_send` with `waitForReply` returned the reply text and sender only, so a relay-injected plaintext reply under a paired agent's fingerprint read as that agent's reply. It now carries the same labels and notes as the inbox (`encrypted`, `credential`, the unverified-claim note). Evidence: the stdio E2E has a pre-D9 Instar answer in plaintext on the waited thread; the reply comes back labelled as an unverified claim. Breakage: 1 tried, 1 caught.
+
+## Spec-converge round 1: encryptedSeen fails safe (LES-12)
+
+- An `encrypted-chat-peers.json` that exists but cannot be read no longer reads as "nothing seen" (which silently reopened the downgrade). Every pinned peer is treated as seen (plaintext in its name refused), the problem is an attention item, and the file is never overwritten. Evidence: `standalone-pairing.test.ts` (+1). Breakages: 2 tried, 2 caught.
 
 ## Spec-converge round 1: names made safe to show (SEC-12)
 
 - core `cleanLabel`: NFKC-normalised, and C0/C1 controls, bidi overrides and isolates, and zero-width characters removed, so another agent's claimed name cannot reorder or hide text in an approval question or an inbox line. Display only (labels are not in the signed transcript), so the wire format is unchanged. threadline-mcp's look-alike check compares NFKC case-folded names (a full-width "ｃａｒｌ" is flagged).
 - Evidence: `PairingInvite.test.ts` (+1), `pair-tools.test.ts` (full-width look-alike). Breakages: 4 tried, 4 caught.
 
+## Spec-converge round 1: the waiting-for-Finish window ends (SEC-6, ADV-7)
+
+- An acceptor that is still waiting for the inviter's Finish sends as before pairing (plaintext), but only until the pin is older than the longest invite lifetime plus 10 minutes (`FINISH_WAIT_MS`). After that, sends to the peer are refused (`finish-not-received`, with a reason telling the person to unpair and ask for a new invite), and `threadline_pair_status.finishNotReceived` lists it. A paused pin is unaffected (it stays encrypted). Evidence: `standalone-pairing.test.ts` (+1). Breakage: 1 tried, 1 caught.
+
+## Spec-converge round 1: safe choice first (LES-4)
+
+- Every pairing question lists the safe choice first (decline / not them / keep), and a test asserts no question or label matches Instar's permission-prompt auto-resolver (`Do you want to proceed?`, `^(yes|proceed|allow|continue)`). The terminal menu numbering changes accordingly ("2) approve").
+
 ## Spec-converge round 1: publish workflow split (SEC-2, part of SEC-1)
 
 - `publish-threadline-core.yml` now has two jobs. `test` holds no secrets (`contents: read`, `persist-credentials: false`, install scripts disabled) and runs the package tests plus the protocol suite. `publish` runs only after `test` passes, on main; checkout does not persist credentials; dependencies install with `--ignore-scripts`; `NPM_TOKEN` is visible only to the publish step and `RELEASE_TOKEN` only to the push of the version bump. The concurrency group (already present) stops two runs racing to bump one version.
 - Not done here, needs repo settings / npm: a protected GitHub Environment `npm-publish` limited to main holding both secrets, and npm trusted publishing (OIDC) so no long-lived npm token exists (SEC-1). Validated by parsing the YAML (jobs, needs, permissions, step order).
 
-## Justin's decisions (topic 61599, 2026-10-16): scoped name and trusted publishing
+## Spec-converge round 1: threadline-mcp publish split and an exact core pin (SEC-2, SEC-13)
 
-- The package is published as `@sagemindai/threadline-core` (scoped, so the name cannot be squatted before the first publish). Publishing needs the free npm organization `sagemindai` on the publishing npm account.
-- The publish job deploys to the GitHub Environment `npm-publish` (only `main` may deploy) and installs npm 11.5.1+ for npm trusted publishing (OIDC); `NPM_TOKEN` stays only as the first-publish fallback until the trusted publisher is configured on npmjs.com.
+- `publish-threadline-mcp.yml`: the same split as threadline-core: a `test` job without secrets (build + both smoke steps), then `publish` (needs test, main only, no persisted credentials, `--ignore-scripts`, `NPM_TOKEN` only on the publish step, `RELEASE_TOKEN` only on the push). It previously had no ref check at all (SEC-1's note).
+- `threadline-mcp` depends on exactly `threadline-core` `0.1.0`, not `^0.1.0`, so one bad core publish cannot reach every `npx threadline-mcp` user (SEC-13). The lockfile is regenerated once core is on npm (already a release step).
+
+## Spec-converge round 1: the refusal names the running binary (SEC-14)
+
+- With terminal pairing on, the no-elicitation refusal now names this server's own binary (`"<node>" "<path to dist/server.js>"`), never a bare `npx threadline-mcp`, which could fetch a different version or a look-alike package at approval time. The README pins the version in its examples. Evidence: `pair-tools.test.ts` (the refusal names the given binary and never `npx`).
+
+## Justin's decisions (topic 61599, 2026-10-16): scoped name, trusted publishing, no Claude Desktop requirement
+
+- The shared package is `@sagemindai/threadline-core` (scoped, so the name cannot be squatted before the first publish; SEC-13). Imports, the vitest aliases, the exact pin in threadline-mcp, and the workflow's version check all use it. Publishing it needs the free npm organization `sagemindai` on the publishing npm account.
+- Both publish jobs deploy to the GitHub Environment `npm-publish` (created 2026-10-16; only `main` may deploy) and install npm 11.5.1+ for npm trusted publishing (OIDC). `NPM_TOKEN` stays only as the first-publish fallback until each package's trusted publisher is set on npmjs.com; then it is removed, and `RELEASE_TOKEN` moves into the environment (SEC-1).
+- Claude Desktop is not a required host; the spec says so and drops it as an open question.
+- Evidence: 2186 unit tests (109 files) and 8 E2E pass after the rename; the core package's own tests pass; both workflows parse with the environment and step order.
 
 ## Class-Closure Declaration (display-only mirror)
 
