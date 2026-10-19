@@ -45,7 +45,7 @@ import { canaryStamp, evaluateSessionCanary, findSessionTranscript, prepareCanar
 import { treeBytes, type ConfinedRunner } from './ConfinedRunner.js';
 import type { DepsCachePort } from './depsCache.js';
 import type { AttemptGit, GitHubGateway } from './executorPorts.js';
-import { SHORT_ATTEMPT_TMP_RE, removeAttemptTree, shortAttemptTmpDir, shortTmpRealRoot, sweepTrash } from './attemptFs.js';
+import { SHORT_ATTEMPT_TMP_RE, ensurePrivateAttemptTmpDir, removeAttemptTree, shortAttemptTmpDir, shortTmpRealRoot, sweepTrash } from './attemptFs.js';
 
 export const FEEDBACK_EXECUTE_STAGE = {
   canonicalPipelineId: 'feedback-factory',
@@ -554,7 +554,7 @@ export class FeedbackExecutorService {
       this.setMeta(epoch, `exec:attempt-deps:${row.attemptId}`, { hash: deps.hash });
       await this.opts.git.createClone(cfg.sourceRepoPath!, p.workspace, baseSha);
       await this.opts.git.createClone(cfg.sourceRepoPath!, p.publishClone, baseSha);
-      fs.mkdirSync(p.tmpDir, { recursive: true, mode: 0o700 });
+      ensurePrivateAttemptTmpDir(p.tmpDir, this.trashRoot());
       // No project hooks or settings may load in the confined session: .claude/ is removed (and write-denied).
       removeAttemptTree(path.join(p.workspace, '.claude'), this.trashRoot(), 'feedback-execute strip workspace .claude');
       fs.symlinkSync(path.join(deps.dir, 'node_modules'), path.join(p.workspace, 'node_modules'), 'dir');

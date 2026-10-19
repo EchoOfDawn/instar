@@ -55,6 +55,38 @@ export function shortAttemptTmpDir(initiativeId: string, attempt: number, root: 
   return path.join(root, `fb-${digest}`);
 }
 
+/**
+ * Create the attempt's temp directory fresh and PRIVATE, or refuse. The directory sits under a
+ * sticky, world-writable root and its name is predictable from queue state, so a pre-existing
+ * entry is suspect (second-pass review 2026-10-19): a directory someone else created would let
+ * them read Claude Code's shell bookkeeping and the canary report, or plant files the session
+ * reads as its own. Rules: a symlink or a non-directory is refused; a directory owned by another
+ * uid is refused; a directory owned by us is a crash leftover and is removed and recreated. After
+ * creation the entry must be a real directory, ours, mode 0700. Throws `confinement-tmpdir-…`
+ * (the executor's prepare path maps that prefix to a stopped attempt, never a weaker sandbox).
+ */
+export function ensurePrivateAttemptTmpDir(tmpDir: string, trashRoot: string, expectedUid: number | null = typeof process.getuid === 'function' ? process.getuid() : null): void {
+  const inspect = (): fs.Stats | null => { try { return fs.lstatSync(tmpDir); } catch { return null; } }; // @silent-fallback-ok: absent is the normal case
+  const existing = inspect();
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory()) throw new Error('confinement-tmpdir-not-a-directory');
+    if (expectedUid !== null && existing.uid !== expectedUid) throw new Error('confinement-tmpdir-foreign-owner');
+    removeAttemptTree(tmpDir, trashRoot, 'feedback-execute recreate attempt tmpdir');
+  }
+  // Non-recursive on the final component: an entry that appears between the lstat above and
+  // this mkdir (the race the sticky root allows) fails EEXIST instead of being adopted.
+  fs.mkdirSync(path.dirname(tmpDir), { recursive: true });
+  try { fs.mkdirSync(tmpDir, { mode: 0o700 }); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('confinement-tmpdir-raced');
+    throw error;
+  }
+  const created = inspect();
+  if (created && !created.isSymbolicLink() && created.isDirectory()) fs.chmodSync(tmpDir, 0o700);
+  if (!created || created.isSymbolicLink() || !created.isDirectory()) throw new Error('confinement-tmpdir-not-a-directory');
+  if (expectedUid !== null && created.uid !== expectedUid) throw new Error('confinement-tmpdir-foreign-owner');
+  if (process.platform !== 'win32' && (created.mode & 0o777) !== 0o700) throw new Error('confinement-tmpdir-mode');
+}
+
 /** The real path of the short system temp root (`/private/tmp` on macOS, `/tmp` elsewhere). */
 export function shortTmpRealRoot(): string {
   const candidate = shortTmpDir();

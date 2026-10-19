@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SafeFsExecutor } from '../../../src/core/SafeFsExecutor.js';
-import { SHORT_ATTEMPT_TMP_RE, removeAttemptTree, shortAttemptTmpDir, shortTmpRealRoot } from '../../../src/feedback-factory/execute/attemptFs.js';
+import { SHORT_ATTEMPT_TMP_RE, ensurePrivateAttemptTmpDir, removeAttemptTree, shortAttemptTmpDir, shortTmpRealRoot } from '../../../src/feedback-factory/execute/attemptFs.js';
 import { FeedbackExecutorService } from '../../../src/feedback-factory/execute/FeedbackExecutorService.js';
 import { buildClaudeSandboxSettings, buildSandboxRuntimeSettings } from '../../../src/feedback-factory/execute/executePolicy.js';
 
@@ -80,5 +80,42 @@ describe('removeAttemptTree across devices', () => {
     vi.spyOn(fs, 'renameSync').mockImplementation(() => { const e = new Error('EPERM') as NodeJS.ErrnoException; e.code = 'EPERM'; throw e; });
     expect(() => removeAttemptTree(target, path.join(base, 'trash'), 'test')).toThrow(/EPERM/);
     expect(fs.existsSync(target)).toBe(true);
+  });
+});
+
+describe('ensurePrivateAttemptTmpDir (second-pass review: a predictable name under a sticky root)', () => {
+  const mk = () => { const base = fs.mkdtempSync(path.join(os.tmpdir(), 'attempt-tmp-')); dirs.push(base); return base; };
+
+  it('creates a fresh 0700 directory owned by us', () => {
+    const base = mk(); const dir = path.join(base, 'fb-0123456789');
+    ensurePrivateAttemptTmpDir(dir, path.join(base, 'trash'));
+    const st = fs.lstatSync(dir);
+    expect(st.isDirectory()).toBe(true);
+    expect(st.mode & 0o777).toBe(0o700);
+  });
+
+  it('a pre-existing directory owned by ANOTHER uid is refused, untouched', () => {
+    const base = mk(); const dir = path.join(base, 'fb-0123456789');
+    fs.mkdirSync(dir, { mode: 0o755 }); fs.writeFileSync(path.join(dir, 'planted'), 'x');
+    const foreignExpectation = (process.getuid?.() ?? 0) + 1; // our uid is not the expected one
+    expect(() => ensurePrivateAttemptTmpDir(dir, path.join(base, 'trash'), foreignExpectation)).toThrow(/confinement-tmpdir-foreign-owner/);
+    expect(fs.existsSync(path.join(dir, 'planted'))).toBe(true);
+  });
+
+  it('a pre-existing directory we own (crash leftover) is replaced by an empty private one', () => {
+    const base = mk(); const dir = path.join(base, 'fb-0123456789');
+    fs.mkdirSync(dir, { mode: 0o755 }); fs.writeFileSync(path.join(dir, 'leftover'), 'x');
+    ensurePrivateAttemptTmpDir(dir, path.join(base, 'trash'));
+    expect(fs.readdirSync(dir)).toEqual([]);
+    expect(fs.lstatSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  it('a symlink or a plain file at the path is refused', () => {
+    const base = mk();
+    const target = path.join(base, 'elsewhere'); fs.mkdirSync(target);
+    const link = path.join(base, 'fb-aaaaaaaaaa'); fs.symlinkSync(target, link);
+    expect(() => ensurePrivateAttemptTmpDir(link, path.join(base, 'trash'))).toThrow(/confinement-tmpdir-not-a-directory/);
+    const file = path.join(base, 'fb-bbbbbbbbbb'); fs.writeFileSync(file, '');
+    expect(() => ensurePrivateAttemptTmpDir(file, path.join(base, 'trash'))).toThrow(/confinement-tmpdir-not-a-directory/);
   });
 });

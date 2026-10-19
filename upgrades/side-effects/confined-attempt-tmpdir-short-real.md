@@ -13,6 +13,7 @@ Wall 3 behind the operator's approver tap (ACT-111). Live measurement (Mac Studi
 - `FeedbackExecutorService.attemptPaths` derives `tmpDir` from it (every reader recomputes the same path; nothing stored changes shape).
 - `removeAttemptTree`: on `EXDEV` (a tmpfs `/tmp` on Linux cannot be renamed into the trash under the agent state) it removes in place through SafeFsExecutor; any other error still throws.
 - `pruneScratch`: also sweeps `fb-*` directories in the short temp root older than 14 days that no live attempt maps to.
+- `attemptFs.ensurePrivateAttemptTmpDir` (added on second-pass review): the temp dir is created fresh and private, or the attempt is refused: a symlink/non-directory or a directory owned by another uid throws `confinement-tmpdir-…` (mapped to `profile-unenforceable` by the prepare path: a stopped attempt, never a weaker sandbox); a directory we own (crash leftover) is removed and recreated; the result is verified as a real directory, ours, mode 0700.
 
 ## Decision-point inventory
 
@@ -24,9 +25,10 @@ Nothing new is blocked. The shared temp roots (`/tmp`, `/private/tmp`, `/var/tmp
 
 ## 2. Under-block
 
-- The attempt's temp dir now sits in a world-traversable root (`/private/tmp`, sticky) rather than under the 0700 agent home; the directory itself is created 0700 by the executor (`fs.mkdirSync(p.tmpDir, { mode: 0o700 })`) and its name is derived, not secret. Contents: Claude Code's shell bookkeeping, sockets, the canary report, the review's `check-*` run dirs. Nothing credential-shaped is written there by design (the fixture secrets live under the state dir). Accepted.
+- The attempt's temp dir now sits in a world-traversable root (`/private/tmp`, sticky) and its name is predictable from queue state. The second-pass review found the pre-creation attack: another local user creates `fb-<hash>` first (0755, their uid), `mkdirSync({recursive:true})` succeeds silently on it, and they can read Claude Code's shell bookkeeping and the canary report or plant files. Closed by `ensurePrivateAttemptTmpDir` (refuse foreign/symlink, recreate our own leftovers, verify 0700 + uid after creation), with unit tests for each case. Contents of the dir: shell bookkeeping, sockets, the canary report, the review's `check-*` run dirs; nothing credential-shaped by design.
 - The 30-byte limit is Claude Code's own and undocumented beyond its warning; a future uid or root making the path longer would reproduce wall 3. The unit test pins `≤ 30` bytes for a long initiative id so a regression is loud, and the canary's `session-git-status` probe fails closed if the host changes the rule again.
 - `pruneScratch` touches only `fb-[0-9a-f]{10}` names in that root and only when older than 14 days and unmapped: a foreign directory with that exact shape would be removed; bounded by the shape and the age.
+- A `held` attempt (needs-review-secret-shape) is not in the live set, so its temp dir older than 14 days is swept; the held change set itself lives under the state dir, so nothing needed for the PIN-approved publication is lost (reviewer advisory, accepted).
 
 ## 3. Level-of-abstraction fit
 
@@ -71,7 +73,8 @@ Removes a deterministic, measured wall that would have failed every attempt's ca
 
 ## Second-pass review (if required)
 
-_pending_
+**Reviewer:** independent reviewer subagent (general-purpose, read-only)
+**Independent read of the artifact: concern raised, applied** — a pre-existing `tmpDir` was accepted silently (`mkdirSync` on a directory another local user pre-created under the sticky root, predictable name) → `ensurePrivateAttemptTmpDir`: refuse a symlink/non-directory or a foreign-owned directory, recreate our own leftovers, verify real directory + our uid + 0700 after creation; unit tests for fresh, foreign, leftover, symlink and plain-file cases. Re-check: **Concur** (TOCTOU between lstat and mkdir is closed by the post-mkdir verification; nit applied: the final mkdir is non-recursive, so a raced entry fails EEXIST → `confinement-tmpdir-raced` instead of being adopted, and chmod runs only on a verified real directory). Advisory noted: held attempts' temp dirs are swept after 14 days (acceptable, recorded above); a symlinked `fb-…` entry in the sweep removes the link, not its target. Confirmed without change: the runtime's allow-within-deny precedence is the documented one (`executePolicy.ts:181`) and matches the live measurement; the Claude-settings builder's temp-deny filter is consistent with it; the byte budget (26 on macOS, 18 on Linux) and `shortTmpDir`'s `/tmp`-first preference; 124 tests across six files pass.
 
 ---
 

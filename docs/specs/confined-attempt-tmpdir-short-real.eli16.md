@@ -10,7 +10,7 @@ A second detail: on a Mac, `/tmp` is a link to `/private/tmp`. The sandbox match
 
 ## What changes
 
-The attempt's temp directory is now a short, real path under the system temp root (for example `/private/tmp/fb-3f9a1c2b7d`, 26 bytes) instead of a long one under the agent home. The sandbox allows exactly that one directory, as before; the shared temp folders around it stay refused (the canary checks that). Because it now lives outside the agent home, two housekeeping details follow: a crash leftover there is cleaned up by the executor's existing 14-day sweep, and on Linux, where `/tmp` is often a separate filesystem, removal falls back to deleting in place when a move into the trash folder is not possible.
+The attempt's temp directory is now a short, real path under the system temp root (for example `/private/tmp/fb-3f9a1c2b7d`, 26 bytes) instead of a long one under the agent home. The sandbox allows exactly that one directory, as before; the shared temp folders around it stay refused (the canary checks that). Because that root is shared and the folder's name is predictable, the executor now creates the folder fresh and private every time, and refuses the attempt if something is already there that it does not own (a reviewer found that gap). Because it now lives outside the agent home, two housekeeping details follow: a crash leftover there is cleaned up by the executor's existing 14-day sweep, and on Linux, where `/tmp` is often a separate filesystem, removal falls back to deleting in place when a move into the trash folder is not possible.
 
 Measured after the change, with the same probe: `git status` and `echo` exit 0, writes land inside the attempt's folder, and a write to `/tmp/feedback-canary-...` is still refused.
 
