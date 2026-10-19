@@ -53,7 +53,6 @@ import { WebSocket } from 'ws';
 import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
 import { classifyInviteText } from '@sagemindai/threadline-core';
 import { PairTools, type Elicit } from './pairTools.js';
-import { servePairSocket, runPairCli } from './pairSocket.js';
 import { acquireStateLock } from './stateLock.js';
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -1121,9 +1120,6 @@ async function main() {
     pairing,
     // Pairing ops travel on this server's own relay connection; through a listener proxy they cannot.
     unavailable: () => (!stateLock.held ? `Pairing is unavailable: ${NOT_OWNER}` : relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
-    terminalEnabled: process.env.THREADLINE_PAIR_TERMINAL === '1',
-    // The running binary, quoted for a shell (Echo review SEC-14).
-    terminalCommand: `${JSON.stringify(process.execPath)} ${JSON.stringify(process.argv[1] ?? '')}`,
     knownAgents: () => contacts.getAll().map((c) => ({ fingerprint: c.agentId, name: c.name })),
     resolvePeer: (nameOrFp: string) => {
       const v = nameOrFp.trim().toLowerCase();
@@ -1134,14 +1130,6 @@ async function main() {
   };
   // Elicitation is offered per call: only when this client declared it can ask the person.
   const toolsForCall = () => new PairTools({ ...pairBase, elicit: server.server.getClientCapabilities()?.elicitation ? elicit : null });
-  // D5: hosts without elicitation. `threadline-mcp pair open|finish` in a terminal answers through this socket.
-  const pairSock = path.join(STATE_DIR, 'pair.sock');
-  // Off unless the person turns it on in the host config: any process running as this user can
-  // reach the socket, so a host that can ask the person directly never exposes it (spec D5).
-  if (process.env.THREADLINE_PAIR_TERMINAL === '1' && stateLock.held) {
-    servePairSocket(pairSock, (e) => new PairTools({ ...pairBase, elicit: e }))
-      .catch((err) => process.stderr.write(`[threadline-mcp] Terminal pairing unavailable (${pairSock}): ${err}\n`));
-  }
   const asResult = (r: Record<string, unknown>) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }],
     ...(r.ok === false ? { isError: true } : {}),
@@ -2093,10 +2081,7 @@ async function main() {
   });
 }
 
-if (process.argv[2] === 'pair') {
-  runPairCli(process.argv.slice(3), path.join(STATE_DIR, 'pair.sock'), { input: process.stdin, output: process.stdout, isTTY: !!process.stdin.isTTY })
-    .then((code) => process.exit(code));
-} else main().catch((err) => {
+main().catch((err) => {
   process.stderr.write(`[threadline-mcp] Fatal: ${err}\n`);
   process.exit(1);
 });

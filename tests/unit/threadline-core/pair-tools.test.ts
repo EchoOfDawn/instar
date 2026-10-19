@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
-import { PairTools, type Elicit } from '../../../packages/threadline-mcp/src/pairTools.js';
+import { PairTools, NO_ELICIT, type Elicit } from '../../../packages/threadline-mcp/src/pairTools.js';
 import { generateIdentityKeyPair, findInviteToken } from '@sagemindai/threadline-core';
 
 type Env = Record<string, unknown> & { to: string };
@@ -70,7 +70,7 @@ describe('pair tools', () => {
   it('without elicitation the person cannot be asked, so open and finish refuse and change nothing', async () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire);
-    expect(await A.tools(null).open()).toMatchObject({ ok: false, error: expect.stringMatching(/cannot ask you questions directly/) });
+    expect(await A.tools(null).open()).toMatchObject({ ok: false, error: expect.stringMatching(/Pairing needs an app that can ask you directly, and Claude Code can\. This app can't, so pairing isn't available here\./) });
     expect(await A.tools(null).finish({})).toMatchObject({ ok: false });
     expect(wire.out).toHaveLength(0);
   });
@@ -156,16 +156,24 @@ describe('pair tools', () => {
     expect(await A.tools(person([{ decision: 'unpair' }]).elicit).forget({ peer: 'c'.repeat(32) })).toMatchObject({ ok: false });
   });
 
-  it('without elicitation, the terminal is mentioned only when the person turned it on', async () => {
+  it('without elicitation, open, finish and forget refuse in plain words that offer no terminal, command or setting', async () => {
     const wire = { out: [] as Env[] };
     const A = agent('a', wire);
-    const off = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null }).open() as { error: string };
-    expect(off.error).toMatch(/cannot ask you questions directly/);
-    expect(off.error).not.toMatch(/npx threadline-mcp|terminal/i);
-    const on = await new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null, terminalEnabled: true, terminalCommand: '"/usr/bin/node" "/opt/tl/dist/server.js"' }).finish({}) as { error: string };
-    expect(on.error).toMatch(/"\/usr\/bin\/node" "\/opt\/tl\/dist\/server\.js" pair finish/);
-    expect(on.error).not.toMatch(/npx/);
-    expect(on.error).toMatch(/any program running as you/);
+    const tools = new PairTools({ pairing: A.pairing, elicit: null, resolvePeer: () => null });
+    const refusals = [await tools.open(), await tools.finish({}), await tools.forget({ peer: 'c'.repeat(32) })] as Array<{ ok: boolean; error: string }>;
+    for (const r of refusals) {
+      expect(r.ok).toBe(false);
+      expect(r.error).toBe(NO_ELICIT);
+      expect(r.error).toMatch(/Claude Code can/);
+      expect(r.error).toMatch(/pairing isn't available here/);
+      for (const banned of ['terminal', 'npx', 'THREADLINE_PAIR_TERMINAL', 'command']) expect(r.error.toLowerCase()).not.toContain(banned.toLowerCase());
+    }
+    expect(wire.out).toHaveLength(0);
+    // The steps that never ask the person keep working without elicitation.
+    expect(tools.status()).toMatchObject({ ok: true });
+    const made = tools.invite({}) as { ok: boolean; iid: string };
+    expect(made.ok).toBe(true);
+    expect(tools.cancel({ iid: made.iid })).toMatchObject({ ok: true });
   });
 
   it('status flags an unpaired agent that claims a paired agent\'s name (a new key is never the same pairing)', async () => {
