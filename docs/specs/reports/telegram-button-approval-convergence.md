@@ -4,7 +4,7 @@
 **Slug:** `telegram-button-approval`
 **Status:** ⚠ **convergence-failed** — the 10-iteration cap was reached with DESIGN-class findings still being
 raised in round 10. The `review-convergence` tag is **not** written. Human input is required before a retry.
-**Iterations:** 11 (2026-10-19; round 11 was a desk-approved extra round under the 80/20 convergence standard)
+**Iterations:** 12 (2026-10-19; rounds 11–12 were desk-approved extra rounds under the 80/20 convergence standard)
 
 ## Cross-model review: codex-cli:gpt-6-astra
 
@@ -73,11 +73,14 @@ standing structural answer is a second trusted reviewer, the operator's decision
 
 | 11 | all six internal, codex | ~16 | dispatch entry points listed and discovered; comment/type lines skipped by parser; Slack prompt buttons mapped; exceptions end on events, age only warns; burn-alert `handle` exists |
 
-Round 11 was run on the desk's instruction to test the 80/20 standard ("stop when findings stop changing
-the build"). It still produced build-changing findings — all on the class-map test — so the tag is not
-written. Round 11's findings were applied in the spec text after the round; no round reviewed those edits.
+| 12 | all six internal, codex | ~15 | `unwired` redefined (no button site, no production caller); every branch in an entry point counts; Slack `_handleInteraction` + `action_id`; `CallbackRegistry.register`; `none` class; attention-item claim dropped; item 7 names prompt adapters |
 
-## Findings still open at the cap (rounds 10–11, addressed in text, unreviewed)
+Rounds 11 and 12 were run on the desk's instruction to test the 80/20 standard ("stop when findings stop
+changing the build"). Each still produced build-changing findings — all on the class-map test — so the tag
+is not written. Round 12's findings were applied in the spec text after the round; no round reviewed those
+edits. The desk said no further rounds without its say.
+
+## Findings still open (rounds 10–12, addressed in text, unreviewed)
 
 - Prompt-gate answers are not S-equivalent (the permission floor answers only registered approval prompts):
   reclassified as P under an event-bound exception tied to ACT-120.
@@ -93,6 +96,13 @@ written. Round 11's findings were applied in the spec text after the round; no r
   exists, so `unwired` means unconstructed; a fixed review-by date would redden the suite fleet-wide (now: event-bound
   end, age only warns); the prompt-gate exception must end when sibling item 7 moves every authority-bearing
   answer, not at ACT-120.
+- Round 12 (build-changing, class-map test): the `unwired` rule contradicted itself (burn-alert branches inside a
+  listed entry point would fail the baseline — now `unwired` = no button site and no production caller); the
+  dispatch rule missed branches on looked-up state (now every branch in an entry point); Slack had no discovery
+  rule (now `_handleInteraction` + Block Kit `action_id`); `CallbackRegistry.register` callers were invisible
+  (now a listed generic method); the "daily job" attention item did not exist (claim dropped — the warning is
+  best-effort, the event ends the exception); the prompt-gate exception's ending event did not name prompts (item
+  7 now does); the "unlisted entry point" fixture contradicted the stated limit (removed).
 
 ## Hand-offs (this agent's evolution queue, owner `echo`)
 
@@ -102,8 +112,10 @@ auto-resume · ACT-119 burn-alert buttons · ACT-120 prompt-gate always-approve 
 
 ## Convergence verdict
 
-**Not converged.** Eleven rounds; DESIGN-class findings were still arriving, though they narrowed from
-architecture (rounds 1–3) to the mechanics of one unit test (rounds 10–11). The analysis
+**Not converged.** Twelve rounds; DESIGN-class findings were still arriving, though they narrowed from
+architecture (rounds 1–3) to the mechanics of one unit test (rounds 10–12). The analysis sections have not
+changed since round 7. A sensible retry is a targeted review of §4 item 2 alone, or splitting that test into
+its own small spec. The analysis
 sections — the head-on answer, the classes, the volume options and their recommendation — were stable from
 round 8 onward apart from the (d) addition. A retry needs a human decision on scope: either accept the
 documentation-only part (rule, notes, hand-offs) and split the class-map test into its own small spec, or run a

@@ -6,7 +6,7 @@ eli16-overview: "telegram-button-approval.eli16.md"
 parent-principle: "Structure beats Willpower"
 lessons-engaged: "Structure beats Willpower; Know Your Principal; L15 Authorization Policy; Canonical Pipeline Operational Completeness; Self-Unblock rung FLOOR (capability is not authority); Signal vs Authority; Verify the State Not Its Symbol; Mobile-Complete Operator Actions; Agent Proposes, Operator Approves; Maturation Path; Migration Parity"
 related-feedback: "fb-bc5da66f-f46"
-review-status: "not converged: 11 rounds on 2026-10-19; round 11 (desk-approved extra round) still produced build-changing findings on the class-map test, applied here unreviewed; not tagged review-convergence"
+review-status: "not converged: 12 rounds on 2026-10-19; rounds 11 and 12 (desk-approved extra rounds) each still produced build-changing findings on the class-map test; round 12's are applied here unreviewed; not tagged review-convergence"
 review-report: "docs/specs/reports/telegram-button-approval-convergence.md"
 related-specs: "docs/specs/a2a-pairing-invite-link.md (§6.1 Honest boundary); docs/specs/OPERATOR-AUTHORIZATION-REQUEST-SPEC.md (display-integrity rule); docs/specs/feedback-triage-and-execution.md (§4 review gate, per-PR floor, §5 action list)"
 ---
@@ -291,30 +291,35 @@ a phone cannot open (a Mobile-Complete gap owned by the tunnel feature).
    ordinary fix PRs, a phase of an already-approved spec), and most button payloads have no fixed prefix. So
    every **site** carries an annotation comment `// callback-site: <site-id>`, and the map
    `src/data/telegramCallbackClasses.json` lists each site id with the actions it produces or handles, each
-   classed S, R or P. Sites are of three kinds, and the test discovers each kind mechanically:
-   - **Button-building sites:** a code line (comments and type declarations skipped by the TypeScript parser,
-     not by a regex) that constructs `callback_data` or `inline_keyboard`, calls a listed generic button method
-     (today `sendPairingPrompt`), or builds the `{text, data}` literal passed to one (today in
+   classed S, R, P or `none` (a branch that only answers, declines, or rejects malformed data). The test
+   discovers sites of two kinds, by TypeScript-parser walk over `src/**/*.ts` (comments and type positions never
+   count):
+   - **Button-building sites:** a construction of `callback_data` or `inline_keyboard` (Telegram) or a Block Kit
+     `action_id` inside a button element (Slack); a call of a listed generic button method (today
+     `sendPairingPrompt`, `CallbackRegistry.register`); or the `{text, data}` literal passed to one (today in
      `PairingInviteTelegram`). A multi-line construction is one site, annotated on its first line.
-   - **Dispatch sites:** every branch inside a listed dispatch entry point — `TelegramAdapter.processCallbackQuery`,
-     the `/internal/telegram-callback` route handler, `PairingInviteTelegram.onCallback`, `BurnAlertButtons.handle`
-     — that reads callback data (a `startsWith`, `JSON.parse`, or `switch` on it). Any such branch without an
-     annotation fails, so a new handler for an `unwired` action is caught whether or not its author annotates.
-   - **Slack prompt buttons** (`SlackAdapter` `prompt::` build and handle) are the same surface by consequence
-     and are mapped as P under the prompt-gate exception; the scan covers `src/**/*.ts` for both adapters.
+   - **Dispatch sites:** every conditional branch (`if`/`else if`/`case`/early return) in the body of a listed
+     dispatch entry point, whatever value it branches on — the data itself or a record looked up from it —
+     because in three of the four Telegram handlers the action is chosen on server-side state. Entry points
+     today: `TelegramAdapter.processCallbackQuery`, the `/internal/telegram-callback` route handler,
+     `PairingInviteTelegram.onCallback`, `BurnAlertButtons.handle`, `SlackAdapter._handleInteraction`.
    A P action carries either an exception record — reason, ending **event**, granted date — or the status
-   `unwired` (burn-alert Release and Snooze: handled by `BurnAlertButtons.handle`, but nothing constructs the
-   class yet). Exceptions: `pi:` approve/finish and `tc:g` until dashboard-pin-structural item 2; prompt-gate
-   answers (Telegram and Slack) until sibling item 7 moves every authority-bearing answer to the dashboard (ACT-120
-   narrows the keyboard first; it does not end the exception). The test fails when: an annotation is missing
-   from a discovered site; a map id has no annotation or an annotation has no map entry; a P action is neither
-   `unwired` nor excepted; an `unwired` action's id appears on a dispatch site; or a new generic button method or
-   dispatch entry point is added to the lists without a map entry. An exception older than 90 days from its
-   granted date makes the test **print a warning** (the attention queue gets one deduped item from the daily
-   job), never a failure — a date that turns the suite red fleet-wide would only teach date-bumping. Honest
-   limits: the map, the annotations and the entry-point lists are files the agent can edit, so the test catches
-   *forgetting* to classify, not *misclassifying* — review of the diff does that; a replaced action under an
-   unchanged annotation passes; and a new generic method or entry point must be added to the lists by hand.
+   `unwired`, defined as: a handler exists but **no button-building site produces the action and no production
+   code calls its entry point** (today burn-alert Release and Snooze: `BurnAlertButtons.handle` exists, nothing
+   constructs the class). Branches inside an `unwired` handler are annotated like any other and do not fail;
+   the test fails the moment a button-building site produces an `unwired` action or a production caller of its
+   entry point appears. Exceptions: `pi:` approve/finish and `tc:g` until dashboard-pin-structural item 2;
+   prompt-gate answers (Telegram and Slack, every authority-bearing prompt type) until sibling item 7, which
+   names them. The test fails when: a discovered site has no annotation; a map id has no annotation or an
+   annotation has no map entry; a P action is neither `unwired` nor excepted; an `unwired` action gains a
+   button site or a production caller; or a listed method or entry point in the map is absent from the code.
+   An exception older than 90 days from its granted date makes the test print a warning on its own line; that
+   is best-effort only — a passing test's output reaches nobody by itself — and the real end of each exception
+   is the named event in the sibling spec, which must delete the record. Honest limits: the map, the
+   annotations and the lists of generic methods and entry points are files the agent can edit, so the test
+   catches *forgetting* to classify, not *misclassifying* — review of the diff does that; a replaced action
+   under an unchanged annotation passes; and a **new** generic button method or dispatch entry point is
+   invisible until a human adds it to the lists — the test cannot discover one, and promises nothing there.
    The recommended way to give the map teeth is to make it a code-owned path (operator decision, one GitHub
    review per reclassification).
 
@@ -359,8 +364,10 @@ This spec's conclusions do not depend on it.
    agent's reach and is cancellable. A session minted by the readable PIN must then no longer satisfy a
    P-class route: P-capable sessions come only from the stronger credential, and legacy sessions are
    invalidated at migration.
-7. Move every P-class tap (pairing approve/finish, tunnel-consent grant) to the dashboard in the same release
-   as item 2 (§2), and delete their exception records from the class map in that release.
+7. Move every P-class tap to the dashboard in the same release as item 2 (§2): pairing approve/finish,
+   tunnel-consent grant, and every authority-bearing prompt-gate answer on Telegram and Slack (permission and
+   plan prompts; plain questions and pickers may stay as input), and delete each exception record from the
+   class map in that release, with a test that the map holds no exception once the release's flag is on.
 8. Consider tamper-evidence for taps on installs with a lifeline: the lifeline records every callback id it
    actually received, so a forwarded callback with no matching record is a detected forgery (cooperative, but
    visible). Installs where the adapter polls Telegram itself need a different design or none.
@@ -374,7 +381,7 @@ This spec's conclusions do not depend on it.
 
 ## Maturation plan
 
-- **test-agent-live:** not applicable to the documentation; the class-map test runs in the unit tier of the throwaway build's suite — it passes on the annotated tree, fails on each seeded case in its own unit test, and warns (not fails) on an aged exception.
+- **test-agent-live:** not applicable to the documentation; the class-map test runs in the unit tier of the throwaway build's suite — it passes on the annotated tree (burn-alert handler branches included), fails on each seeded case in its own unit test, and warns (not fails) on an aged exception.
 - **dev-agent-live:** the test runs in Echo's suite from the merge of the `/instar-dev` build; it has no runtime surface.
 - **fleet:** not applicable — nothing is installed on agents; the test runs in instar's own CI and pre-push tiers.
 - **graduation criterion:** the test is green on main, and its own unit test shows it failing on each seeded case.
@@ -383,10 +390,12 @@ This spec's conclusions do not depend on it.
 ## Tests
 
 - **Unit:** the class-map test above; its own test seeds every failure case listed in §4 (an unannotated
-  button line, an unannotated `{text, data}` literal, an unannotated dispatch branch, a map id without an
-  annotation, an annotation without a map entry, a P action neither `unwired` nor excepted, an `unwired` id on a
-  dispatch site, an unlisted entry point) and expects each to fail, seeds a 91-day-old exception and expects a
-  warning without failure, and expects the annotated current tree to pass.
+  button construction, an unannotated Slack `action_id` button, an unannotated `{text, data}` literal, an
+  unannotated branch inside a listed entry point, a map id without an annotation, an annotation without a map
+  entry, a P action neither `unwired` nor excepted, an `unwired` action with a button site, a listed entry
+  point missing from the code) and expects each to fail, seeds a 91-day-old exception and expects a warning
+  without failure, and expects the annotated current tree — including `BurnAlertButtons.handle`'s branches —
+  to pass.
 - **Integration / E2E:** not applicable — no route, job or runtime path changes.
 
 ## Approval volume — the options, with their real costs
@@ -546,7 +555,7 @@ and the PR body already names the test.
 
 | Decision point | Classification | Justification / floor |
 |---|---|---|
-| An unannotated or unmapped button/dispatch site, or a P action neither `unwired` nor excepted, fails the class-map test; an old exception warns (§4) | **invariant** | A closed allowlist on an authority surface; unclassified defaults to P, so the conservative outcome is a failing build that a human classifies. |
+| An unannotated or unmapped button/dispatch site, a P action neither `unwired` nor excepted, or an `unwired` action that gains a button site or production caller fails the class-map test; an old exception warns (§4) | **invariant** | A closed allowlist on an authority surface; unclassified defaults to P, so the conservative outcome is a failing build that a human classifies. |
 
 The approval classes themselves (§1) are assigned by spec review, not at runtime.
 
