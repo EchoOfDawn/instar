@@ -36,7 +36,7 @@ export { RerouteRefusedError } from './rerouteRefusedError.js';
 import { initialConfinedStartupState, stepConfinedStartup, classifyConfinedStartupPane, confinedPromptLine, LOGIN_REQUIRED, showsOtherPermissionMode, CONFINED_STARTUP_BUDGET_MS, type ConfinedStartupState, type ConfinedStartupObservation } from './confinedStartupDialogs.js';
 
 const squash = (text: string): string => text.replace(/\s+/g, '');
-import { extractGeminiFinalAssistantBlock, meaningfulTail } from './paneText.js';
+import { extractGeminiFinalAssistantBlock, meaningfulTail, meaningfulNonBlankTail } from './paneText.js';
 import { ensureInteractiveReady } from './ensureInteractiveReady.js';
 import { withSyncOp } from './InFlightSyncOpMarker.js';
 import type { DegradedTmuxGuard } from '../monitoring/DegradedTmuxGuard.js';
@@ -76,7 +76,7 @@ import { classifyLoginExpired } from './LoginExpiredSignature.js';
 import { InputGuard, type TopicBinding } from './InputGuard.js';
 import { resolveIdleSinceSeed } from './idleSincePersistence.js';
 import type { InputDetector } from '../monitoring/PromptGate.js';
-import { toPaneTailLines, type PermissionPromptAutoResolver } from '../monitoring/PermissionPromptAutoResolver.js';
+import { toPaneTailLines, type PermissionPromptAutoResolver, RESOLVER_PREGATE_RE } from '../monitoring/PermissionPromptAutoResolver.js';
 
 const execFileAsync = promisify(execFile);
 import type { Session, SessionManagerConfig, SessionStatus, ModelTier } from './types.js';
@@ -3015,11 +3015,13 @@ rm()  { "${shimRunner}" rm  "$@"; }
           const output = await this.captureMeaningfulTailMaybeAsync(session.tmuxSession, 5);
 
           // ── Permission-Prompt Auto-Resolver (always-on safety floor) ──
-          // Cheap pre-gate on the already-captured 5-line tail, keyed on the
-          // MENU SHAPE (a glyph/❯-led numbered option, or a generic blocking
-          // affordance — all bottom-anchored, so reliably in the last 5 lines).
-          // Only on a hit do a fuller capture + evaluate, so the common
-          // (no-menu) case adds ZERO extra captures.
+          // Cheap pre-gate on the last 5 NON-BLANK rows, keyed on the MENU SHAPE
+          // (a glyph/❯-led numbered option, or a generic blocking affordance —
+          // all bottom-anchored). Only on a hit do a fuller capture + evaluate,
+          // so the common (no-menu) case adds ZERO extra captures.
+          // Non-blank, not raw rows: live 2026-10-19 a blocking menu sat above 17
+          // blank rows and one status line, so every raw-row tail was blanks plus
+          // that line and the resolver never saw the menu (see meaningfulNonBlankTail).
           // A confined session's ONLY answerer is its own startup state machine, and only before
           // delivery (docs/specs/confined-spawn-subscription-reroute.md D3): no generic auto-answerer
           // may press a key in it — on the trust dialog Enter selects "No, exit", and after startup an
@@ -3030,10 +3032,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
             this.confinedDialogReported.add(session.id);
             this.reportConfinedDialog(session.tmuxSession, 'dialog-after-delivery', output);
           }
-          if (this.permissionPromptResolver && output && !confinedSession &&
-              /(?:[>❯●○◉]\s*)?\d+\.\s|Esc to cancel|Do you want to proceed/i.test(output)) {
+          const resolverPregate = this.permissionPromptResolver && output && !confinedSession
+            ? (await this.captureMeaningfulNonBlankTailMaybeAsync(session.tmuxSession, 5)) ?? output
+            : null;
+          if (this.permissionPromptResolver && resolverPregate && !confinedSession && RESOLVER_PREGATE_RE.test(resolverPregate)) {
             try {
-              const full = await this.captureMeaningfulTailMaybeAsync(session.tmuxSession, 16);
+              const full = await this.captureMeaningfulNonBlankTailMaybeAsync(session.tmuxSession, 16);
               if (full) {
                 await this.permissionPromptResolver.evaluate(session.tmuxSession, toPaneTailLines(full));
               }
@@ -5434,6 +5438,19 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const raw = await this.captureOutputAsync(tmuxSession, Math.max(lines * 4, 50));
     if (raw === null) return null;
     return meaningfulTail(raw, lines);
+  }
+
+  /**
+   * The last `lines` NON-BLANK rows (resolver pre-gate + evaluate). A wider physical
+   * window than captureMeaningfulTail, because the rows it must skip are the blank
+   * padding a host draws between a blocking menu and its bottom status line.
+   */
+  private async captureMeaningfulNonBlankTailMaybeAsync(tmuxSession: string, lines: number): Promise<string | null> {
+    const raw = this.tmuxAsyncEnabled
+      ? await this.captureOutputAsync(tmuxSession, Math.max(lines * 6, 80))
+      : this.captureOutput(tmuxSession, Math.max(lines * 6, 80));
+    if (raw === null) return null;
+    return meaningfulNonBlankTail(raw, lines);
   }
 
   /**
