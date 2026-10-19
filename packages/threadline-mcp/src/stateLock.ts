@@ -4,8 +4,8 @@
  * Claude Desktop and every Claude Code session each start their own threadline-mcp, all on one
  * state directory and one identity. Without coordination they race on the pairing stores and the
  * relay. The owner holds `<stateDir>/threadline/owner.lock` (its pid, created exclusively); a lock
- * whose pid is no longer running is stale and is taken over. Only the owner pairs, serves the
- * terminal socket and writes pairing state; the others refuse pairing and credentials and re-read
+ * whose pid is no longer running is stale and is taken over. Only the owner pairs and writes
+ * pairing state; the others refuse pairing and credentials and re-read
  * pins from disk for every message.
  */
 

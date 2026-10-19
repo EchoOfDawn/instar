@@ -70,7 +70,6 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
         ...process.env as Record<string, string>,
         THREADLINE_RELAY: relayUrl, THREADLINE_STATE_DIR: mcpState.stateDir, THREADLINE_NAME: 'desktop-agent', THREADLINE_OWNER: 'Justin',
         THREADLINE_SEND_PORT: '1', // never adopt a local listener proxy on this machine
-        THREADLINE_PAIR_TERMINAL: '1', // the terminal fallback is off unless the person turns it on (D5)
       },
       stderr: 'pipe',
     });
@@ -117,13 +116,6 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
     const inboxNow = await call('threadline_inbox');
     expect(inboxNow.body.pairing.join('\n')).toMatch(/now paired with "echo"/);
     expect(JSON.stringify(inboxNow.body.messages)).not.toMatch(/pair-invite-/);
-
-    // The terminal fallback (D5) reaches the same running server: `threadline-mcp pair status`.
-    const cli = execFileSync(process.execPath, [path.join(pkg, 'dist', 'server.js'), 'pair', 'status'], {
-      env: { ...process.env, THREADLINE_STATE_DIR: mcpState.stateDir }, encoding: 'utf8', timeout: 15_000,
-    });
-    expect(cli).toContain(instarFp);
-    expect(cli).toContain('mutual-verified');
 
     const sent = await call('threadline_send', { to: instarFp, message: 'the vault password', credential: true });
     expect(sent.isError).toBe(false);

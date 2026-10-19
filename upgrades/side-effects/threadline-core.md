@@ -213,6 +213,14 @@ Re-reading the spec against the build found three things it asked for that were 
 - Claude Desktop is not a required host; the spec says so and drops it as an open question.
 - Evidence: 2186 unit tests (109 files) and 8 E2E pass after the rename; the core package's own tests pass; both workflows parse with the environment and step order.
 
+## threadline-mcp 0.5.1: the terminal pairing fallback is removed (Justin, 2026-10-18)
+
+- Removed: `packages/threadline-mcp/src/pairSocket.ts` (the `<stateDir>/pair.sock` Unix socket and the `threadline-mcp pair open|finish|status` CLI), the `pair` argv dispatch in `server.ts`, serving the socket at startup, `THREADLINE_PAIR_TERMINAL`, and `terminalEnabled` / `terminalCommand` in `pairTools.ts`. Reason: any workflow where the person types commands in a terminal is unacceptable for this product.
+- Without elicitation, `threadline_pair_open`, `_finish` and `_forget` return one plain refusal (`NO_ELICIT`) telling the agent what to say: pairing needs an app that can ask you directly (Claude Code can); this app can't, so pairing isn't available here. It never mentions a terminal, a command, an env var or npx. `_status`, `_invite` and `_cancel` are unchanged.
+- Over-block: a host without elicitation can no longer pair at all (0.5.0 let it pair through the terminal when the person opted in). Messaging is unaffected.
+- Under-block: none. The change only removes an approval path; the elicitation path and every send gate are untouched. It also removes the socket that any process running as the user could reach.
+- Evidence: `pair-tools.test.ts` (the refusal for open, finish and forget, with the banned-word check; status, invite and cancel still work without elicitation), the stdio E2E without `THREADLINE_PAIR_TERMINAL`, and `pair-socket.test.ts` deleted. Breakage: 1 tried (the word "terminal" put back into the refusal), 1 caught.
+
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
