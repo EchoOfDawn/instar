@@ -12,7 +12,27 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export interface StateLock { held: boolean; holderPid: number | null; release(): void }
+export interface StateLock {
+  held: boolean;
+  holderPid: number | null;
+  release(): void;
+  /** The owner records the app it serves (the MCP client's name), so a refusal can name the app, never a pid. */
+  setApp(name: string): void;
+  /** The app named by the current owner, read fresh from the lock, or null. */
+  holderApp(): string | null;
+}
+
+/**
+ * Lock file format: the pid on the first line, optionally the app's name on the second. A lock that holds
+ * only a pid (threadline-mcp 0.5.x) is still read, and a 0.5.x reader's parseInt still finds the pid.
+ */
+export function parseLock(text: string): { pid: number | null; app: string | null } {
+  const [first, ...rest] = text.split('\n');
+  const pid = Number.parseInt(first.trim(), 10);
+  const app = rest.join(' ').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 100);
+  return { pid: Number.isInteger(pid) && pid > 0 ? pid : null, app: app || null };
+}
+const clean = (name: string) => name.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 100);
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; } };
 
@@ -22,18 +42,35 @@ export function acquireStateLock(stateDir: string, pid = process.pid): StateLock
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       fs.writeFileSync(file, String(pid), { flag: 'wx', mode: 0o600 });
-      return { held: true, holderPid: pid, release: () => { try { if (fs.readFileSync(file, 'utf8').trim() === String(pid)) fs.unlinkSync(file); } catch { /* gone */ } } };
+      const ours = () => { try { return parseLock(fs.readFileSync(file, 'utf8')).pid === pid; } catch { return false; } };
+      return {
+        held: true, holderPid: pid,
+        release: () => { try { if (ours()) fs.unlinkSync(file); } catch { /* gone */ } },
+        setApp: (name: string) => {
+          const n = clean(name);
+          if (!n || !ours()) return;
+          const tmp = `${file}.${pid}.tmp`;
+          try { fs.writeFileSync(tmp, `${pid}\n${n}`, { mode: 0o600 }); fs.renameSync(tmp, file); } catch { try { fs.unlinkSync(tmp); } catch { /* none */ } }
+        },
+        holderApp: () => { try { return parseLock(fs.readFileSync(file, 'utf8')).app; } catch { return null; } },
+      };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      const holder = Number.parseInt(fs.readFileSync(file, 'utf8').trim(), 10);
-      if (Number.isInteger(holder) && holder > 0 && holder !== pid && alive(holder)) {
-        return { held: false, holderPid: holder, release: () => {} };
-      }
+      const holder = parseLock(fs.readFileSync(file, 'utf8')).pid;
+      if (holder !== null && holder !== pid && alive(holder)) return notHeld(file, holder);
       // Stale (dead holder or unreadable): remove and try once more. A racing starter that wins
       // the exclusive create in between is respected.
       try { fs.unlinkSync(file); } catch { /* someone else removed it */ }
     }
   }
-  const holder = Number.parseInt(fs.readFileSync(file, 'utf8').trim(), 10);
-  return { held: false, holderPid: Number.isInteger(holder) ? holder : null, release: () => {} };
+  let holder: number | null = null;
+  try { holder = parseLock(fs.readFileSync(file, 'utf8')).pid; } catch { /* gone */ }
+  return notHeld(file, holder);
+}
+
+function notHeld(file: string, holderPid: number | null): StateLock {
+  return {
+    held: false, holderPid, release: () => {}, setApp: () => {},
+    holderApp: () => { try { return parseLock(fs.readFileSync(file, 'utf8')).app; } catch { return null; } },
+  };
 }

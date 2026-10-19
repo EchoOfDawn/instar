@@ -40,8 +40,11 @@ describe.skipIf(!hasDeps)('threadline-mcp: two servers on one state directory', 
     const first = await start();
     const second = await start();
     const text = async (c: InstanceType<typeof Client>) => JSON.stringify((await c.callTool({ name: 'threadline_pair_invite', arguments: {} })).content);
-    expect(await text(second)).toMatch(/owns pairing/);
-    expect(await text(first)).not.toMatch(/Pairing is unavailable/);
+    // The refusal names the owning app (its MCP client name), never a pid (Echo review R2-2).
+    const refused = await text(second);
+    expect(refused).toMatch(/Pairing is open in host\. Finish it there, or close that app and try again\./);
+    expect(refused).not.toMatch(/pid|THREADLINE_STATE_DIR/);
+    expect(await text(first)).not.toMatch(/Pairing is open in/);
     await second.close(); await first.close();
   }, 60_000);
 });

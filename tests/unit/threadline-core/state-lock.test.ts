@@ -5,7 +5,8 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireStateLock } from '../../../packages/threadline-mcp/src/stateLock.js';
+import { acquireStateLock, parseLock } from '../../../packages/threadline-mcp/src/stateLock.js';
+import { notOwnerRefusal } from '../../../packages/threadline-mcp/src/pairTools.js';
 import { StandalonePairing } from '../../../packages/threadline-mcp/src/pairing.js';
 import { generateIdentityKeyPair } from '@sagemindai/threadline-core';
 
@@ -23,6 +24,40 @@ describe('state lock', () => {
     fs.writeFileSync(path.join(dir, 'threadline', 'owner.lock'), '2147483646'); // no such process
     expect(acquireStateLock(dir, process.pid).held).toBe(true);
     expect(fs.statSync(path.join(dir, 'threadline', 'owner.lock')).mode & 0o077).toBe(0);
+  });
+
+  it('the owner records its app name; a non-owner reads it fresh; a pid-only lock (0.5.x) is still read (R2-2)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-lock-app-'));
+    const file = path.join(dir, 'threadline', 'owner.lock');
+    const a = acquireStateLock(dir, process.pid);
+    const b = acquireStateLock(dir, process.ppid);
+    expect(b.held).toBe(false);
+    expect(b.holderApp()).toBeNull(); // nothing recorded yet
+    a.setApp('Claude\nDesktop\u0007');
+    expect(b.holderApp()).toBe('Claude Desktop');
+    expect(fs.readFileSync(file, 'utf8')).toBe(`${process.pid}\nClaude Desktop`);
+    expect(Number.parseInt(fs.readFileSync(file, 'utf8'), 10)).toBe(process.pid); // what a 0.5.x reader does
+    expect(fs.statSync(file).mode & 0o077).toBe(0);
+    b.setApp('impostor'); // a non-owner cannot rename the owner
+    expect(b.holderApp()).toBe('Claude Desktop');
+    // A third instance still sees the live owner through the two-line format.
+    expect(acquireStateLock(dir, process.ppid)).toMatchObject({ held: false, holderPid: process.pid });
+    a.release();
+    expect(fs.existsSync(file)).toBe(false);
+    // An old pid-only lock held by a live process is respected, with no app name.
+    fs.writeFileSync(file, String(process.ppid));
+    const c = acquireStateLock(dir, process.pid);
+    expect(c).toMatchObject({ held: false, holderPid: process.ppid });
+    expect(c.holderApp()).toBeNull();
+    expect(parseLock('123')).toEqual({ pid: 123, app: null });
+    expect(parseLock('123\nCursor')).toEqual({ pid: 123, app: 'Cursor' });
+    expect(parseLock('garbage')).toEqual({ pid: null, app: null });
+  });
+
+  it('the non-owner refusal names the app in plain words, never a pid or a setting', () => {
+    expect(notOwnerRefusal('Claude Desktop')).toBe('Tell your person this, in these words: "Pairing is open in Claude Desktop. Finish it there, or close that app and try again."');
+    expect(notOwnerRefusal(null)).toContain('Pairing is open in another app.');
+    for (const t of [notOwnerRefusal('x'), notOwnerRefusal(null)]) for (const banned of ['pid', 'terminal', 'npx', 'THREADLINE_', 'command']) expect(t).not.toContain(banned);
   });
 });
 

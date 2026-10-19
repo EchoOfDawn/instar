@@ -52,7 +52,8 @@ import http from 'node:http';
 import { WebSocket } from 'ws';
 import { StandalonePairing, INVITE_IN_MESSAGE } from './pairing.js';
 import { classifyInviteText } from '@sagemindai/threadline-core';
-import { PairTools, type Elicit } from './pairTools.js';
+import { PairTools, notOwnerRefusal, type Elicit, type ToolResult } from './pairTools.js';
+import { ApprovalCoordinator, type ApprovalAction } from './approvalPage.js';
 import { acquireStateLock } from './stateLock.js';
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -1077,7 +1078,8 @@ async function main() {
   const stateLock = acquireStateLock(STATE_DIR);
   if (!stateLock.held) process.stderr.write(`[threadline-mcp] Another threadline-mcp (pid ${stateLock.holderPid}) owns pairing for ${STATE_DIR}; this one will message but not pair or send credentials.\n`);
   process.on('exit', () => stateLock.release());
-  const NOT_OWNER = `another threadline-mcp (pid ${stateLock.holderPid}) is running for this state directory and owns pairing. Use the app that started it, or give this one its own THREADLINE_STATE_DIR.`;
+  // The refusal names the owning app (recorded in its lock), never a pid or a setting (Echo review R2-2).
+  const notOwner = () => notOwnerRefusal(stateLock.holderApp());
   const pairing = new StandalonePairing({
     ownsPairing: stateLock.held,
     stateDir: STATE_DIR,
@@ -1119,7 +1121,7 @@ async function main() {
   const pairBase = {
     pairing,
     // Pairing ops travel on this server's own relay connection; through a listener proxy they cannot.
-    unavailable: () => (!stateLock.held ? `Pairing is unavailable: ${NOT_OWNER}` : relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
+    unavailable: () => (!stateLock.held ? notOwner() : relay.isListenerProxy ? `Pairing is unavailable: ${PROXY_NOTE}` : null),
     knownAgents: () => contacts.getAll().map((c) => ({ fingerprint: c.agentId, name: c.name })),
     resolvePeer: (nameOrFp: string) => {
       const v = nameOrFp.trim().toLowerCase();
@@ -1128,8 +1130,34 @@ async function main() {
       return m.length === 1 ? m[0].agentId : null;
     },
   };
-  // Elicitation is offered per call: only when this client declared it can ask the person.
-  const toolsForCall = () => new PairTools({ ...pairBase, elicit: server.server.getClientCapabilities()?.elicitation ? elicit : null });
+  // Elicitation is offered per call: only when this client declared it can ask the person. The choice
+  // between the app's own dialog and the local approval page is made by that capability alone, never by
+  // the app's name (Echo review R2-3).
+  const hasElicitation = () => !!server.server.getClientCapabilities()?.elicitation;
+  const toolsForCall = () => new PairTools({ ...pairBase, elicit: hasElicitation() ? elicit : null });
+
+  // The owner records which app it serves, so another app's refusal can name it (R2-2).
+  const prevInitialized = server.server.oninitialized;
+  server.server.oninitialized = () => {
+    prevInitialized?.();
+    stateLock.setApp(server.server.getClientVersion()?.name ?? '');
+  };
+
+  // Without elicitation, the person answers on a local approval page that this process (the pairing
+  // owner) serves on 127.0.0.1 and opens in their browser (spec r4 D5). The tool returns at once.
+  const approvals = new ApprovalCoordinator({ timeoutMs: ELICIT_TIMEOUT_MS });
+  process.on('exit', () => approvals.close());
+  const personAct = async (action: ApprovalAction, run: (tools: PairTools) => Promise<ToolResult>): Promise<ToolResult> => {
+    if (hasElicitation()) return run(toolsForCall()); // unchanged: the app asks the person itself
+    if (!stateLock.held) return { ok: false, error: notOwner() };
+    try {
+      return await approvals.start(action, (pageElicit) => run(new PairTools({ ...pairBase, elicit: pageElicit })));
+    } catch {
+      return run(new PairTools({ ...pairBase, elicit: null })); // the page could not listen: the plain refusal
+    }
+  };
+  const PAGE_BOUNDARY = 'In an app that cannot ask your person itself, Threadline instead opens a page in their browser and this returns at once with pending: true; pass the note on and check threadline_pair_status later. ' +
+    'Never open or answer that page yourself. It is weaker than the app\'s own dialog, because a program that can fetch local URLs could answer it; opening an invite still needs the invite itself, which you never have.';
   const asResult = (r: Record<string, unknown>) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }],
     ...(r.ok === false ? { isError: true } : {}),
@@ -1149,30 +1177,31 @@ async function main() {
   server.tool(
     'threadline_pair_open',
     'Your person was sent a pairing invite and wants to accept it. Call this with NO arguments: Threadline asks your person to paste the invite directly ' +
-    '(it never passes through you) and to approve or decline. Do not paste invite text into any tool.',
+    '(it never passes through you) and to approve or decline. Do not paste invite text into any tool. ' + PAGE_BOUNDARY,
     {},
-    async () => asResult(await toolsForCall().open()),
+    async () => asResult(await personAct('open', (t) => t.open())),
   );
 
   server.tool(
     'threadline_pair_finish',
-    'Someone accepted one of your invites. Threadline asks your person whether that agent is who they meant (Finish) or not (Not them). You cannot decide this yourself.',
+    'Someone accepted one of your invites. Threadline asks your person whether that agent is who they meant (Finish) or not (Not them). You cannot decide this yourself. ' + PAGE_BOUNDARY,
     { iid: z.string().optional().describe('Which invite, if more than one accept is waiting') },
-    async (args) => asResult(await toolsForCall().finish(args)),
+    async (args) => asResult(await personAct('finish', (t) => t.finish(args))),
   );
 
   server.tool(
     'threadline_pair_status',
-    'Show pairings (with their state), open invites, accepts waiting for your person, and recent pairing events. Never shows invite secrets.',
+    'Show pairings (with their state), open invites, accepts waiting for your person, and recent pairing events. Never shows invite secrets. ' +
+    'pendingApproval: an approval page is open for your person; lastApproval: how the last one ended.',
     {},
-    async () => asResult(toolsForCall().status()),
+    async () => asResult({ ...toolsForCall().status(), ...approvals.statusFields() } as ToolResult),
   );
 
   server.tool(
     'threadline_pair_forget',
-    'Unpair from an agent. Your person confirms; you cannot unpair on your own. Use it when the other agent has a new identity (a new key means a new pairing).',
+    'Unpair from an agent. Your person confirms; you cannot unpair on your own. Use it when the other agent has a new identity (a new key means a new pairing). ' + PAGE_BOUNDARY,
     { peer: z.string().describe('Contact name or agent ID of the paired agent') },
-    async (args) => asResult(await toolsForCall().forget(args)),
+    async (args) => asResult(await personAct('forget', (t) => t.forget(args))),
   );
 
   server.tool(

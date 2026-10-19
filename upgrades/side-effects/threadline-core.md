@@ -224,3 +224,14 @@ Re-reading the spec against the build found three things it asked for that were 
 ## Class-Closure Declaration (display-only mirror)
 
 `unbounded-self-action` — closure **n/a** (negative declaration). The crypto, store and gate are pure or single-shot. The one repeated action is the pairing engine's Finish send (`flow.ts`, ported from Instar). It starts only when an operator approves Finish, sends at most 5 times over about 10 minutes, and stops on the peer's ack. It is never self-triggered. Covered by the ported "finish retries are bounded (5)" test.
+
+## threadline-mcp 0.6.0: the local approval page (spec r4 D5, Echo review round 2)
+
+- New `packages/threadline-mcp/src/approvalPage.ts` (no MCP SDK import): `ApprovalPage` (one HTTP listener per pending action, 127.0.0.1, port 0, 32-byte hex token path, per-question 16-byte token, 10-minute expiry, result readable for 60 s after the action ends, then closed) and `ApprovalCoordinator` (one page at a time per server; returns pending as soon as the action asks its first question, or the action's own result if it ends without asking; opens the browser itself; records `lastApproval`). Listener and timers are `unref`'d, so the page never keeps the process alive.
+- `server.ts`: without client elicitation, open/finish/forget go through the coordinator in the pairing owner; a non-owner returns `notOwnerRefusal(app)`; a page that cannot listen falls back to the existing `NO_ELICIT` refusal. With elicitation, nothing changes. `threadline_pair_status` merges `pendingApproval` / `lastApproval`. The non-owner text no longer contains a pid or `THREADLINE_STATE_DIR` for any client.
+- `stateLock.ts`: the owner lock is `<pid>` or `<pid>\n<app name>`; the owner writes the app name after MCP initialize (atomic rename, 0600). A 0.5.x reader's `parseInt` still reads the pid, and a pid-only lock is still read.
+- `pairTools.ts`: results of open/finish/forget also carry the claimed `agent` name (used for the page's result line).
+- Deviation from the brief, on purpose: `Referrer-Policy` is `same-origin`, not `no-referrer`. Under `no-referrer` a browser sends `Origin: null` with the page's own form POST, which the required Origin check (absent or exactly `http://127.0.0.1:<port>`) would refuse. `same-origin` sends nothing to other sites and there are no outbound links.
+- Over-block: none for apps with elicitation. Under-block (honest boundary): a local program that learns the page address can answer it; the address reaches the model only in the `link-in-chat` fallback. Opening an invite still needs the invite, which the agent never has.
+- Breakage: 3 tried, 3 caught (Host check removed; tool waits for the action; link put back in the opened result).
+- Not done: a non-owner does not take over ownership when the owner app closes; the person has to restart the app ("try again" means after reopening it). The proxy-mode refusal (`PROXY_NOTE`) still names `THREADLINE_SEND_PORT`.
