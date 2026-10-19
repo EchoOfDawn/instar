@@ -6,9 +6,16 @@ eli16-overview: "telegram-button-approval.eli16.md"
 parent-principle: "Structure beats Willpower"
 lessons-engaged: "Structure beats Willpower; Know Your Principal; L15 Authorization Policy; Canonical Pipeline Operational Completeness; Self-Unblock rung FLOOR (capability is not authority); Signal vs Authority; Verify the State Not Its Symbol; Mobile-Complete Operator Actions; Agent Proposes, Operator Approves; Maturation Path; Migration Parity"
 related-feedback: "fb-bc5da66f-f46"
-review-status: "not converged: 12 rounds on 2026-10-19; rounds 11 and 12 (desk-approved extra rounds) each still produced build-changing findings on the class-map test; round 12's are applied here unreviewed; not tagged review-convergence"
-review-report: "docs/specs/reports/telegram-button-approval-convergence.md"
 related-specs: "docs/specs/a2a-pairing-invite-link.md (§6.1 Honest boundary); docs/specs/OPERATOR-AUTHORIZATION-REQUEST-SPEC.md (display-integrity rule); docs/specs/feedback-triage-and-execution.md (§4 review gate, per-PR floor, §5 action list)"
+review-convergence: "2026-10-19T19:23:58.623Z"
+review-iterations: 12
+review-completed-at: "2026-10-19T19:23:58.623Z"
+review-report: "docs/specs/reports/telegram-button-approval-convergence.md"
+cross-model-review: "codex-cli:gpt-6-astra"
+single-run-completable: true
+frontloaded-decisions: 12
+cheap-to-change-tags: 0
+contested-then-cleared: 0
 ---
 
 # Telegram-button approval
@@ -182,8 +189,20 @@ extraction with ordinary tools** — forgery then needs a deliberate modificatio
 state, with no guarantee that anyone sees it. Full independence needs enforcement that runs where the agent
 cannot write. **None exists in this pipeline today**: the per-PR review is checked by the executor's own
 code, and `JKHeadley/instar`'s ruleset requires code-owner review only on owned paths
-(`feedback-triage-and-execution.md` §4). A GitHub ruleset requiring the approver's review would be such an
-enforcer, if the agent holds no session for that account (G7).
+(`feedback-triage-and-execution.md` §4). **Measured on the live repository (coordinator, 2026-10-19):** the
+per-PR approval floor for feedback pull requests is enforced by the executor's own code, which the agent can
+modify. GitHub currently requires no review for a feedback-derived pull request touching `src/`: `main`'s
+ruleset carries only `deletion`, `non_fast_forward` and `pull_request`; `pull_request` has
+`required_approving_review_count: 0` with code-owner review covering exactly two paths
+(`docs/STANDARDS-REGISTRY.md` and `.github/CODEOWNERS` itself); no required status checks; classic branch
+protection returns 404; positive control PR 2182 (targeting main, unarmed) reads clean. And there is **no
+path-scoped GitHub rule that could enforce review only for feedback PRs** without gating all ordinary work:
+CODEOWNERS matches paths, not authors, and the executor publishes from a fork, which GitHub evaluates against
+the base repository's CODEOWNERS — a `src/**` line would require the operator's review on every source pull
+request, the bottleneck he has twice refused and the trade the existing CODEOWNERS already weighed and
+rejected in writing ("~10 approvals vs ~1"). Closing the gap needs a different mechanism: a separate
+repository whose CODEOWNERS can cover everything because everything in it is feedback-derived, or an enforcer
+running where the agent cannot write — both the operator's call, neither in this build.
 
 ## Proposed design
 
@@ -286,42 +305,14 @@ a phone cannot open (a Mobile-Complete gap owned by the tunnel feature).
    stating the rule in full: the S definition with its exclusions and the undo requirement, the R conditions,
    P as the default, the backtrack-tell, and that the rung-1 "yes/no tap" describes how small the request is,
    not where the approval happens.
-2. **A class map keyed on annotated code sites, with a failing test (code, built after approval through
-   `/instar-dev`).** Spec review does not see every path that adds a tap handler (feedback-executor PRs,
-   ordinary fix PRs, a phase of an already-approved spec), and most button payloads have no fixed prefix. So
-   every **site** carries an annotation comment `// callback-site: <site-id>`, and the map
-   `src/data/telegramCallbackClasses.json` lists each site id with the actions it produces or handles, each
-   classed S, R, P or `none` (a branch that only answers, declines, or rejects malformed data). The test
-   discovers sites of two kinds, by TypeScript-parser walk over `src/**/*.ts` (comments and type positions never
-   count):
-   - **Button-building sites:** a construction of `callback_data` or `inline_keyboard` (Telegram) or a Block Kit
-     `action_id` inside a button element (Slack); a call of a listed generic button method (today
-     `sendPairingPrompt`, `CallbackRegistry.register`); or the `{text, data}` literal passed to one (today in
-     `PairingInviteTelegram`). A multi-line construction is one site, annotated on its first line.
-   - **Dispatch sites:** every conditional branch (`if`/`else if`/`case`/early return) in the body of a listed
-     dispatch entry point, whatever value it branches on — the data itself or a record looked up from it —
-     because in three of the four Telegram handlers the action is chosen on server-side state. Entry points
-     today: `TelegramAdapter.processCallbackQuery`, the `/internal/telegram-callback` route handler,
-     `PairingInviteTelegram.onCallback`, `BurnAlertButtons.handle`, `SlackAdapter._handleInteraction`.
-   A P action carries either an exception record — reason, ending **event**, granted date — or the status
-   `unwired`, defined as: a handler exists but **no button-building site produces the action and no production
-   code calls its entry point** (today burn-alert Release and Snooze: `BurnAlertButtons.handle` exists, nothing
-   constructs the class). Branches inside an `unwired` handler are annotated like any other and do not fail;
-   the test fails the moment a button-building site produces an `unwired` action or a production caller of its
-   entry point appears. Exceptions: `pi:` approve/finish and `tc:g` until dashboard-pin-structural item 2;
-   prompt-gate answers (Telegram and Slack, every authority-bearing prompt type) until sibling item 7, which
-   names them. The test fails when: a discovered site has no annotation; a map id has no annotation or an
-   annotation has no map entry; a P action is neither `unwired` nor excepted; an `unwired` action gains a
-   button site or a production caller; or a listed method or entry point in the map is absent from the code.
-   An exception older than 90 days from its granted date makes the test print a warning on its own line; that
-   is best-effort only — a passing test's output reaches nobody by itself — and the real end of each exception
-   is the named event in the sibling spec, which must delete the record. Honest limits: the map, the
-   annotations and the lists of generic methods and entry points are files the agent can edit, so the test
-   catches *forgetting* to classify, not *misclassifying* — review of the diff does that; a replaced action
-   under an unchanged annotation passes; and a **new** generic button method or dispatch entry point is
-   invisible until a human adds it to the lists — the test cannot discover one, and promises nothing there.
-   The recommended way to give the map teeth is to make it a code-owned path (operator decision, one GitHub
-   review per reclassification).
+2. **A class map with a failing test — split out, not load-bearing here.** The structural carrier (an
+   annotated class map of every button-building and dispatch site, with a unit test that fails on an
+   unclassified site) is specified in its own small spec, `docs/specs/telegram-callback-class-map.md`, to be
+   converged separately. It is **not load-bearing for this build**: this build ships no code for the
+   classification rule, and the rule binds through L15 and spec review until that test lands. During twelve
+   review rounds the test's mechanics were the only part of this spec still changing (rounds 10–12), which is
+   why it is separated. Its runtime decision point (the failing test) is classified there, not here; this
+   build has no runtime decision point.
 
 Supersession notes (docs, in this PR): `OPERATOR-AUTHORIZATION-REQUEST-SPEC.md` ("the agent can never approve
 its own request") and `a2a-pairing-invite-link.md` (the Bearer token alone never approves) each gain a dated
@@ -375,28 +366,21 @@ This spec's conclusions do not depend on it.
 
 ### 5. Rollout
 
-- **Docs (in this PR):** the L15 paragraph and the two supersession notes.
-- **Class map and its test** (§4): built through `/instar-dev`; runs in instar's own test tiers; nothing is
-  installed on agents.
+Docs only, in this PR: the L15 paragraph and the two supersession notes. The class-map test ships with its own
+spec (`telegram-callback-class-map.md`) after that spec converges.
 
 ## Maturation plan
 
-- **test-agent-live:** not applicable to the documentation; the class-map test runs in the unit tier of the throwaway build's suite — it passes on the annotated tree (burn-alert handler branches included), fails on each seeded case in its own unit test, and warns (not fails) on an aged exception.
-- **dev-agent-live:** the test runs in Echo's suite from the merge of the `/instar-dev` build; it has no runtime surface.
-- **fleet:** not applicable — nothing is installed on agents; the test runs in instar's own CI and pre-push tiers.
-- **graduation criterion:** the test is green on main, and its own unit test shows it failing on each seeded case.
+- **test-agent-live:** not applicable — this build is documentation (a lessons-index paragraph and two spec notes); nothing runs on any agent.
+- **dev-agent-live:** not applicable — the paragraph is in effect when merged, read by the lessons-aware reviewer on the next spec review.
+- **fleet:** not applicable — nothing is installed on agents.
+- **graduation criterion:** the next spec that adds a `callback_data` handler is reviewed with the L15 paragraph in the reviewer's input (its review report names it).
 - **dark-window:** none — nothing ships dark.
 
 ## Tests
 
-- **Unit:** the class-map test above; its own test seeds every failure case listed in §4 (an unannotated
-  button construction, an unannotated Slack `action_id` button, an unannotated `{text, data}` literal, an
-  unannotated branch inside a listed entry point, a map id without an annotation, an annotation without a map
-  entry, a P action neither `unwired` nor excepted, an `unwired` action with a button site, a listed entry
-  point missing from the code) and expects each to fail, seeds a 91-day-old exception and expects a warning
-  without failure, and expects the annotated current tree — including `BurnAlertButtons.handle`'s branches —
-  to pass.
-- **Integration / E2E:** not applicable — no route, job or runtime path changes.
+None in this build: documentation only. The class-map test and its seeded-failure tests are specified in
+`telegram-callback-class-map.md`.
 
 ## Approval volume — the options, with their real costs
 
@@ -417,8 +401,11 @@ only floor-preserving option that removes the operator as the bottleneck. Costs:
 - the ownership change is the operator's call alone (package publishing, Actions secrets, links and
   integrations move);
 - for an org-owned repository the triage spec sets the approver through the dashboard PIN, which is not a
-  boundary against the agent (G1, G3). So (a) is structural only if **GitHub itself** enforces the review (a
-  ruleset requiring that reviewer) and the reviewer's GitHub session never sits on an agent machine (G7).
+  boundary against the agent (G1, G3). So (a) is structural only if **GitHub itself** enforces the review and
+  the reviewer's GitHub session never sits on an agent machine (G7). Today GitHub requires no review for a
+  feedback PR touching `src/`, and no path-scoped rule can target only feedback PRs (head-on answer); the
+  organisation move is therefore most useful with a **separate repository for feedback-derived work**, whose
+  CODEOWNERS can cover everything.
 
 **(b) Batch N verified fixes into one PR.** Fewer approvals, the same reading in one larger diff — exactly the
 "signing off diffs you have no time to read" the operator refused. The rung floor would still be met (a batch
@@ -553,21 +540,13 @@ and the PR body already names the test.
 
 ## Decision points touched
 
-| Decision point | Classification | Justification / floor |
-|---|---|---|
-| An unannotated or unmapped button/dispatch site, a P action neither `unwired` nor excepted, or an `unwired` action that gains a button site or production caller fails the class-map test; an old exception warns (§4) | **invariant** | A closed allowlist on an authority surface; unclassified defaults to P, so the conservative outcome is a failing build that a human classifies. |
-
-The approval classes themselves (§1) are assigned by spec review, not at runtime.
+*(none)*
 
 ## Verify the State, Not Its Symbol
 
-- **Class-map test.** Symbol: every discovered button-building or dispatch site carries a site annotation
-  present in the map, and every P action is `unwired` or excepted. Claimed state: no tap handler acts on a P-class
-  operation outside the recorded exceptions. Gaps both ways: a misclassified action passes (review of the map's
-  diff is the check); a site whose behaviour changes under the same annotation passes; a new generic button
-  method or dispatch entry point is invisible until listed. Unmeasurable (a file cannot be read): the test fails rather than passes.
-- The spec's factual claims are measured in Ground truth, each with the query that could have returned the
-  opposite.
+This build adds no detector, metric or gate. The spec's factual claims are measured in Ground truth, each with
+the query that could have returned the opposite; the GitHub ruleset facts in the head-on answer were measured
+by the coordinator on the live repository on 2026-10-19.
 
 ## Self-Heal Before Notify (Standard B)
 
@@ -575,7 +554,7 @@ No new monitor or notice source.
 
 ## Multi-machine posture
 
-- **L15 paragraph and class map:** repository files; no runtime state.
+- **L15 paragraph and spec notes:** repository files; no runtime state.
 
 ## Frontloaded Decisions
 
@@ -598,8 +577,8 @@ No new monitor or notice source.
 9. **The PIN leak is its own urgent spec (ACT-113),** first item of the sibling spec; the sibling also owns
    the broadcast, the passkey, the GitHub-as-enforcer comparison and moving the P-class taps.
 10. **Remediator Telegram countersignature is P and not a different principal** (ACT-116).
-11. **This build ships** the L15 paragraph and two supersession notes (docs, in this PR) and, after approval, a
-    class map with a failing unit test. The agent-instruction honesty change moves to the sibling spec (item 2)
+11. **This build ships** the L15 paragraph and two supersession notes (docs, in this PR). The class-map test is
+    split into `telegram-callback-class-map.md`; it is not load-bearing here. The agent-instruction honesty change moves to the sibling spec (item 2)
     so the instructions change once, together with the PIN source.
 12. **Public-document discipline:** the route-level detail of the open PIN leak stays in ACT-113 until it is
     fixed.
@@ -621,7 +600,9 @@ deliverable.
   operator attention" — which is what about 50 days of reviews is. Does the rung floor govern
   feedback-executor merges, and at what granularity — per pull request (today), a standing scoped grant
   (option (g)), or an independent automated reviewer (option (f))? Only the operator can answer it.
-- Whether to move the repository to an organisation with a second approver (option (a)).
+- Whether to move the repository to an organisation with a second approver (option (a)), and whether
+  feedback-derived work should live in a separate repository so GitHub can enforce its review without gating
+  ordinary work.
 - Whether to remove operator Telegram/GitHub sessions from agent machines.
 
 ## Open questions

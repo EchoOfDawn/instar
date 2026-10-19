@@ -22,9 +22,9 @@ logged into his account. So a button may only ever approve things that are safe 
 undone — stop, hold, decline — never anything that grants, spends, publishes, switches off a safety check or
 mutes an alert.
 
-**What this spec ships.** The rule above, written where design reviewers will read it, and a small automatic
-test (built next) that fails whenever someone adds a new kind of Telegram button without saying which kind of
-approval it is. Two older design documents get a dated note that their "the agent can never approve this"
+**What this spec ships.** The rule above, written where design reviewers will read it. (A small automatic
+test that would fail whenever someone adds a new kind of button without classifying it is specified
+separately, in `telegram-callback-class-map.md`; this spec does not depend on it.) Two older design documents get a dated note that their "the agent can never approve this"
 promises are weaker than they sound. No new buttons are built: the messages that need him already contain a
 link one tap from each approval. Everything that would change the PIN itself — stop posting it in Telegram,
 close the leak this review found (the agent's own chat history hands it to anyone with the API key, filed as
@@ -44,7 +44,9 @@ judge in ten seconds. A card that sounds more certain than it is would be worse 
 false confidence the review step exists to prevent. The messages already give him a link straight to each fix.
 
 Other options weighed: a second trusted reviewer in a GitHub organisation (the real structural fix, if such a
-person exists — his decision, and the recommendation); bundling fixes (rejected: one hostile fix could hide among nine); the agent's
+person exists — his decision, and the recommendation; measured tonight, GitHub currently requires no review at
+all for a feedback fix, and there is no way to require one only for feedback fixes without also gating every
+ordinary change, so this likely means a separate repository for feedback-derived work); bundling fixes (rejected: one hostile fix could hide among nine); the agent's
 own AI approving (rejected: not independent); an independent AI reviewer off the agent's machines, or a
 standing "merge whatever passes" grant (both his to decide, and the second means nobody reads the code). Two
 more levers are his: take his Telegram and GitHub logins off the agent's machines, and measure how many of the
