@@ -510,6 +510,13 @@ describe('npm "Validating" review — an accepted publish that is not visible ye
     expect(n).toContain('Do NOT publish again');
     expect(n).toContain('npm view instar@1.3.1360 version');
   });
+  it('--push-only adds the never-published caveat; the smoke path (an accepted upload) does not', () => {
+    const po = npmPendingNotice('instar', '1.3.1360', { pushOnly: true });
+    expect(po).toContain('was never published (for example the publish step itself failed)');
+    expect(po).toContain('do not use --push-only; re-run release-local normally');
+    expect(npmPendingNotice('instar', '1.3.1360')).not.toContain('never published');
+    expect(smokeFailureVerdict('absent', 'instar', '1.3.1360').message).not.toContain('never published');
+  });
   it('smoke failed + not visible (absent or unknown) → pending, with the notice', () => {
     for (const st of ['absent', 'unknown'] as const) {
       const v = smokeFailureVerdict(st, 'instar', '1.3.1360');
@@ -679,6 +686,7 @@ describe('--push-only resumes a release that failed between publish and commit (
     expect(r.out).toContain('"Validating" review');
     expect(r.out).toContain('https://www.npmjs.com/package/instar?activeTab=versions');
     expect(r.out).toContain('Do NOT publish again');
+    expect(r.out).toContain('do not use --push-only; re-run release-local normally');
     expect(r.out).toContain('--push-only --remote origin');
     expect(r.out).not.toContain('Nothing was published');
     expect(g(clone, 'log', '-1', '--format=%s')).toBe('base: a merged fix with its fragment');
@@ -695,6 +703,7 @@ describe('--push-only resumes a release that failed between publish and commit (
     const pending = pushOnly();
     expect(pending.status).toBe(1);
     expect(pending.out).toContain('refuses until then');
+    expect(pending.out).toContain('was never published (for example the publish step itself failed)');
     expect(pending.out).toContain('"Validating" review');
     expect(pending.out).not.toContain('Nothing was published');
     expect(g(bare, 'rev-parse', 'main')).toBe(before);
@@ -790,6 +799,14 @@ describe('release-local.mjs wiring', () => {
     expect(pendingBranch).not.toContain('restoreTree');
     expect(pendingBranch).not.toContain('Nothing was published');
     expect(failFn.indexOf('if (npmPending)')).toBeLessThan(failFn.indexOf('} else if (publishUnknown)'));
+  });
+  it('unknown is pending on the smoke path but publishUnknown in --push-only — deliberately, and both are documented', () => {
+    const smoke = src.slice(src.indexOf("const smoke = run('node', ['scripts/post-publish-smoke.mjs', VERSION]);"), src.indexOf('// ── 12. commit'));
+    expect(smoke).toContain('deliberately unlike --push-only');
+    const flow = src.slice(src.indexOf('if (opts.pushOnly) {'), src.indexOf('// ── 0. preflight'));
+    expect(flow.match(/if \((st|state) === 'unknown'\) publishUnknown = true;/g)?.length).toBe(2);
+    expect(flow).toContain('deliberately different from the smoke path');
+    expect(flow.match(/npmPendingNotice\('instar', [^)]*\{ pushOnly: true \}\)/g)?.length).toBe(2);
   });
   it('a timed-out publish is passed to the registry check as timed out', () => {
     expect(src).toContain('timedOut: Boolean(pub.timedOut)');
