@@ -24,6 +24,7 @@ import {
   publishedStateAfterFailure,
   workingTreeReleaseCut,
   remoteTagSha,
+  viewRetryDelayMs,
   isReleaseCutCommit,
   otpRequirement,
   ciRunState,
@@ -225,14 +226,42 @@ describe('release-local push + ref refresh (real git)', () => {
     expect(calls.some((c) => c[1] === 'rebase')).toBe(false);
   });
 
-  it('names the CI race: the remote already has the tag on another commit', () => {
+  it('names the race: the remote already has the tag on a commit that is NOT the release cut', () => {
     g(other, 'tag', 'v1.0.1');
     g(other, 'push', '-q', 'origin', 'v1.0.1');
     const res = pushReleaseAtomically({ run: runner(clone), remote: 'origin', version: '1.0.1' });
     expect(res.ok).toBe(false);
     expect(res.code).toBe('tag-exists');
     expect(res.reason).toContain('already has tag v1.0.1');
+    expect(res.reason).toContain('is NOT a release cut');
+    expect(res.reason).toContain('publish.yml run, or an earlier --keep-tag-on-published run of this tool');
     expect(remoteTagSha(runner(clone), 'origin', 'v1.0.1')).toBe(g(other, 'rev-parse', 'HEAD'));
+    // the temporary ref used to inspect the remote tag is cleaned up
+    expect(runner(clone)('git', ['rev-parse', '--verify', '--quiet', 'refs/release-local/remote-tag']).status).not.toBe(0);
+  });
+
+  it('after a keep-tag run, a plain --push-only rerun is told it was probably our own earlier run', () => {
+    // A real release cut for 1.0.1 (package.json + guide), published and tagged
+    // by an earlier --keep-tag-on-published run; then main moved and the
+    // release commit was rebased off the tag.
+    fs.writeFileSync(path.join(clone, 'version.txt'), '');
+    g(clone, 'reset', '-q', '--hard', 'HEAD~1');
+    fs.writeFileSync(path.join(clone, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.1' }, null, 2) + '\n');
+    fs.mkdirSync(path.join(clone, 'upgrades'), { recursive: true });
+    fs.writeFileSync(path.join(clone, 'upgrades', '1.0.1.md'), '# notes\n');
+    g(clone, 'add', '-A');
+    g(clone, 'commit', '-qm', 'chore: release v1.0.1 [skip ci]');
+    g(clone, 'tag', 'v1.0.1');
+    g(clone, 'push', '-q', 'origin', 'v1.0.1');
+    otherCodeMerge();
+    g(clone, 'fetch', '-q', 'origin', 'main');
+    g(clone, 'rebase', '-q', 'origin/main'); // HEAD now differs from the tag
+    g(clone, 'tag', '-d', 'v1.0.1');
+    const res = pushReleaseAtomically({ run: runner(clone), remote: 'origin', version: '1.0.1' });
+    expect(res.ok).toBe(false);
+    expect(res.code).toBe('tag-exists');
+    expect(res.reason).toContain('That commit IS the release cut for v1.0.1');
+    expect(res.reason).toContain('re-run with --push-only --keep-tag-on-published');
   });
 
   it('--keep-tag-on-published is resumable: tag already pushed, HEAD rebased off it → main push only', () => {
@@ -468,6 +497,21 @@ describe('dirtyToolFilesOnly (--dry-run --allow-dirty-tool-files)', () => {
     expect(dirtyToolFilesOnly(' M src/core/x.ts\n').ok).toBe(false);
     expect(dirtyToolFilesOnly('R  scripts/release-local.mjs -> scripts/other.mjs\n').ok).toBe(false);
     expect(dirtyToolFilesOnly('').ok).toBe(false);
+  });
+});
+
+describe('viewRetryDelayMs (INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS)', () => {
+  it('unset or empty means the default — an empty string is NOT zero', () => {
+    expect(viewRetryDelayMs(undefined)).toBe(10_000);
+    expect(viewRetryDelayMs('')).toBe(10_000);
+    expect(viewRetryDelayMs('  ')).toBe(10_000);
+  });
+  it('can only shorten the wait: capped at the default; junk or negative means the default', () => {
+    expect(viewRetryDelayMs('0')).toBe(0);
+    expect(viewRetryDelayMs('2500')).toBe(2500);
+    expect(viewRetryDelayMs('600000')).toBe(10_000);
+    expect(viewRetryDelayMs('abc')).toBe(10_000);
+    expect(viewRetryDelayMs('-5')).toBe(10_000);
   });
 });
 

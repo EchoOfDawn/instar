@@ -59,6 +59,7 @@ import {
   publishedStateAfterFailure,
   isReleaseCutCommit,
   workingTreeReleaseCut,
+  viewRetryDelayMs,
   otpRequirement,
   activePublishRuns,
   dirtyToolFilesOnly,
@@ -70,11 +71,10 @@ const SEMVER = /^\d+\.\d+\.\d+$/;
 // prepublishOnly rebuilds before uploading; 20 min is far above a normal publish.
 const PUBLISH_TIMEOUT_MS = 20 * 60 * 1000;
 // Spacing of the npm re-queries after a failed publish (~30s over 3 retries).
-// The env override exists only so tests need not wait; it can only be set lower
-// by intent, and the number of re-queries is fixed.
-const VIEW_RETRY_DELAY_MS = Number(process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS) >= 0 && process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS !== undefined
-  ? Number(process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS)
-  : 10_000;
+// INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS exists so tests need not wait: unset or
+// empty means the default, and any value is capped at the default, so it can
+// only shorten the wait. The number of re-queries is fixed.
+const VIEW_RETRY_DELAY_MS = viewRetryDelayMs(process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS);
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);

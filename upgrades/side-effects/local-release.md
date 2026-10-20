@@ -23,6 +23,8 @@ Adds `scripts/release-local.mjs` (`npm run release:local`), which runs the `publ
 - **`--keep-tag-on-published`** is resumable, with exact recovery steps printed.
 - **The build** runs with `NODE_ENV=development`.
 
+**Round 5 (Echo approved round 4; two non-blocking minors).** When `vX` already exists on the remote on another commit, the tool now fetches that commit into a temporary ref (deleted afterwards). If it is the release cut for vX, the message says so and points at `--push-only --keep-tag-on-published`. An earlier keep-tag run of this tool is the usual cause, and it is no longer blamed on publish.yml. `INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS`: unset or empty means the 10 s default, and any value is capped at that default, so it can only shorten the wait.
+
 ## Decision-point inventory
 
 - **No agent runtime decision point.** This is maintainer tooling; it is in the npm `files` payload only because `scripts/` is.

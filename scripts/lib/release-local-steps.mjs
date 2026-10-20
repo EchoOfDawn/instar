@@ -55,6 +55,44 @@ export function headContainsRemoteMain(run, remote) {
   return run('git', ['merge-base', '--is-ancestor', `refs/remotes/${remote}/main`, 'HEAD']).status === 0;
 }
 
+/**
+ * Explain a `vX` that already exists on the remote on another commit. Two
+ * publishers are possible: a publish.yml run, or an earlier
+ * `--keep-tag-on-published` run of THIS tool (which leaves the tag on the
+ * published commit while HEAD is the rebased release commit). Cheaply checks
+ * whether the remote tag's commit is itself the release cut for vX and says so.
+ */
+export function describeExistingTag(run, remote, tag, version, remoteSha) {
+  const ref = 'refs/release-local/remote-tag';
+  let holdsCut = null;
+  if (run('git', ['fetch', '--quiet', '--no-tags', remote, `+refs/tags/${tag}:${ref}`]).status === 0) {
+    const subj = run('git', ['log', '-1', '--format=%s', ref]);
+    holdsCut = subj.status === 0 && subj.stdout.trim() === `chore: release ${tag} [skip ci]` && isReleaseCutCommit(run, ref);
+    run('git', ['update-ref', '-d', ref]);
+  }
+  const head = `${remote} already has tag ${tag} on a different commit (${remoteSha.slice(0, 10)}). Nothing was pushed (atomic).`;
+  if (holdsCut === true) {
+    return `${head} That commit IS the release cut for v${version}, so ${tag} was already pushed for this release, most likely by an ` +
+      `earlier --keep-tag-on-published run of this tool (or by a publish.yml run). If it was this tool, re-run with ` +
+      `--push-only --keep-tag-on-published: it sees the tag already on ${remote} and pushes main only.`;
+  }
+  const what = holdsCut === false ? ' That commit is NOT a release cut for this version.' : '';
+  return `${head}${what} Another publisher released this version: most likely a publish.yml run, or an earlier ` +
+    `--keep-tag-on-published run of this tool; if it was this tool, re-run with --push-only --keep-tag-on-published.`;
+}
+
+/**
+ * Spacing of the npm re-queries after a failed publish. Unset or empty → the
+ * 10s default. A value can only LOWER it (it is capped at the default), so the
+ * override exists for tests that must not wait and cannot stretch a release.
+ */
+export function viewRetryDelayMs(envValue, def = 10_000) {
+  if (envValue === undefined || envValue === null || String(envValue).trim() === '') return def;
+  const n = Number(envValue);
+  if (!Number.isFinite(n) || n < 0) return def;
+  return Math.min(n, def);
+}
+
 function revParse(run, ref) {
   const r = run('git', ['rev-parse', '--verify', '--quiet', ref]);
   return r.status === 0 ? r.stdout.trim() : null;
@@ -136,7 +174,7 @@ export function pushReleaseAtomically({ run, remote, version, maxAttempts = 5, l
         ok: false,
         attempts: attempt,
         code: 'tag-exists',
-        reason: `${remote} already has tag ${tag} on a different commit (${remoteTag.slice(0, 10)}) — another publisher, most likely a publish.yml run, released this version. Nothing was pushed (atomic).`,
+        reason: describeExistingTag(run, remote, tag, version, remoteTag),
         output,
       };
     }
