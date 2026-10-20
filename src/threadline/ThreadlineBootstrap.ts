@@ -473,7 +473,10 @@ export async function bootstrapThreadline(
 
     // Invite pairing engine (docs/specs/a2a-pairing-invite-link.md). Identity is read fresh on
     // every use so a rotated key is never signed with stale material.
-    {
+    // The store comes from threadline-core: a corrupt file is moved aside and reported, and an
+    // unreadable one (permissions, I/O) makes the constructor throw rather than start empty and
+    // later overwrite it. That throw turns off invite pairing only, never the rest of Threadline.
+    try {
       const client = relayClient;
       const invStore = new PairingInviteStore(config.stateDir);
       const invEvents = new EventEmitter();
@@ -499,6 +502,9 @@ export async function bootstrapThreadline(
         ownName: () => ({ owner: config.ownerName ?? '', agent: config.agentName }),
       });
       pairingInvites = { flow, store: invStore, events: invEvents };
+    } catch (err) {
+      // Logged, not silent: invite pairing stays off until the store file is readable.
+      console.error(`[pairing-invite] invite pairing is off: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // Create inbound message gate (imports ThreadlineRouter lazily if needed)

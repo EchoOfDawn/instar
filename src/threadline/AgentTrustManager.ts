@@ -21,6 +21,7 @@ import path from 'node:path';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { PairingPendingStore, type PendingPairingRecord } from './PairingPendingStore.js';
 import { deriveSASv2, deriveSasBitsV2, deriveSasFingerprintV2, derivePairingIdV2 } from './ThreadlineCrypto.js';
+import type { InviteTrust } from '@sagemindai/threadline-core';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -222,7 +223,7 @@ interface ProfilesFile {
   updatedAt: string;
 }
 
-export class AgentTrustManager {
+export class AgentTrustManager implements InviteTrust {
   private readonly threadlineDir: string;
   private readonly profilesPath: string;
   private readonly auditPath: string;
