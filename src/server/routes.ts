@@ -578,6 +578,7 @@ import {
 import {
   refuseDowngradeCounters,
   refuseDowngradeModeName,
+  downgradeRefusals,
   resolveRefuseDowngradeMode,
 } from '../threadline/refuseDowngrade.js';
 import { isRelayChainLoop } from '../messaging/MessageRouter.js';
@@ -5180,7 +5181,9 @@ export function createRoutes(ctx: RouteContext): Router {
             },
             ctx.config as { developmentAgent?: boolean; threadline?: { refuseDowngrade?: { enabled?: boolean; dryRun?: boolean } } },
           );
-          return { ...mode, mode: refuseDowngradeModeName(mode), ...refuseDowngradeCounters };
+          // `refusals`: one record per peer whose plaintext was refused, with the named reason,
+          // the remedy and the notices sent back (Echo, 2026-10-20: never a silent drop).
+          return { ...mode, mode: refuseDowngradeModeName(mode), ...refuseDowngradeCounters, refusals: downgradeRefusals.snapshot() };
         })(),
       };
       // Inbound-id ledger counters (spec "Migration parity" → counters): in

@@ -49,12 +49,15 @@ import {
   createEncryptToPinnedResolver,
   createEncryptToPinnedClientOptions,
   encryptToPinnedCounters,
+  ENCRYPT_TO_PINNED_DEFAULT,
   labelUnverifiedPinnedPlaintext,
   type EncryptToPinnedMode,
 } from './encryptToPinned.js';
 import {
   noteEncryptedChat,
   refuseDowngradeCounters,
+  reportDowngradeRefusal,
+  REFUSE_DOWNGRADE_DEFAULT,
   shouldRefuseDowngradedPlaintext,
   type RefuseDowngradeMode,
 } from './refuseDowngrade.js';
@@ -134,14 +137,14 @@ export interface ThreadlineBootstrapConfig {
   getRelayUnknownSenderTrustMode?: () => RelayUnknownSenderTrustMode;
   /**
    * Live reader for encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9,
-   * `threadline.encryptToPinned`). Supplied by server.ts. When omitted it is off: ordinary
-   * chat is encrypted only when the relay gave us the peer's keys, as before.
+   * `threadline.encryptToPinned`). Supplied by server.ts. When omitted it is the shipped
+   * default, enforce: ordinary chat to an invite-paired peer is always encrypted to its pin.
    */
   getEncryptToPinnedMode?: () => EncryptToPinnedMode;
   /**
    * Live reader for refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6/D11,
    * rollout step 6, `threadline.refuseDowngrade`). Supplied by server.ts. When omitted it is
-   * off: no mark is recorded and no plaintext is refused.
+   * the shipped default, watch: marks are recorded and would-refuse plaintext is counted.
    */
   getRefuseDowngradeMode?: () => RefuseDowngradeMode;
 }
@@ -452,23 +455,23 @@ export async function bootstrapThreadline(
       return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
     }
   };
-  // Encrypt-to-pinned (spec threadline-standalone-pairing D9): the live mode (off when
-  // server.ts supplies no reader).
+  // Encrypt-to-pinned (spec threadline-standalone-pairing D9): the live mode. With no reader it
+  // is the shipped default (enforce, Justin 2026-10-20); so is a reader that throws (never off).
   const encryptToPinnedMode = (): EncryptToPinnedMode => {
     try {
-      return config.getEncryptToPinnedMode?.() ?? { enabled: false, dryRun: true };
+      return config.getEncryptToPinnedMode?.() ?? { ...ENCRYPT_TO_PINNED_DEFAULT };
     } catch {
-      return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
+      return { ...ENCRYPT_TO_PINNED_DEFAULT }; // @silent-fallback-ok — an unreadable mode is the shipped default (enforce), never off
     }
   };
 
-  // Refuse-downgrade (spec threadline-standalone-pairing D6, step 6): the live mode (off when
-  // server.ts supplies no reader).
+  // Refuse-downgrade (spec threadline-standalone-pairing D6, step 6): the live mode. With no
+  // reader it is the shipped default (watch); so is a reader that throws (never off).
   const refuseDowngradeMode = (): RefuseDowngradeMode => {
     try {
-      return config.getRefuseDowngradeMode?.() ?? { enabled: false, dryRun: true };
+      return config.getRefuseDowngradeMode?.() ?? { ...REFUSE_DOWNGRADE_DEFAULT };
     } catch {
-      return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
+      return { ...REFUSE_DOWNGRADE_DEFAULT }; // @silent-fallback-ok — an unreadable mode is the shipped default (watch), never off
     }
   };
 
@@ -663,7 +666,20 @@ export async function bootstrapThreadline(
       // encrypted chat does not get plaintext delivered in its name. Enforce refuses here,
       // before anything is recorded or routed; watch only counts.
       if (shouldRefuseDowngradedPlaintext({ trustManager, mode: refuseDowngradeMode, counters: refuseDowngradeCounters }, received.from, msgType)) {
-        console.warn(`Threadline: plaintext from ${received.from.slice(0, 12)} refused — that paired agent has sent encrypted messages before (possible downgrade by the relay)`);
+        // Loud, never silent (Echo, 2026-10-20): named reason + remedy in the log, a per-peer
+        // record on /health, one degradation report and one encrypted notice back to the
+        // sender per peer per hour.
+        reportDowngradeRefusal({
+          trustManager,
+          report: ({ reason, impact }) => DegradationReporter.getInstance().report({
+            feature: 'Threadline.refuseDowngrade',
+            primary: 'deliver messages from agents you paired with',
+            fallback: 'the unencrypted message was not delivered; encrypted messages from that agent still are',
+            reason,
+            impact,
+          }),
+          sendNotice: (fp, pinnedHex, text) => { relayClient!.sendNoticeToPinned(fp, pinnedHex, text); },
+        }, received.from);
         return;
       }
 
