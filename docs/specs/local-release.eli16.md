@@ -34,6 +34,10 @@ A single command, `npm run release:local`, that does exactly what the workflow d
 
 **A failure after publishing can be finished without publishing again.** `--push-only` lands the release commit for a version that is already on npm, and checks npm first. If the failure came before the release commit was even made (the install test failed, or a commit check refused it), `--push-only` makes that commit itself, but only when the leftover changes are exactly a release and npm already has that version.
 
+**A publish npm is still reviewing is not a failure.** npm sometimes holds a new version in an automated review ("Validating") for a long time, sometimes over 40 minutes, before anyone can download it. When that happens the tool says so, shows where the package owner can check, and says not to publish again. `--push-only` waits until npm shows the version and then finishes the release.
+
+**One decision is coming.** npm says tokens that skip two-factor checks stop working for publishing in January 2027, so local releases will need a different sign-in route by then. Justin is choosing which.
+
 **It never turns off the checks.** The release commit and push run every hook; there is no force push; a conflicting rebase stops instead of overwriting.
 
 **What it cannot do locally:** npm provenance (a signed record that the package was built by GitHub) needs a token only GitHub's machines have, so local releases go out without it, and the script says so.
