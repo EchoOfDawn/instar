@@ -214,7 +214,7 @@ import { RULE_DISPOSITIONS, buildDegradedToneResult, resolveToneGateOperatorConf
 import type { WriteOperation, WriteToken } from '../core/StateWriteAuthority.js';
 import { writeLifelineRestartSignal } from '../core/version-skew.js';
 import { LifelineIngressGuard } from './LifelineIngressGuard.js';
-import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX } from '../threadline/PairingInviteTelegram.js';
+import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX, resolveApprovalOwner } from '../threadline/PairingInviteTelegram.js';
 import { sharedLifelineIngressSecretHolder } from '../core/LifelineIngressSecret.js';
 import { TelegramCallbackDedupe } from './TelegramCallbackDedupe.js';
 import { readSessionClocks } from '../core/SessionClockReader.js';
@@ -3370,7 +3370,15 @@ export function createRoutes(ctx: RouteContext): Router {
         await ctx.telegram!.sendToTopic(topicId, text);
       },
       answer: (id, text) => ctx.telegram!.answerCallback(id, text),
-      ownerUserId: () => ctx.telegram!.getOwnerUserId(),
+      // A configured owner wins (the Telegram block's ownerUserId / promptGate.ownerId, else the
+      // agent's monitoring.promptGate.ownerId, which the adapter itself never reads). With none,
+      // only a single VERIFIED operator binding from authenticated inbound Telegram counts —
+      // never an asserted record, a replicated one, or "whoever messaged" (resolveApprovalOwner).
+      // Scoped to pairing on purpose: getOwnerUserId() also addresses owner DMs and consent prompts.
+      ownerUserId: () => resolveApprovalOwner(
+        ctx.telegram!.getOwnerUserId() ?? ctx.config.monitoring?.promptGate?.ownerId,
+        Object.values(ctx.topicOperatorStore?.allBindings() ?? {}),
+      ),
       chatId: () => ctx.telegram!.getChatId(),
       operatorTopicId: () => ctx.telegram!.getLifelineTopicId(),
       enforcing: () => lifelineIngressGuard.mode() === 'enforce'

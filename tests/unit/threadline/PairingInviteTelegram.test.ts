@@ -2,17 +2,24 @@
  * Telegram surface for invite pairing (docs/specs/a2a-pairing-invite-link.md §6.1):
  * who may open a prompt, who may tap, one decision per prompt, and the operator notices.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
-import { PairingInviteTelegram, CALLBACK_PREFIX } from '../../../src/threadline/PairingInviteTelegram.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  PairingInviteTelegram, CALLBACK_PREFIX, resolveApprovalOwner, NO_OWNER_REFUSAL, NOT_OWNER_REFUSAL,
+} from '../../../src/threadline/PairingInviteTelegram.js';
+import { TopicOperatorStore } from '../../../src/users/TopicOperatorStore.js';
+import { SafeFsExecutor } from '../../../src/core/SafeFsExecutor.js';
 import { createInvite, inviteMessage, findInviteToken, decodeInvite } from '../../../src/threadline/PairingInvite.js';
 
 const OWNER = 4242;
 const INVITE = inviteMessage(createInvite({ identityPubHex: crypto.randomBytes(32).toString('hex'), owner: 'Justin', agent: 'Scout' }));
 const IID = 'ab'.repeat(16);
 
-function setup(opts: { enforcing?: boolean; operatorTopic?: number | undefined; now?: () => number } = {}) {
+function setup(opts: { enforcing?: boolean; operatorTopic?: number | undefined; now?: () => number; owner?: () => number | undefined } = {}) {
   const calls: string[] = [];
   const sent: Array<{ topicId: number; text: string; buttons?: Array<{ text: string; data: string }> }> = [];
   const answers: string[] = [];
@@ -27,7 +34,7 @@ function setup(opts: { enforcing?: boolean; operatorTopic?: number | undefined; 
     events,
     send: async (topicId, text, buttons) => { sent.push({ topicId, text, buttons }); },
     answer: async (_id, text) => { answers.push(text); },
-    ownerUserId: () => OWNER,
+    ownerUserId: opts.owner ?? (() => OWNER),
     chatId: () => '-100',
     operatorTopicId: () => ('operatorTopic' in opts ? opts.operatorTopic : 7),
     enforcing: () => enforcing,
@@ -161,5 +168,109 @@ describe('PairingInviteTelegram', () => {
     events.emit('event', { kind: 'invite-used-elsewhere', iid: IID, inviterFp: 'c'.repeat(32) });
     await new Promise((r) => setImmediate(r));
     expect(sent.map((s) => s.text).join('\n')).toMatch(/two agents used the same pairing invite[\s\S]*already been used/);
+  });
+
+  it('says "no owner set" (not "only the owner") when the agent has no owner it can name', async () => {
+    const { tg, sent, calls } = setup({ owner: () => undefined });
+    await tg.onForwardedInvite(okForward);
+    expect(calls).toEqual([]);
+    expect(sent[0].text).toContain(NO_OWNER_REFUSAL);
+    expect(sent[0].text).not.toContain(NOT_OWNER_REFUSAL);
+    expect(sent[0].text).toMatch(/dashboard/);
+  });
+
+  it('a genuine non-owner still hears "Only the agent\'s owner can do this."', async () => {
+    const { tg, sent } = setup();
+    await tg.onForwardedInvite({ ...okForward, fromUserId: 1 });
+    expect(sent[0].text).toContain(NOT_OWNER_REFUSAL);
+    expect(sent[0].text).not.toContain(NO_OWNER_REFUSAL);
+  });
+});
+
+describe('resolveApprovalOwner (who may approve when no owner id is configured)', () => {
+  const OP = 7812716706;
+  let dir: string;
+  let store: TopicOperatorStore;
+  const evidence = (uid: number, messageId = '11') => ({
+    kind: 'authenticated-inbound' as const, ingress: 'telegram-lifeline-forward' as const,
+    authorization: 'telegram-is-authorized-sender' as const, senderUid: String(uid), messageId,
+  });
+  const bindVerified = (topic: number, uid: number) =>
+    store.setAuthenticatedOperator(topic, { platform: 'telegram', uid: String(uid), displayName: 'Justin' }, evidence(uid));
+  const bindings = () => Object.values(store.allBindings());
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'approval-owner-'));
+    store = new TopicOperatorStore(dir);
+  });
+  afterEach(() => { SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'tests/unit/threadline/PairingInviteTelegram.test.ts' }); });
+
+  it('a configured owner wins, whatever the bindings say', () => {
+    bindVerified(3, 555);
+    expect(resolveApprovalOwner(OWNER, bindings())).toBe(OWNER);
+  });
+
+  it('a configured owner written as a string still counts; a malformed one means no owner, never the bindings', () => {
+    bindVerified(3, 555);
+    expect(resolveApprovalOwner(String(OWNER), bindings())).toBe(OWNER);
+    expect(resolveApprovalOwner('not-an-id', bindings())).toBeUndefined();
+    expect(resolveApprovalOwner(-5, bindings())).toBeUndefined();
+  });
+
+  it('no owner + exactly one verified operator (on one or several topics) → that operator', () => {
+    expect(bindVerified(3, OP)).not.toBeNull();
+    expect(resolveApprovalOwner(undefined, bindings())).toBe(OP);
+    bindVerified(9, OP);
+    expect(resolveApprovalOwner(undefined, bindings())).toBe(OP);
+  });
+
+  it('no owner + two different verified operators → nobody (never pick one)', () => {
+    bindVerified(3, OP);
+    bindVerified(9, 555);
+    expect(resolveApprovalOwner(undefined, bindings())).toBeUndefined();
+  });
+
+  it('no owner + no bindings → nobody', () => {
+    expect(resolveApprovalOwner(undefined, bindings())).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, null)).toBeUndefined();
+  });
+
+  it('a manually asserted record (POST /topic-operator) never counts', () => {
+    expect(store.setOperator(3, { platform: 'telegram', uid: String(OP), displayName: 'Justin' })).not.toBeNull();
+    expect(bindings()).toHaveLength(1);
+    expect(resolveApprovalOwner(undefined, bindings())).toBeUndefined();
+  });
+
+  it('an asserted record for someone else does not make a verified operator ambiguous, nor stand in for one', () => {
+    bindVerified(3, OP);
+    store.setOperator(9, { platform: 'telegram', uid: '555' });
+    expect(resolveApprovalOwner(undefined, bindings())).toBe(OP);
+  });
+
+  it('a legacy or self-described record without evidence (someone who merely messaged) never counts', () => {
+    const forged = { platform: 'telegram', uid: String(OP), names: [], boundAt: '', boundFrom: 'authenticated-inbound' };
+    expect(resolveApprovalOwner(undefined, [forged])).toBeUndefined();
+    const mismatched = { ...forged, establishmentEvidence: evidence(555) };
+    expect(resolveApprovalOwner(undefined, [mismatched])).toBeUndefined();
+  });
+
+  it('a verified binding on another platform does not count as a Telegram owner', () => {
+    const wa = { platform: 'whatsapp', uid: String(OP), names: [], boundAt: '', boundFrom: 'authenticated-inbound', establishmentEvidence: evidence(OP) };
+    expect(resolveApprovalOwner(undefined, [wa])).toBeUndefined();
+  });
+
+  it('end to end: no owner configured, the verified operator forwards → Approve prompt; anyone else → non-owner refusal', async () => {
+    bindVerified(3, OP);
+    const owner = () => resolveApprovalOwner(undefined, bindings());
+    const a = setup({ owner });
+    await a.tg.onForwardedInvite({ ...okForward, fromUserId: OP });
+    expect(a.sent[0].buttons?.map((b) => b.text)).toEqual(['Approve', 'Decline']);
+    await a.tg.onCallback(tap(a.sent[0].buttons![0].data, { fromUserId: OP }));
+    expect(a.calls).toEqual(['receive', `approve:${IID}`]);
+
+    const b = setup({ owner });
+    await b.tg.onForwardedInvite({ ...okForward, fromUserId: 555 });
+    expect(b.calls).toEqual([]);
+    expect(b.sent[0].text).toContain(NOT_OWNER_REFUSAL);
   });
 });
