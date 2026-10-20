@@ -5752,11 +5752,20 @@ rm()  { "${shimRunner}" rm  "$@"; }
   private confinedWriteRefused(tmuxSession: string, what: string): boolean {
     // The D2 startup driver is the ONLY writer allowed into a confined session, and only while it
     // holds the session (from its first capture to `delivered` or `failed`).
-    if (this.confinedStartupHolders.has(tmuxSession)) return false;
+    //
+    // Both Sets below are class-field initialisers, so they exist only when the constructor ran.
+    // Narrow harnesses build this recovery surface with `Object.create(SessionManager.prototype)`
+    // (see the same note on fireStuckInputRecovery), where they are `undefined` — and an unguarded
+    // `.has()` threw a TypeError that BOTH enclosing catches swallowed, silently sending ZERO
+    // stuck-input recovery keys instead of the escalating four. Optional chaining keeps D3's teeth:
+    // the refusal verdict comes from `session.confinedConfigHome`, not from these Sets, so a
+    // genuinely confined session is still refused — only the holder allow-list and the
+    // once-per-session warning degrade, and both are additive.
+    if (this.confinedStartupHolders?.has(tmuxSession)) return false;
     const session = this.state.listSessions({ status: 'running' }).find((s) => s.tmuxSession === tmuxSession);
     if (!session?.confinedConfigHome) return false;
-    if (!this.confinedWriteRefusals.has(session.id)) {
-      this.confinedWriteRefusals.add(session.id);
+    if (!this.confinedWriteRefusals?.has(session.id)) {
+      this.confinedWriteRefusals?.add(session.id);
       console.warn(`[SessionManager] refused ${what} into confined session "${tmuxSession}" (D3: only the startup driver may press a key in a confined session)`);
     }
     return true;

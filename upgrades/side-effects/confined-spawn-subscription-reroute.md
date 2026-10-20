@@ -95,3 +95,99 @@ Confirmed without change: launch parity (shared `applyClaudeConfinement`; `--set
 **Fix applied (same branch):** the guard now refuses every write to a confined session, before or after delivery, from any writer except the D2 startup driver while it holds that session (`confinedStartupHolders`), and it is consulted at the real chokepoints: `performTmuxInjectionEffect`, `sendKey`, `sendKeyAsync`, `performStuckInputKeyEffect`, `detectClaudePrompt`, and the server's `tmuxOps.sendKeys` (via the public `isConfinedWriteRefused`). `tests/unit/confined-send-keys-chokepoints.test.ts` enumerates every raw `send-keys` / `buildLiteralSendArgs` site in `src/core/SessionManager.ts`, `src/commands/server.ts` and `src/server/*.ts` and fails on any site that neither consults the guard in its enclosing function nor carries a `confined-write-allowed: <reason>` comment. The four allowlisted sites are named above. The artifact and spec now say "every Instar writer through SessionManager or the server's tmux operations". Known limits, by name: the exclusion is time-scoped (any caller is admitted during the driver's ≤120 s hold, not only the driver); the ratchet matches the quoted `send-keys` argv forms and the shell-string `send-keys -t` form, not an arbitrarily constructed argv, and scans only those files; writers outside the scan, which resolve targets from their own handles and are practically unreachable for a confined session, are the provider adapters (`anthropic-headless`, `anthropic-interactive-pool`, `openai-codex` control and canary paths), `ServerSupervisor`, `cli.ts` and `codexHookArm` (Codex only). `MessageDelivery` is gated through `tmuxOps.sendKeys`.
 
 **Re-check of 3a0aa3496 (same reviewer): Concur** (49/49 across 6 files), with the three wording corrections above applied.
+
+---
+
+## Addendum — D3 guard crashed the stuck-input recovery under a constructor-less harness (2026-10-20)
+
+**What was found after the PR's required checks finally ran.** `Unit Tests (shard 1/4)` went red on
+BOTH node versions with `tests/unit/session-multishot-recovery.test.ts` — 4 tests, first assertion
+`expected 0 to be greater than or equal to 4`. That test is PRE-EXISTING on main; this PR broke it.
+
+**Root cause.** `performStuckInputKeyEffect` opens with the D3 guard
+`if (this.confinedWriteRefused(...)) return;`. `confinedWriteRefused` reads two **class-field
+initialisers** — `confinedStartupHolders` and `confinedWriteRefusals` — which exist only when the
+SessionManager constructor ran. The multishot test builds its manager with
+`Object.create(SessionManager.prototype)`, so both are `undefined` and `.has()` threw a TypeError.
+**Both enclosing catches swallow it** (`fireStuckInputRecovery`'s try/catch, and `verifyInjection`'s
+"never throw from a background verification"), so the symptom was not an error but SILENCE: zero
+stuck-input recovery keys instead of the escalating four. Confirmed from the test output:
+`[SessionManager] fireStuckInputRecovery error ... Cannot read properties of undefined (reading 'has')`
+on all four attempts.
+
+**Fix.** Optional chaining on both Set reads. This PR already anticipated the identical hazard one
+method up — `fireStuckInputRecovery` reads `this.strandedDraftMarkers?.get(...)` with a comment
+saying "legacy harnesses may instantiate this narrow recovery surface without running the full
+SessionManager constructor" — and simply missed the same case inside the guard.
+
+### 1. Over-block
+Before the fix the guard over-blocked absolutely: it refused EVERY stuck-input recovery key in any
+harness that had not run the constructor, which is the opposite of D3's intent (D3 refuses writes into
+*confined* sessions, not all sessions). After the fix it blocks exactly what the design says.
+
+### 2. Under-block
+None introduced. The refusal verdict is unchanged and still derives from
+`session.confinedConfigHome` read out of durable state. A genuinely confined session is still refused.
+What degrades when the Sets are absent is (a) the startup-driver ALLOW-list — absence makes the guard
+*more* restrictive, never less — and (b) the once-per-session dedupe of the warning log. Both are
+additive, and both only degrade in a harness, never in production where the constructor runs.
+
+### 3. Level-of-abstraction fit
+Correct layer. The alternative — stubbing the Sets in the test — would hide a real fragility in
+production code behind test scaffolding, and would leave the next prototype-built caller crashing in
+the same silent way. Making the guard tolerant of its own optional state is the lower, more durable fix.
+
+### 4. Signal vs authority compliance
+Compliant, and strictly improved. `confinedWriteRefused` IS an authority (it blocks writes), so its
+logic must not be brittle. A `.has()` on possibly-undefined state is exactly the brittleness the
+principle warns about: the guard's crash was silently converted into "refuse everything" by the
+surrounding catches. Removing that crash path makes a blocking authority less brittle without widening
+or narrowing what it decides.
+
+### 5. Interactions
+- The two swallowing catches are left as they are, deliberately. They exist so a background verifier
+  can never throw into the caller, and that is right. The defect was the crash, not the catching.
+- No interaction with the confined startup driver: `confinedStartupHolders?.has()` returning undefined
+  for an un-constructed harness fails toward refusal, which is the safe direction.
+- Verified no shadowing of the other four `confinedWriteRefused` callsites (`sendKey`, `rawInject`,
+  `isConfinedWriteRefused`, the text path) — all keep identical behaviour in production.
+
+### 6. External surfaces
+None. No route, no message, no config, no state shape changes. The only externally visible difference
+is that a stuck session gets its four escalating recovery nudges again instead of none — which is the
+behaviour main already had before this PR.
+
+### 7. Multi-machine posture (Cross-Machine Coherence)
+**Machine-local BY DESIGN.** Stuck-input recovery acts on a tmux pane on the machine that owns the
+session; both Sets are in-process state about local panes. There is nothing to replicate: a pane on
+another machine is recovered by that machine's own SessionManager. No durable state, no generated URL,
+no user-facing notice is involved, so there is no transfer-stranding or one-voice concern.
+
+### 8. Rollback cost
+Near zero. Revert two `?.` operators to `.` and the prior behaviour returns. No migration, no data
+change, no agent-state repair. The lockfile half reverts by restoring the previous `pnpm-lock.yaml`.
+
+## Second-pass review (Phase 5 — required: touches session-lifecycle recovery and a guard)
+
+**Performed by the implementing agent as a deliberate adversarial pass, NOT by an independent reviewer
+subagent.** Recording that honestly rather than claiming concurrence that did not happen: this session
+operates under a standing constraint against spawning subagents unrequested, so the independent audit
+Phase 5 asks for was not run. The trace records `secondPass: true, reviewerConcurred: null` so the gap
+is visible rather than papered over.
+
+Adversarial questions asked and answered:
+- *Does optional chaining weaken D3 for a real confined session?* No — tested. The refusal comes from
+  `session.confinedConfigHome`; `tests/unit/confined-send-keys-chokepoints.test.ts` and
+  `tests/unit/confined-startup-dialogs.test.ts` still pass 23/23 after the change.
+- *Could the undefined ALLOW-list now let a write into a confined session?* No. An undefined
+  `confinedStartupHolders?.has()` is falsy, so the early `return false` (allow) is NOT taken — control
+  falls through to the confined check. The failure direction is toward refusal.
+- *Is this really a harness-only problem, or is production affected?* Production runs the constructor,
+  so the Sets exist; and `confinedWriteRefused` already fails OPEN for a non-confined session
+  (`if (!session?.confinedConfigHome) return false`). So no production session lost recovery keys. The
+  defect's reach was the test harness — but it was a REAL defect in production code, found by a real
+  pre-existing test, and the fix belongs in the production code.
+- *Is the lockfile change in scope?* It is a pre-existing drift on main (`@sagemindai/threadline-core`
+  added to `package.json` without `pnpm-lock.yaml`) that makes THIS PR's `UX assertions (messaging
+  E2E)` check fail on `ERR_PNPM_OUTDATED_LOCKFILE`. Bundled deliberately so one merge clears both this
+  PR's red checks; the diff is +11/-0 and purely additive.

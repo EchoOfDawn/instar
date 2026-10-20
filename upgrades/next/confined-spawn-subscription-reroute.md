@@ -25,3 +25,50 @@ Nothing changes for you unless the feedback executor is on. If it is, and your a
 - `tests/unit/confined-startup-dialogs.test.ts` (20), `tests/unit/session-manager-confined-reroute.test.ts` (13), `tests/unit/feedback-factory/execute-reroute-capacity.test.ts` (5), `tests/unit/session-manager-confined-spawn.test.ts` (updated).
 - `tests/e2e/confined-reroute-lifecycle.test.ts`: real tmux, production-shaped config, a fake interactive Claude drawing the measured dialogs.
 - Live on the Mac Studio (2026-10-19, twice): the executor's session canary through the built SessionManager under `force`; trust answered, task delivered, 16/17 probes passed, planted project hook and MCP server did not run. The failing probe is `session-git-status`: Claude Code 2.1.303 writes `/tmp/claude-501/cwd-*`, which the executor's sandbox policy denies (it allows `/tmp/claude`), so every Bash command exits 1. That is the sandbox policy, not this change.
+
+## Addendum (2026-10-20) — the stuck-input recovery regression this PR introduced, now fixed
+
+The D3 confined-write guard reads two class-field Sets that exist only when the SessionManager
+constructor ran. The pre-existing `tests/unit/session-multishot-recovery.test.ts` builds its manager
+with `Object.create(SessionManager.prototype)`, so `.has()` threw a TypeError — and because
+`fireStuckInputRecovery` and `verifyInjection` both deliberately swallow errors, the symptom was
+silence: zero stuck-input recovery keys instead of the escalating four. Optional chaining on both Set
+reads fixes it without touching what the guard decides (the refusal verdict comes from
+`session.confinedConfigHome`, not from the Sets).
+
+Also refreshes `pnpm-lock.yaml`: `@sagemindai/threadline-core@0.1.0` was added to `package.json` on
+main without the pnpm lockfile, so every pnpm job failed `ERR_PNPM_OUTDATED_LOCKFILE` — which is what
+made this PR's `UX assertions (messaging E2E)` check red. `package-lock.json` already carried it, which
+is why the npm-based unit shards installed fine. The lockfile diff is +11/-0 and purely additive.
+
+### Evidence
+
+- Before: `tests/unit/session-multishot-recovery.test.ts` — 4 failed | 8 passed, with
+  `[SessionManager] fireStuckInputRecovery error ... Cannot read properties of undefined (reading 'has')`
+  logged on all four recovery attempts.
+- After: **12 passed (12)**, zero swallowed `fireStuckInputRecovery` errors.
+- D3 unchanged: `tests/unit/confined-send-keys-chokepoints.test.ts` +
+  `tests/unit/confined-startup-dialogs.test.ts` — **23 passed (23)**.
+- Lockfile: `@sagemindai/threadline-core` present in `pnpm-lock.yaml` (importer specifier, package
+  resolution with integrity, and snapshot); `git diff --numstat` = +11 / -0.
+
+## ELI16 — when a session got stuck, the thing that wakes it up had gone silent
+
+Instar watches for a session whose typed message never submitted, and nudges it a few times, harder
+each time, until it goes through. This change added a safety check in front of those nudges — a
+confined, sandboxed session is not allowed to be typed into by anything except its own start-up
+driver. The check looks up two lists to decide, and those lists only get created when a session
+manager is built the full way. One of our tests builds a deliberately cut-down one, so the lookup
+crashed.
+
+The crash was invisible, which is the interesting part. Two layers above it are written to ignore
+errors on purpose, because a background checker should never break the thing it is watching. So
+instead of a loud failure, a stuck session simply got no nudges at all and stayed stuck. Asking for
+those two lists more carefully — "if they exist" rather than assuming they do — fixes it. The safety
+check keeps its teeth, because what it actually decides comes from the session record itself, not from
+those lists: a genuinely sandboxed session is still refused.
+
+One unrelated thing rides along, because it was failing this change's own checks: a dependency was
+added to the project's package list on the main branch without updating one of the two lock files that
+pin exact versions. Any build step using that lock file refused to install. Regenerating it adds the
+missing entry and nothing else.
