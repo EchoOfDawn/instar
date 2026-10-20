@@ -78,3 +78,7 @@ Instar and threadline-mcp now run one implementation of invite pairing. The beha
 **Independent read of the artifact: concern, then resolved**
 
 The reviewer compared every function taken from core against the removed Instar code and `node_modules/@sagemindai/threadline-core/dist`. It found the re-exported crypto helpers identical, confirmed the `verify` and `MessageEncryptor` differences are real, found the store's corrupt-file and ENOENT handling matches core's, and found no re-exported name with a changed signature (`tsc --noEmit` clean). Concern raised: the first draft kept `derivePairingIdV2` in Instar on the premise that core's adds a 32-byte length check, but Instar's already throws through `sortedPair`, so the two were identical. Resolved: `derivePairingIdV2` now delegates to core's `derivePairingId`, and this artifact and the code comment were corrected.
+
+## Spec amendment (wording only, after Echo's approval)
+
+`docs/specs/threadline-standalone-pairing.md` is brought into line with what this PR does: the trust port is named `InviteTrust` (the name core exports) instead of `TrustPort`; step 3 lists the five core review fixes it adopts instead of calling itself behaviour-identical; and steps 3 and 6 say that whichever lands second deletes `src/threadline/encryptedSeenMark.ts` and its parity test, with step 6 importing the mark from core if it rebases onto step 3. No decision changes; `approved: true` stays.
