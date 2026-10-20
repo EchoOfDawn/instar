@@ -7,7 +7,7 @@
  * scratch dir and the script drives it in the repo.
  */
 
-import { classifyReleaseCut } from '../release-cut-diff.mjs';
+import { classifyReleaseCut, compareSemver } from '../release-cut-diff.mjs';
 
 /** The remotes whose `<remote>/main` pre-push-gate.js's pickRef may choose, in its order. */
 export const GATE_BASE_REMOTES = ['JKHeadley', 'origin', 'upstream'];
@@ -481,4 +481,51 @@ export function smokeFailureVerdict(viewState, name, version) {
     return { pending: false, message: `the post-publish smoke test failed, and ${name}@${version} IS visible on npm — the published tarball itself failed the smoke test` };
   }
   return { pending: true, message: `the post-publish smoke test failed: ${name}@${version} is not visible on npm yet (${viewState}).\n${npmPendingNotice(name, version)}` };
+}
+
+/**
+ * Is npm AHEAD of main? `latest` is `npm view <name> version`; `local` is
+ * main's package.json version. npm ahead means a release was published and its
+ * release commit never landed (1.3.1362, 2026-10-20: published by a session
+ * that never ran --push-only; main stayed at 1.3.1361). Not a bump to make
+ * silently: the version on npm has notes and consumed fragments that main
+ * still lacks.
+ */
+export function npmAheadOfMain(latest, local) {
+  const SEMVER = /^\d+\.\d+\.\d+$/;
+  if (!SEMVER.test(String(latest)) || !SEMVER.test(String(local))) return false;
+  return compareSemver(latest, local) > 0;
+}
+
+/** The refusal text for an unfinished release, naming both remedies. */
+export function unfinishedReleaseMessage(name, latest, local, remote = 'origin') {
+  return [
+    `${name}@${latest} is on npm but main's package.json is ${local}: release v${latest} was published and its`,
+    `release commit never landed on main. Finish it before cutting a new release, by either:`,
+    `  1. running --push-only from the worktree that still holds the v${latest} cut:`,
+    `       node scripts/release-local.mjs --push-only --remote ${remote}`,
+    `  2. or, if that worktree is gone, rebuilding the cut from the published tarball and landing it:`,
+    `       node scripts/release-local.mjs --reconcile ${latest} --remote ${remote}`,
+    `     (upgrades/${latest}.md verbatim from the tarball; the fragments that existed at its gitHead deleted;`,
+    `      package.json and package-lock.json bumped; committed with hooks on and pushed like --push-only).`,
+  ].join('\n');
+}
+
+/** The release-note fragments present under upgrades/next/ at `commit`. */
+export function consumedFragmentsAt(run, commit) {
+  const r = run('git', ['ls-tree', '--name-only', `${commit}:upgrades/next`]);
+  if (r.status !== 0) return { ok: false, paths: [] };
+  return { ok: true, paths: r.stdout.split('\n').filter((f) => f.endsWith('.md')).map((f) => `upgrades/next/${f}`) };
+}
+
+/**
+ * Set the version in package.json / package-lock.json text. The lock's root
+ * package entry is bumped too. 2-space JSON plus a newline, which is how npm
+ * writes both files (a round-trip of the current files is byte-identical).
+ */
+export function bumpVersionJson(text, version, { lock = false } = {}) {
+  const o = JSON.parse(text);
+  o.version = version;
+  if (lock && o.packages && o.packages['']) o.packages[''].version = version;
+  return JSON.stringify(o, null, 2) + '\n';
 }

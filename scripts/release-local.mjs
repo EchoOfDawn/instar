@@ -51,6 +51,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
   refreshGateBaseRefs,
@@ -62,6 +63,10 @@ import {
   viewRetryDelayMs,
   npmPendingNotice,
   smokeFailureVerdict,
+  npmAheadOfMain,
+  unfinishedReleaseMessage,
+  consumedFragmentsAt,
+  bumpVersionJson,
   otpRequirement,
   activePublishRuns,
   dirtyToolFilesOnly,
@@ -89,6 +94,7 @@ const opts = {
   allowUnverifiedCi: false, // proceed when gh cannot say whether publish.yml is running
   pushOnly: false,        // resume: push an already-published release commit
   allowDirtyToolFiles: false, // --dry-run only: tolerate uncommitted edits to this tool's own files
+  reconcile: null, // --reconcile <version>: rebuild a published-but-never-landed cut from npm, then land it
   keepTagOnPublished: false, // with --push-only: tag stays on the published commit, main is rebased
 };
 for (let i = 0; i < argv.length; i++) {
@@ -104,6 +110,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--allow-unverified-ci') opts.allowUnverifiedCi = true;
   else if (a === '--push-only') opts.pushOnly = true;
   else if (a === '--allow-dirty-tool-files') opts.allowDirtyToolFiles = true;
+  else if (a === '--reconcile') opts.reconcile = argv[++i] ?? '';
+  else if (a.startsWith('--reconcile=')) opts.reconcile = a.slice('--reconcile='.length);
   else if (a === '--keep-tag-on-published') opts.keepTagOnPublished = true;
   else if (a === '--help' || a === '-h') {
     console.log('Usage: node scripts/release-local.mjs [--dry-run] [--userconfig <npmrc path>] [--remote <name>]\n' +
@@ -124,6 +132,8 @@ if (!opts.remote) { console.error('release-local: --remote needs a name'); proce
 if (opts.otpCommand !== null && !opts.otpCommand) { console.error('release-local: --otp-command needs a command'); process.exit(2); }
 if (opts.keepTagOnPublished && !opts.pushOnly) { console.error('release-local: --keep-tag-on-published only applies with --push-only'); process.exit(2); }
 if (opts.allowDirtyToolFiles && !opts.dryRun) { console.error('release-local: --allow-dirty-tool-files is for --dry-run only — a real release needs a clean tree'); process.exit(2); }
+if (opts.reconcile !== null && !SEMVER.test(opts.reconcile)) { console.error('release-local: --reconcile needs a version X.Y.Z'); process.exit(2); }
+if (opts.reconcile !== null && (opts.dryRun || opts.pushOnly || opts.keepTagOnPublished)) { console.error('release-local: --reconcile cannot be combined with --dry-run, --push-only or --keep-tag-on-published'); process.exit(2); }
 if (opts.pushOnly && opts.dryRun) { console.error('release-local: --push-only and --dry-run cannot be combined'); process.exit(2); }
 const npmAuthArgs = opts.userconfig ? ['--userconfig', opts.userconfig] : [];
 
@@ -243,6 +253,67 @@ function checkCiRuns(slug, when) {
   if (action === 'warn') { console.log(`WARNING (a real run would stop here): ${what}`); return; }
   if (action === 'proceed-unverified') { console.log(`WARNING: ${what.split('. Not assuming')[0]}; proceeding (--allow-unverified-ci).`); CI_UNVERIFIED = true; return; }
   fail(what);
+}
+
+// ── reconcile: rebuild a published-but-never-landed release cut ──────
+if (opts.reconcile !== null) {
+  const v = opts.reconcile;
+  console.log(`release-local --reconcile ${v} (rebuild the cut for a version already on npm, then land it like --push-only; never publishes)`);
+  step(`Reconcile: check that instar@${v} is on npm and main has not landed it`);
+  const dirty = must('git', ['status', '--porcelain', '--untracked-files=all'], { capture: true, quiet: true }).stdout.trim();
+  if (dirty) fail(`the working tree is not clean:\n${dirty.split('\n').slice(0, 10).join('\n')}`);
+  must('git', ['fetch', '--quiet', opts.remote, 'main']);
+  const head = must('git', ['rev-parse', 'HEAD'], { capture: true, quiet: true }).stdout.trim();
+  const remoteMain = must('git', ['rev-parse', `${opts.remote}/main`], { capture: true, quiet: true }).stdout.trim();
+  if (head !== remoteMain) fail(`HEAD (${head.slice(0, 10)}) is not ${opts.remote}/main (${remoteMain.slice(0, 10)}): git checkout --detach ${opts.remote}/main`);
+  const local = readPkgVersion();
+  if (!npmAheadOfMain(v, local)) fail(`main's package.json is already ${local}; v${v} is not ahead of it — nothing to reconcile`);
+  const st = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: v, npmArgs: npmAuthArgs, delayMs: VIEW_RETRY_DELAY_MS });
+  if (st !== 'published') {
+    if (st === 'unknown') publishUnknown = true;
+    fail(`instar@${v} is ${st === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --reconcile only rebuilds a version npm shows`);
+  }
+  const gh = run('npm', ['view', `instar@${v}`, 'gitHead', '--prefer-online', ...npmAuthArgs], { capture: true, quiet: true });
+  const gitHead = gh.stdout.trim();
+  if (gh.status !== 0 || !/^[0-9a-f]{40}$/.test(gitHead)) fail(`npm has no gitHead for instar@${v} (got ${JSON.stringify(gitHead)}) — cannot tell which fragments it consumed; rebuild by hand`);
+  if (run('git', ['cat-file', '-e', `${gitHead}^{commit}`], { capture: true, quiet: true }).status !== 0) {
+    run('git', ['fetch', '--quiet', opts.remote, gitHead], { capture: true, quiet: true });
+  }
+  if (run('git', ['merge-base', '--is-ancestor', gitHead, 'HEAD'], { capture: true, quiet: true }).status !== 0) {
+    fail(`instar@${v} was built from ${gitHead.slice(0, 10)}, which is not in main's history — refusing to rebuild its cut onto main`);
+  }
+  console.log(`instar@${v} is on npm, built from ${gitHead.slice(0, 10)} (on main's history); main is at ${local}.`);
+
+  step(`Reconcile: fetch the published tarball and take upgrades/${v}.md from it`);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'release-local-reconcile-'));
+  const pack = run('npm', ['pack', `instar@${v}`, '--pack-destination', tmp, '--json', ...npmAuthArgs], { capture: true, quiet: true });
+  let tgz = null;
+  try { tgz = JSON.parse(pack.stdout)[0].filename; } catch { tgz = null; }
+  if (pack.status !== 0 || !tgz) fail(`npm pack instar@${v} failed${pack.stderr ? `: ${pack.stderr.trim().split('\n').pop()}` : ''}`);
+  const tarPath = path.isAbsolute(tgz) ? tgz : path.join(tmp, path.basename(tgz));
+  const x = run('tar', ['-xzf', tarPath, '-C', tmp, `package/upgrades/${v}.md`], { capture: true, quiet: true });
+  const guidePath = path.join(tmp, 'package', 'upgrades', `${v}.md`);
+  if (x.status !== 0 || !fs.existsSync(guidePath)) fail(`the published tarball for instar@${v} has no upgrades/${v}.md`);
+  const guide = fs.readFileSync(guidePath, 'utf-8');
+
+  step(`Reconcile: rebuild the cut (guide verbatim, consumed fragments, version bump)`);
+  const frags = consumedFragmentsAt(quietRun, gitHead);
+  if (!frags.ok) fail(`could not list upgrades/next/ at ${gitHead.slice(0, 10)}`);
+  touchedTree = true; // from here a failure restores package.json, the lock and upgrades/
+  fs.writeFileSync(path.join(ROOT, 'upgrades', `${v}.md`), guide);
+  const removed = [];
+  for (const f of frags.paths) {
+    if (fs.existsSync(path.join(ROOT, f))) { fs.unlinkSync(path.join(ROOT, f)); removed.push(f); }
+  }
+  for (const [f, lock] of [['package.json', false], ['package-lock.json', true]]) {
+    const p = path.join(ROOT, f);
+    if (fs.existsSync(p)) fs.writeFileSync(p, bumpVersionJson(fs.readFileSync(p, 'utf-8'), v, { lock }));
+  }
+  console.log(`wrote upgrades/${v}.md (verbatim from the tarball); removed ${removed.length} fragment(s) consumed at ${gitHead.slice(0, 10)}: ${removed.join(', ') || '(none left on main)'}; bumped package.json/package-lock.json to ${v}`);
+  // Land it exactly like --push-only: it re-checks that the tree is EXACTLY a
+  // release cut, that HEAD is on main's history and that npm has v, then
+  // commits with hooks on and pushes main + tag atomically.
+  opts.pushOnly = true;
 }
 
 // ── push-only resume ──────────────────────────────────────────────────
@@ -368,6 +439,22 @@ step('Preflight: clean tree on an up-to-date main');
   }
   START_SHA = head;
   SLUG = slug;
+  // An unfinished release: npm is AHEAD of main. Cutting another release now
+  // would bury it (1.3.1362, 2026-10-20). A dry run warns; a real run stops.
+  {
+    const lv = run('npm', ['view', 'instar', 'version', '--prefer-online'], { capture: true, quiet: true });
+    const latest = lv.stdout.trim();
+    const local = readPkgVersion();
+    if (lv.status !== 0 || !SEMVER.test(latest)) {
+      const msg = `could not read the latest instar version from npm (exit ${lv.status}) — cannot check for an unfinished release`;
+      if (opts.dryRun) console.log(`WARNING (a real run would stop here): ${msg}`); else fail(msg);
+    } else if (npmAheadOfMain(latest, local)) {
+      const msg = unfinishedReleaseMessage('instar', latest, local, opts.remote);
+      if (opts.dryRun) console.log(`WARNING (a real run would stop here): ${msg}`); else fail(msg);
+    } else {
+      console.log(`npm latest ${latest}, main ${local}: no unfinished release`);
+    }
+  }
   checkCiRuns(slug, 'preflight');
 }
 

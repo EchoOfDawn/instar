@@ -27,6 +27,10 @@ import {
   viewRetryDelayMs,
   npmPendingNotice,
   smokeFailureVerdict,
+  npmAheadOfMain,
+  unfinishedReleaseMessage,
+  consumedFragmentsAt,
+  bumpVersionJson,
   isReleaseCutCommit,
   otpRequirement,
   ciRunState,
@@ -567,6 +571,194 @@ describe('ciGateAction', () => {
   });
 });
 
+describe('unfinished release: npm ahead of main (1.3.1362 incident)', () => {
+  it('npmAheadOfMain compares numerically and ignores junk', () => {
+    expect(npmAheadOfMain('1.3.1362', '1.3.1361')).toBe(true);
+    expect(npmAheadOfMain('1.3.1000', '1.3.999')).toBe(true);
+    expect(npmAheadOfMain('1.3.1361', '1.3.1361')).toBe(false);
+    expect(npmAheadOfMain('1.3.1360', '1.3.1361')).toBe(false);
+    expect(npmAheadOfMain('', '1.3.1361')).toBe(false);
+  });
+  it('the refusal names the version and both remedies', () => {
+    const m = unfinishedReleaseMessage('instar', '1.3.1362', '1.3.1361', 'origin');
+    expect(m).toContain('instar@1.3.1362 is on npm but main\'s package.json is 1.3.1361');
+    expect(m).toContain('--push-only --remote origin');
+    expect(m).toContain('--reconcile 1.3.1362 --remote origin');
+    expect(m).toContain('upgrades/1.3.1362.md verbatim from the tarball');
+  });
+  it('bumpVersionJson sets package and lock-root versions; a no-op bump is byte-identical', () => {
+    const pkg = JSON.stringify({ name: 'instar', version: '1.0.0', dependencies: { a: '^1' } }, null, 2) + '\n';
+    expect(bumpVersionJson(pkg, '1.0.0')).toBe(pkg);
+    expect(JSON.parse(bumpVersionJson(pkg, '1.0.1')).version).toBe('1.0.1');
+    const lock = JSON.stringify({ name: 'instar', version: '1.0.0', packages: { '': { version: '1.0.0' }, 'node_modules/a': { version: '1.0.0' } } }, null, 2) + '\n';
+    const out = JSON.parse(bumpVersionJson(lock, '1.0.1', { lock: true }));
+    expect(out.version).toBe('1.0.1');
+    expect(out.packages[''].version).toBe('1.0.1');
+    expect(out.packages['node_modules/a'].version).toBe('1.0.0');
+  });
+});
+
+describe('--reconcile <version>: rebuild a published-but-never-landed cut from npm and land it (real CLI, bare remote, fake registry)', () => {
+  const ROOT_REPO = path.join(__dirname, '..', '..');
+  let tmp: string;
+  let bare: string;
+  let clone: string;
+  let bin: string;
+  let gitHead: string;
+  const GUIDE = '# Upgrade Guide — v1.0.1\n\nThe notes npm actually shipped.\n';
+  const g = (cwd: string, ...args: string[]) => {
+    const r = runner(cwd)('git', args);
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const write = (rel: string, body: string) => {
+    fs.mkdirSync(path.dirname(path.join(clone, rel)), { recursive: true });
+    fs.writeFileSync(path.join(clone, rel), body);
+  };
+  const pkg = (v: string) => JSON.stringify({ name: 'instar', version: v }, null, 2) + '\n';
+  const lock = (v: string) => JSON.stringify({ name: 'instar', version: v, lockfileVersion: 3, packages: { '': { name: 'instar', version: v } } }, null, 2) + '\n';
+
+  /** npm stand-in: `npm view`, `npm pack` against a fake registry holding 1.0.1. */
+  function shim({ latest = '1.0.1', has101 = true, head = () => gitHead } = {}) {
+    const tgzDir = path.join(tmp, 'registry');
+    const script = [
+      '#!/bin/sh',
+      `if [ "$1" = view ] && [ "$2" = instar ] && [ "$3" = version ]; then echo ${latest}; exit 0; fi`,
+      `if [ "$1" = view ] && [ "$2" = "instar@1.0.1" ] && [ "$3" = version ]; then ${has101 ? 'echo 1.0.1; exit 0' : 'echo "npm error code E404" >&2; exit 1'}; fi`,
+      `if [ "$1" = view ] && [ "$2" = "instar@1.0.1" ] && [ "$3" = gitHead ]; then echo ${head()}; exit 0; fi`,
+      `if [ "$1" = pack ] && [ "$2" = "instar@1.0.1" ]; then cp "${tgzDir}/instar-1.0.1.tgz" "$4/"; echo '[{"filename":"instar-1.0.1.tgz"}]'; exit 0; fi`,
+      'echo "npm error code E404" >&2; exit 1',
+    ].join('\n') + '\n';
+    fs.writeFileSync(path.join(bin, 'npm'), script);
+    fs.chmodSync(path.join(bin, 'npm'), 0o755);
+  }
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'release-local-reconcile-'));
+    bare = path.join(tmp, 'remote.git');
+    clone = path.join(tmp, 'clone');
+    bin = path.join(tmp, 'bin');
+    fs.mkdirSync(bin);
+    g(tmp, 'init', '--bare', '--initial-branch=main', bare);
+    g(tmp, 'clone', '-q', bare, clone);
+    for (const f of ['scripts/release-local.mjs', 'scripts/lib/release-local-steps.mjs', 'scripts/release-cut-diff.mjs']) {
+      write(f, fs.readFileSync(path.join(ROOT_REPO, f), 'utf-8'));
+    }
+    write('package.json', pkg('1.0.0'));
+    write('package-lock.json', lock('1.0.0'));
+    write('upgrades/1.0.0.md', '# 1.0.0\n');
+    write('upgrades/next/consumed.md', '# a fix that shipped in 1.0.1\n');
+    g(clone, 'add', '-A');
+    g(clone, 'commit', '-qm', 'merge: the fix that 1.0.1 was built from');
+    gitHead = g(clone, 'rev-parse', 'HEAD'); // what `npm view instar@1.0.1 gitHead` reports
+    // After 1.0.1 was published (and never landed), another PR merged with its own fragment.
+    write('upgrades/next/later.md', '# a later fix, NOT in 1.0.1\n');
+    write('src/later.ts', 'export const later = 1;\n');
+    g(clone, 'add', '-A');
+    g(clone, 'commit', '-qm', 'merge: a later fix');
+    g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    // The published tarball.
+    const pkgDir = path.join(tmp, 'registry', 'package', 'upgrades');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, '1.0.1.md'), GUIDE);
+    execFileSync('tar', ['-czf', path.join(tmp, 'registry', 'instar-1.0.1.tgz'), '-C', path.join(tmp, 'registry'), 'package']);
+    shim();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function cli(...args: string[]) {
+    const r = spawnSync(process.execPath, [path.join(clone, 'scripts', 'release-local.mjs'), ...args], {
+      cwd: clone,
+      env: { ...ENV, PATH: `${bin}:${process.env.PATH}`, INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS: '0' },
+      encoding: 'utf-8',
+    });
+    return { status: r.status, out: `${r.stdout}\n${r.stderr}` };
+  }
+
+  it('a real release run refuses while npm is ahead of main, naming the version and both remedies; nothing changes', () => {
+    const before = g(bare, 'rev-parse', 'main');
+    const r = cli('--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("instar@1.0.1 is on npm but main's package.json is 1.0.0");
+    expect(r.out).toContain('--reconcile 1.0.1 --remote origin');
+    expect(r.out).toContain('--push-only --remote origin');
+    expect(g(bare, 'rev-parse', 'main')).toBe(before);
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  });
+
+  it('--reconcile 1.0.1 rebuilds the cut from the tarball + gitHead and lands it with hooks on', () => {
+    // a pre-commit hook proves the commit ran with hooks
+    const marker = path.join(tmp, 'precommit-ran');
+    const hook = path.join(clone, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, `#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    fs.chmodSync(hook, 0o755);
+    const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
+    expect(r.out).toContain('removed 1 fragment(s) consumed at');
+    expect(r.status).toBe(0);
+    expect(fs.existsSync(marker)).toBe(true);
+    const head = g(clone, 'rev-parse', 'HEAD');
+    expect(g(bare, 'rev-parse', 'main')).toBe(head);
+    expect(g(bare, 'log', '-1', '--format=%s', 'main')).toBe('chore: release v1.0.1 [skip ci]');
+    expect(g(bare, 'rev-parse', 'v1.0.1^{commit}')).toBe(head);
+    expect(g(bare, 'show', 'main:upgrades/1.0.1.md') + '\n').toBe(GUIDE); // verbatim
+    const files = g(bare, 'ls-tree', '--name-only', 'main:upgrades/next').split('\n');
+    expect(files).toEqual(['later.md']); // consumed fragment gone, the later one kept
+    expect(JSON.parse(g(bare, 'show', 'main:package.json')).version).toBe('1.0.1');
+    expect(JSON.parse(g(bare, 'show', 'main:package-lock.json')).packages[''].version).toBe('1.0.1');
+    expect(g(bare, 'show', 'main:src/later.ts')).toBe('export const later = 1;');
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  });
+
+  it('refuses when npm does not have the version; the tree stays clean', () => {
+    shim({ has101: false });
+    const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('only rebuilds a version npm shows');
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  });
+
+  it("refuses when the version's gitHead is not on main's history", () => {
+    shim({ head: () => 'deadbeef'.repeat(5) });
+    const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("not in main's history");
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  });
+
+  it('refuses when main is not behind the version (nothing to reconcile)', () => {
+    const r = cli('--reconcile', '1.0.0', '--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('nothing to reconcile');
+  });
+
+  it('a hook refusal of the rebuilt commit keeps the rebuilt cut and points at --push-only (the version IS on npm); nothing is pushed', () => {
+    const hook = path.join(clone, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, '#!/bin/sh\necho "PRECOMMIT SAYS NO" >&2\nexit 1\n');
+    fs.chmodSync(hook, 0o755);
+    const before = g(bare, 'rev-parse', 'main');
+    const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('PRECOMMIT SAYS NO');
+    expect(r.out).toContain('the release commit was NOT made');
+    expect(r.out).toContain('--push-only --remote origin');
+    expect(g(bare, 'rev-parse', 'main')).toBe(before);
+    // the rebuilt cut is still in the tree, so --push-only can commit it once the hook passes
+    expect(fs.readFileSync(path.join(clone, 'upgrades', '1.0.1.md'), 'utf-8')).toBe(GUIDE);
+    fs.writeFileSync(path.join(clone, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 0\n');
+    const resumed = cli('--push-only', '--remote', 'origin');
+    expect(resumed.status).toBe(0);
+    expect(g(bare, 'log', '-1', '--format=%s', 'main')).toBe('chore: release v1.0.1 [skip ci]');
+  });
+
+  it('consumedFragmentsAt lists upgrades/next/ at a commit', () => {
+    expect(consumedFragmentsAt(runner(clone), gitHead)).toEqual({ ok: true, paths: ['upgrades/next/consumed.md'] });
+    expect(consumedFragmentsAt(runner(clone), 'HEAD').paths.sort()).toEqual(['upgrades/next/consumed.md', 'upgrades/next/later.md']);
+  });
+});
+
 describe('--push-only resumes a release that failed between publish and commit (real CLI, bare remote)', () => {
   // Echo #2225 blocker. Both failure points leave the SAME state — npm has the
   // version, the release cut is in the working tree, HEAD is still main:
@@ -741,7 +933,7 @@ describe('release-local.mjs wiring', () => {
     expect(preflight).toBeLessThan(npmCi);
     expect(again).toBeGreaterThan(npmCi);
     expect(again).toBeLessThan(publish);
-    const fn = src.slice(src.indexOf('function checkCiRuns('), src.indexOf('// ── push-only resume'));
+    const fn = src.slice(src.indexOf('function checkCiRuns('), src.indexOf('// ── reconcile:'));
     expect(fn).toContain('ciGateAction({ state: verdict.state, dryRun: opts.dryRun, allowUnverified: opts.allowUnverifiedCi })');
     expect(fn.trim().endsWith('fail(what);\n}') || /fail\(what\);\s*\}\s*$/.test(fn)).toBe(true);
   });
@@ -833,6 +1025,10 @@ describe('release-local.mjs wiring', () => {
     expect(a.status).toBe(2);
     const b = spawnSync(process.execPath, [script, '--push-only', '--dry-run'], { encoding: 'utf-8' });
     expect(b.status).toBe(2);
+    const d = spawnSync(process.execPath, [script, '--reconcile', 'latest'], { encoding: 'utf-8' });
+    expect(d.status).toBe(2);
+    const e = spawnSync(process.execPath, [script, '--reconcile', '1.2.3', '--dry-run'], { encoding: 'utf-8' });
+    expect(e.status).toBe(2);
     const c = spawnSync(process.execPath, [script, '--allow-dirty-tool-files'], { encoding: 'utf-8' });
     expect(c.status).toBe(2);
     expect(c.stderr).toContain('--dry-run only');
