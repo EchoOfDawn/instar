@@ -4,7 +4,7 @@ slug: "local-release"
 author: "dawn"
 status: draft
 approved: false
-review-convergence: "Echo review round 1 (PR #2224 comment, 2026-10-20T05:31Z); both must-settle items and all four smaller items answered in round 2; open questions resolved. The formal /spec-converge multi-reviewer pass has NOT been run."
+review-convergence: "Echo review rounds 1 (2026-10-20T05:31Z) and 2 (re-review at 5dc1c8a34) on PR #2224; every item answered in round 3, including round 2's must-settle (any publish.yml run, not just this commit). No open questions. The formal /spec-converge multi-reviewer pass has NOT been run."
 eli16-overview: "local-release.eli16.md"
 ---
 
@@ -34,7 +34,8 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 - `--allow-unverified-ci` lets a real run proceed when `gh` cannot say whether a publish.yml run is active. It never overrides a run that IS active.
 - `--push-only` resumes after a publish: it lands an already-published release commit and never publishes (see "Push-only resume").
 - `--keep-tag-on-published` (with `--push-only` only) pushes the tag on the published commit and lands the release commit on main separately.
-- An unknown argument exits 2 and touches nothing, as do `--keep-tag-on-published` without `--push-only` and `--push-only` with `--dry-run`.
+- `--allow-dirty-tool-files` (with `--dry-run` only) tolerates uncommitted edits to the tool's own files, and only those: the script, its lib, its two tests, the destructive-lint allowlist, CONTRIBUTING.md and this spec. This lets the real dry run be exercised before the tool can be committed (it can't be committed until this spec is approved). The list deliberately excludes package.json, package-lock.json and upgrades/, because the dry run edits those and then restores them from HEAD, which would discard an uncommitted edit there. A real run with the flag exits 2.
+- An unknown argument exits 2 and touches nothing, as do `--keep-tag-on-published` without `--push-only`, `--push-only` with `--dry-run`, and `--allow-dirty-tool-files` without `--dry-run`.
 
 **Steps** (the numbers are the script's step order):
 
@@ -42,14 +43,17 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
    - The git top-level must be the script's own repo.
    - `git status --porcelain --untracked-files=all` must be empty.
    - It runs `git fetch <remote> main`, then requires `HEAD == <remote>/main`. A `--dry-run` only warns on a mismatch, so a branch can be rehearsed; a real run refuses.
-   - If HEAD's message contains `[skip ci]`, it stops cleanly. This is the job's `if:`.
+   - If HEAD's message contains `[skip ci]`, it prints a note and **continues** (changed in round 3). publish.yml's `if:` exists to stop its own release commit re-triggering it; locally there is no loop, and step 4's fragment check already answers "is anything left to release?". Stopping would strand work that merged before a release cut was rebased on top of it. That is main's state right now: the 1.3.1359 cut ee72c9c81 sits over #2222, whose fragment is unreleased. The round-3 dry run shows it.
    - **Gate-base refresh (Echo 3b):** for each of `JKHeadley/main`, `origin/main` and `upstream/main` that exists locally, it fetches that ref **from its own remote**: `git fetch JKHeadley main`, `git fetch origin main`, `git fetch upstream main`. It never fetches from `--remote`. These are the refs `pre-push-gate.js`'s `pickRef` may choose. A ref that exists but cannot be fetched stops the run before anything is published, because the gate would otherwise diff the release commit against a stale base.
-   - **publish.yml run check (open question 1, resolved).** It runs `gh run list -R <owner/repo> --workflow publish.yml --commit <HEAD> --json databaseId,status`.
-     - A run that is not `completed` (queued, in progress, waiting) stops a real run and prints the `gh run cancel` command. Two publishers must never race.
+   - **publish.yml run check (open question 1; widened in round 3 by Echo's must-settle).** It asks whether **any** publish.yml run on the repo is unfinished, **for any commit**. publish.yml checks out `ref: main`, not its triggering sha, and waits in `concurrency: publish` with `cancel-in-progress: false`. So a run queued for an earlier merge publishes whatever main is when it gets a runner, which would race a local release on the same version. There is no `--commit` filter.
+     - It makes one `gh run list -R <owner/repo> --workflow publish.yml --status <s> --limit 100 --json databaseId,status,headSha` query per unfinished status: `queued`, `in_progress`, `waiting`, `requested`, `action_required`. Querying by status means an old queued run can't fall off a page of recent runs.
+     - Any run found stops a real run and prints the `gh run cancel` ids. Two publishers must never race.
+     - Round-3 finding: the round-2 list included `pending`, which gh 2.64 rejects (`invalid argument "pending" for --status`). Every query therefore failed, and the first real dry run correctly read that as UNKNOWN. `pending` was removed, and a test now checks every queried status against the installed gh's own list of valid values.
      - If `gh` is missing, fails, prints something unparseable, or the owner/repo can't be derived from the remote URL, the answer is UNKNOWN. A real run stops unless `--allow-unverified-ci` is given; it never assumes none.
      - A `--dry-run` only warns.
-     - Real gh output was checked: the #2222 merge's run parses as `completed` → clear.
-   - A real run (not `--dry-run`) also requires `npm whoami` to succeed.
+     - It runs again right before publish, as step 13 of the run, which the dry run reaches too.
+     - Real gh output was checked: the round-3 dry run reports "none queued or in progress, for any commit" at both points.
+   - `npm whoami` must succeed. In a `--dry-run` this check and the OTP preflight below still run, but they warn ("a real run would stop here") instead of stopping, so the dry run proves them.
    - **OTP preflight (Echo round-1 item 2).** Before anything is mutated, it runs `npm profile get --json` and reads `tfa`:
      - `tfa: false`, `pending`, or mode `auth-only` → not required.
      - mode `auth-and-writes` → required.
@@ -69,9 +73,11 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 8. `node scripts/check-upgrade-guide.js`.
 9. **prepublishOnly's gates, run up front so `--dry-run` covers them:** `node scripts/verify-codex-stage-b-release-evidence.mjs` and `node scripts/check-contract-evidence.js`. `npm publish` runs them again through `prepublishOnly`.
 10. **`npm publish --access public`**, with no `--provenance`, because provenance needs the GitHub Actions OIDC token. The script prints that.
-    - The publish.yml run check runs again first, to close the window since preflight.
     - If `--otp-command` was given, it runs now and must print a 6–8 digit code; it is passed as `--otp`, and the printed command line shows `--otp <hidden>`.
-    - `npm publish` runs with **stdin closed**, so it can never sit waiting on an OTP prompt. A missing OTP becomes an `EOTP` failure, handled below.
+    - `npm publish` runs with **stdin closed** and a **20-minute timeout**.
+      - **Verified against the npm actually run (11.19.1, Echo round-2 item 3).** `lib/utils/auth.js` `otplease` rethrows at once when `!process.stdin.isTTY || !process.stdout.isTTY`. That check comes before both the web flow (`webAuthOpener`, which prints a URL and polls) and the classic prompt. So with stdin closed, a web-OTP challenge becomes an immediate `EOTP` failure, handled below. A test runs the installed npm's own `otplease` with a web-OTP `EOTP` and stdin closed, and requires `REJECTED EOTP` within 5 s. As a control, faking a TTY sends the same call into the web flow (`ENOTFOUND` on the fake URL), so the test does tell the two paths apart.
+      - `--auth-type=legacy` was considered and rejected: for publish, npm's web-vs-classic choice comes from the registry's `EOTP` body (`authUrl`/`doneUrl`), not from `auth-type`, so the flag would not change this path.
+      - The timeout is a backstop for an npm that someday polls anyway. A timeout is resolved against the registry like any other failure.
     
     **(Echo 3c)** If `npm publish` exits non-zero, it asks `npm view instar@<v> version`:
     - `<v>` → **published.** It continues down the published path, with a message saying so.
@@ -96,14 +102,14 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 - creates the local tag `vX` if it is missing, and refreshes the gate refs (each from its own remote);
 - then runs one of two pushes:
   - **default:** the same atomic push and cut-only rebase rule as step 12;
-  - **`--keep-tag-on-published`:** the local tag must be on HEAD (the published commit). It pushes the tag alone, so the tag stays on the commit npm was built from. Then it pushes `HEAD:main`, rebasing the release commit over whatever moved main; the tag does not move. A hook refusal still stops at once, and it never force-pushes. Main then carries the version bump on top of the newer code, as CI's own release commit always does, while the tag marks exactly the published tree.
+  - **`--keep-tag-on-published`** prints a note when used, because `vX` is then **not in main's history**. `scripts/release-skip-annotate.mjs` finds the last release with `git describe --tags --match 'v[0-9]*' --abbrev=0`, which sees reachable tags only, so it will treat the previous tag as the last release and report `vX`'s work as unreleased (round 2, item 2). Otherwise: the local tag must be on HEAD (the published commit). It pushes the tag alone, so the tag stays on the commit npm was built from. Then it pushes `HEAD:main`, rebasing the release commit over whatever moved main; the tag does not move. A hook refusal still stops at once, and it never force-pushes. Main then carries the version bump on top of the newer code, as CI's own release commit always does, while the tag marks exactly the published tree.
 
 **Failure semantics.**
 - Before publish, any failure restores `package.json`, `package-lock.json` and `upgrades/` (`git checkout HEAD -- …` plus `git clean -fq -- upgrades`). This only ever undoes the script's own edits, because the preflight required a clean tree including untracked files.
 - After publish, nothing is undone, and the message says the version is on npm and the release commit must land.
 - An UNKNOWN publish state does neither.
 
-**Code layout.** The decisions live in `scripts/lib/release-local-steps.mjs`: `refreshGateBaseRefs`, `pushReleaseAtomically`, `pushTagThenMain`, `isReleaseCutCommit` / `incomingCommits`, `publishedStateAfterFailure`, `otpRequirement`, `ciRunState` and `ciGateAction`. They live in `scripts/lib/release-local-steps.mjs`. Each takes an injected `run(cmd, args)`, so the tests drive real git.
+**Code layout.** The decisions live in `scripts/lib/release-local-steps.mjs`: `refreshGateBaseRefs`, `pushReleaseAtomically`, `pushTagThenMain`, `isReleaseCutCommit` / `incomingCommits`, `publishedStateAfterFailure`, `otpRequirement`, `ciRunState` / `activePublishRuns`, `ciGateAction` and `dirtyToolFilesOnly`. Each takes an injected `run(cmd, args)`, so the tests drive real git.
 
 **Docs.** CONTRIBUTING.md gets a "Releasing (maintainers)" section: local release is the default when CI is starved, the three commands, and the differences from CI.
 
@@ -123,6 +129,9 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 | commit push, then a separate tag push | one atomic push of commit + tag | main and the tag cannot disagree (Echo 3b) |
 | retry rebases on any push failure | rebases only when the remote main moved, and only over release cuts | a hook refusal is not fixed by rebasing (Echo 3a); a rebase over code would put the tag on a tree npm never got (Echo #2224 item 1) |
 | rebase re-tags over any concurrent merge | moved-with-code stops; `--push-only --keep-tag-on-published` keeps the tag on the published commit | the tag must match the tarball |
+| tag always in main's history | with `--keep-tag-on-published` the tag is NOT in main's history (a note is printed) | `release-skip-annotate.mjs` reads reachable tags only (`git describe --tags --abbrev=0`), so it would report vX's work as unreleased |
+| job skipped for a `[skip ci]` head commit | `[skip ci]` HEAD is a note; the fragment check decides | publish.yml's `if:` stops its own commit re-triggering it; locally there is no loop, and stopping would strand work merged before a cut |
+| one run per merge, serialised by `concurrency: publish` | refuses while ANY publish.yml run is unfinished, for any commit | a queued run publishes whatever main is when it starts, so it would race |
 | no concurrent-publisher check (concurrency group) | refuses while a publish.yml run for the merge is queued or in progress; unknown → stop | two publishers must never race (open question 1) |
 | non-interactive token in CI | OTP decided in preflight; `--otp-command` fresh code at publish; stdin closed | an OTP prompt mid-run would hang after mutating (Echo #2224 item 2) |
 | — | `--push-only` resume | a post-publish failure must be resumable without a re-publish (Echo #2224 item 4) |
@@ -164,8 +173,31 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 - **Mutation-checked.** Each of these mutations made a test fail.
   - Round 1: removing the moved-check, comparing against HEAD, a non-atomic push, skipping a stale ref, treating unknown as absent.
   - Round 2: rebasing over code, counting a merge as a cut, moving the tag in keep-tag mode, dropping the moved-check or the tag-on-HEAD check in keep-tag mode, treating an unknown OTP requirement as not-required (two forms), deciding OTP after `npm ci`, leaving publish stdin open, fetching every ref from `origin`, treating an unknown run state as clear, ignoring in_progress, letting an unknown state proceed, letting an active run be overridden, ignoring the gate action in the script, dropping the pre-publish re-check, skipping the npm check in `--push-only`, and passing the echoing runner to the push.
+- **Round 3** (Echo's re-review at 5dc1c8a34):
+  - `activePublishRuns`: a run queued for a DIFFERENT (earlier) sha → active; an in-progress run for another sha → active; no query ever carries `--commit`; there is one query per unfinished status; any failed or unreadable query → unknown; all empty → clear.
+  - Every queried status is valid for the installed gh.
+  - The installed npm's `otplease` rejects a web-OTP `EOTP` at once with stdin closed.
+  - `dirtyToolFilesOnly` accepts only the tool's files, refuses package.json, upgrades/, src/, renames and an empty status, and parses a porcelain string whose first line's leading space was trimmed.
+  - Wiring: the publish timeout is set; the dry run runs the auth and OTP preflight; a `[skip ci]` HEAD neither stops nor fails; the keep-tag note is printed; `--allow-dirty-tool-files` exits 2 on a real run.
+  - 9 more mutations were all caught: adding a `--commit` filter, skipping a failed status query, querying `queued` only, no timeout, stdin open, allowing package.json, an empty status counting as ok, allowing the flag on a real run, and dropping the keep-tag note. Re-adding `pending` is caught by the gh-validity test.
+  - 47 tests pass across `release-local-steps` and `release-local-parity`.
 - Real data: `gh run list` for the #2222 merge (run 39374587426, `completed`) parses as clear, and `isReleaseCutCommit` says yes for the real v1.3.1359 cut ee72c9c81 and no for merge d1ddf8b4b.
-- Real run (round 1): `node scripts/release-local.mjs --dry-run` on a branch exited 0 (tier patch/allow, npm 1.3.1359 → would publish 1.3.1360, Stage-B evidence verified, tree restored). It has not been re-run since round 2, because the tool is still uncommitted and the dry run requires a clean tree.
+- **Real end-to-end dry run (round 3).** The tool is uncommitted on `feat/release-local-tool`, rebased onto origin/main ee72c9c81, with its own `npm ci`. The command was `node scripts/release-local.mjs --dry-run --allow-dirty-tool-files`, and it exited 0. In order:
+  1. It tolerated the 6 tool files and refreshed `origin/main`. HEAD = origin/main = ee72c9c81, a `[skip ci]` cut, which produced the note.
+  2. publish.yml: none queued or in progress, for any commit.
+  3. npm whoami: would stop (this shell's npm is not logged in). OTP requirement: `unknown` → would stop without `--otp-command` or `--token-skips-otp`.
+  4. `npm ci`, then build.
+  5. Assemble → NEXT.md has content.
+  6. Tier: patch, allow.
+  7. npm 1.3.1359 → resolved 1.3.1360.
+  8. Renamed NEXT.md → `upgrades/1.3.1360.md`, removing 1 fragment (#2222's).
+  9. check-upgrade-guide passed. Stage-B verified 50 deliveries over 120 minutes.
+  10. publish.yml re-check: none.
+  11. "Would publish instar@1.3.1360". The tree was restored, and only the 6 tool files were dirty afterwards.
+- **Two bugs that only the real run could find:**
+  - The `pending` status, which made the CI query fail; it was read correctly as UNKNOWN.
+  - The dirty-file parser read a trimmed first porcelain line ` M CONTRIBUTING.md` as `ONTRIBUTING.md` and refused it, failing closed.
+- Real run (round 1): on a branch, exited 0 (would publish 1.3.1360).
 
 ## Multi-machine posture
 
