@@ -11,8 +11,11 @@
  * method (`pairingMethod: 'inherited'`), keep the previous rule: encrypt when the relay gave
  * us the peer's keys this session.
  *
- * The switch `threadline.encryptToPinned` follows `threadline.relayUnknownSenderTrust`
- * exactly: `enabled` omitted rides the developmentAgent gate, `dryRun` defaults TRUE.
+ * The switch `threadline.encryptToPinned` SHIPS ON for every agent (Justin, 2026-10-20:
+ * "why is encryption shipped off? Please change it such that it ships on."): `enabled`
+ * omitted means ON and `dryRun` omitted means FALSE, so an agent with no value enforces. It
+ * was a developmentAgent-gated, dry-run-first switch until then. An explicit value always wins,
+ * so an operator can still choose `off` (`enabled: false`) or `watch` (`dryRun: true`).
  *
  *  - off (`enabled` false): the resolver returns null — today's behaviour.
  *  - watch (`enabled`, `dryRun` not false): the resolver returns null, and each SEND that
@@ -30,7 +33,6 @@
  * watching, it is only counted (`wouldLabelUnverified`).
  */
 
-import { resolveDevAgentGate } from '../core/devAgentGate.js';
 import type { AgentTrustLevel, AgentTrustManager } from './AgentTrustManager.js';
 import { classifyRelayPlaintextOperation, type RelayUnknownSenderPassDecision } from './relayUnknownSenderTrust.js';
 import {
@@ -40,9 +42,9 @@ import {
 } from './client/ThreadlineClient.js';
 
 export interface EncryptToPinnedMode {
-  /** Gate-resolved: `enabled` omitted ⇒ the developmentAgent gate decides. */
+  /** `enabled` omitted ⇒ ON (ships on for every agent, dev or not). */
   enabled: boolean;
-  /** Default TRUE: count would-encrypt sends, send exactly as today. */
+  /** `dryRun` omitted ⇒ FALSE (enforce). Only an explicit `true` watches. */
   dryRun: boolean;
 }
 
@@ -53,15 +55,21 @@ interface EncryptToPinnedConfigShape {
   threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } };
 }
 
-/** The live mode. Read per send / per inbound message. */
+/** The default when no value is set anywhere: enforce, for every agent. */
+export const ENCRYPT_TO_PINNED_DEFAULT: Readonly<EncryptToPinnedMode> = Object.freeze({ enabled: true, dryRun: false });
+
+/**
+ * The live mode. Read per send / per inbound message. The live value wins over the file, the
+ * file wins over the default, and the default is enforce whatever `developmentAgent` says.
+ */
 export function resolveEncryptToPinnedMode(
   live: { enabled?: boolean; dryRun?: boolean },
   config: EncryptToPinnedConfigShape,
 ): EncryptToPinnedMode {
   const block = config.threadline?.encryptToPinned;
-  const enabled = resolveDevAgentGate(live.enabled ?? block?.enabled, config);
-  // Only an explicit `false` leaves dry-run; anything else observes.
-  const dryRun = (live.dryRun ?? block?.dryRun) !== false;
+  const enabled = live.enabled ?? block?.enabled ?? ENCRYPT_TO_PINNED_DEFAULT.enabled;
+  // Only an explicit `true` watches; omitted (or anything else) enforces.
+  const dryRun = (live.dryRun ?? block?.dryRun) === true;
   return { enabled, dryRun };
 }
 
