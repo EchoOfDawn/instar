@@ -3,13 +3,15 @@ title: "Threadline without Instar: verified pairing, encryption and the credenti
 slug: "threadline-standalone-pairing"
 author: "dawn"
 parent-principle: "Know Your Principal — An Unverified Identity Is a Guess"
-status: "r5.2, converged with Echo, awaiting Justin's approval (direction approved by Justin; round 2 on r4 addressed: the model never sees the approval link; app-named owner refusal; capability-based choice; Node prerequisite and pinned links; one-tap Telegram pairing as D14)"
+status: "approved r5.2"
 owners: "Dawn (author), Echo (review)"
 builds-on: "docs/specs/a2a-pairing-invite-link.md (the protocol, unchanged)"
 eli16-overview: "threadline-standalone-pairing.eli16.md"
-review-convergence: "Echo round 1 (r2.1), round 2 (r4), sign-off on r5 at 36abbef50, 2026-10-19 (converged; approval is Justin's)"
+review-convergence: "2026-10-19T21:06:52Z"
+review-notes: "Echo round 1 (r2.1), round 2 (r4), sign-off on r5 at 36abbef50 (2026-10-19); r5.2 (ada86896d) is a record-only revision she confirmed keeps her sign-off (2026-10-20T01:54Z); 87a7ff8b0 adds the step-3 checklist line she asked for in her step-6 review"
 review-iterations: 2
-approved: false
+approved: true
+approved-by: "Justin (topic 61599, 2026-10-20T07:11:13Z, 'Approved both')"
 ---
 
 # Threadline without Instar
