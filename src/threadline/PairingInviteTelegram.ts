@@ -80,21 +80,26 @@ export const NO_OWNER_REFUSAL = 'I can\'t approve this here because this agent h
  *
  * 1. A configured owner id (Telegram `ownerUserId`, `promptGate.ownerId`, or the agent's
  *    `monitoring.promptGate.ownerId`) always wins. Agents that have one see no change.
- * 2. With none configured, the agent's VERIFIED operator binding stands in, and only when it is
- *    unambiguous: every verified binding on this machine names the same one Telegram user. Those
- *    bindings are written only from authenticated, authorized inbound Telegram messages
- *    (Know Your Principal; `TopicOperatorStore.setAuthenticatedOperator`). Records made through the
- *    manual POST /topic-operator route are assertions and never count, and neither do records
- *    replicated from another machine (they live in a separate store and are never passed here).
- *    Two or more different verified operators means there is no single principal, so nobody is
- *    picked. Zero means there is no owner at all.
+ * 2. With none configured, the agent's VERIFIED operator stands in, and only when it is
+ *    unambiguous over the machine's whole history, not just its current bindings:
+ *    - exactly ONE distinct Telegram user id has ever been verified on this machine
+ *      (`TopicOperatorStore.everVerifiedOperatorUids()`, append-only). A topic's binding is
+ *      replaced by whoever spoke there last, so current bindings alone would let a second group
+ *      member who spoke last in the owner's topic hide the owner; AND
+ *    - the current verified bindings name that same one id.
+ *    Bindings are written only from authenticated, authorized inbound Telegram messages (Know
+ *    Your Principal; `setAuthenticatedOperator`). Records made through the manual
+ *    POST /topic-operator route are assertions: they never count and never add to or remove from
+ *    the ever-verified record. Records replicated from another machine live in a separate store
+ *    and are never passed here. Anything else (none, two or more ever, a mismatch) is no owner.
  *
- * Every candidate record is re-checked with `isVerifiedTopicOperatorBinding`, so a caller that
+ * Every current record is re-checked with `isVerifiedTopicOperatorBinding`, so a caller that
  * hands over raw bindings cannot make an asserted or legacy record count.
  */
 export function resolveApprovalOwner(
   configuredOwner: unknown,
   operatorBindings: Iterable<unknown> | null | undefined,
+  everVerifiedUids: readonly string[] | null | undefined,
 ): number | undefined {
   // Config is raw JSON, so an id may arrive as a string. Any configured value decides on its own:
   // a usable id is the owner, and an unusable one means no owner. A malformed setting must never
@@ -111,7 +116,10 @@ export function resolveApprovalOwner(
     uids.add(b.uid.trim());
   }
   if (uids.size !== 1) return undefined;
-  const n = Number([...uids][0]);
+  const ever = new Set((everVerifiedUids ?? []).map((u) => String(u).trim()));
+  const [only] = [...uids];
+  if (ever.size !== 1 || !ever.has(only)) return undefined;
+  const n = Number(only);
   return Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
 

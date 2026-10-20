@@ -202,6 +202,20 @@ describe('invite pairing — Telegram routes', () => {
       expect(fx.sent.at(-1)?.text).toMatch(/dashboard/);
     });
 
+    it('the owner, then a second member who speaks LAST in the owner\'s own topic → "no owner set", for both of them', async () => {
+      const store = operators();
+      const app = boot(dev, { owner: undefined, operators: store });
+      await forward(app, 'hello', { secret: secret(), from: OP, messageId: 10, topicId: 3 });
+      await forward(app, 'me too', { secret: secret(), from: 555, messageId: 11, topicId: 3 }); // latest binding is now 555
+      expect(store.getOperator(3)?.uid).toBe('555');
+      await forward(app, INVITE, { secret: secret(), from: 555, messageId: 12, topicId: 3 });
+      expect(fx.flow).toEqual([]);
+      expect(fx.sent.at(-1)?.text).toContain(NO_OWNER_REFUSAL);
+      await forward(app, INVITE, { secret: secret(), from: OP, messageId: 13, topicId: 3 });
+      expect(fx.flow).toEqual([]);
+      expect(fx.sent.at(-1)?.text).toContain(NO_OWNER_REFUSAL);
+    });
+
     it('no binding at all → the "no owner set" refusal, not "Only the agent\'s owner"', async () => {
       const app = boot(dev, { owner: undefined, operators: operators() });
       await forward(app, INVITE, { secret: secret(), from: OP });
@@ -220,7 +234,7 @@ describe('invite pairing — Telegram routes', () => {
       expect(res.status).toBe(200);
       expect(fx.topicMessages).toContain('hello, I am the owner now');
       expect(Object.keys(store.all())).toEqual(['3']);
-      expect(resolveApprovalOwner(undefined, Object.values(store.allBindings()))).toBe(OP);
+      expect(resolveApprovalOwner(undefined, Object.values(store.allBindings()), store.everVerifiedOperatorUids())).toBe(OP);
 
       // Enforce mode refuses the unproven message outright, so it binds nobody either.
       const store2 = new TopicOperatorStore(path.join(stateDir, 'state2'));

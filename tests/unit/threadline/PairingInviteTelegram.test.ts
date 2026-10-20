@@ -198,6 +198,7 @@ describe('resolveApprovalOwner (who may approve when no owner id is configured)'
   const bindVerified = (topic: number, uid: number) =>
     store.setAuthenticatedOperator(topic, { platform: 'telegram', uid: String(uid), displayName: 'Justin' }, evidence(uid));
   const bindings = () => Object.values(store.allBindings());
+  const ever = () => store.everVerifiedOperatorUids();
 
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'approval-owner-'));
@@ -207,61 +208,124 @@ describe('resolveApprovalOwner (who may approve when no owner id is configured)'
 
   it('a configured owner wins, whatever the bindings say', () => {
     bindVerified(3, 555);
-    expect(resolveApprovalOwner(OWNER, bindings())).toBe(OWNER);
+    expect(resolveApprovalOwner(OWNER, bindings(), ever())).toBe(OWNER);
   });
 
   it('a configured owner written as a string still counts; a malformed one means no owner, never the bindings', () => {
     bindVerified(3, 555);
-    expect(resolveApprovalOwner(String(OWNER), bindings())).toBe(OWNER);
-    expect(resolveApprovalOwner('not-an-id', bindings())).toBeUndefined();
-    expect(resolveApprovalOwner(-5, bindings())).toBeUndefined();
+    expect(resolveApprovalOwner(String(OWNER), bindings(), ever())).toBe(OWNER);
+    expect(resolveApprovalOwner('not-an-id', bindings(), ever())).toBeUndefined();
+    expect(resolveApprovalOwner(-5, bindings(), ever())).toBeUndefined();
   });
 
   it('no owner + exactly one verified operator (on one or several topics) → that operator', () => {
     expect(bindVerified(3, OP)).not.toBeNull();
-    expect(resolveApprovalOwner(undefined, bindings())).toBe(OP);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBe(OP);
     bindVerified(9, OP);
-    expect(resolveApprovalOwner(undefined, bindings())).toBe(OP);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBe(OP);
   });
 
   it('no owner + two different verified operators → nobody (never pick one)', () => {
     bindVerified(3, OP);
     bindVerified(9, 555);
-    expect(resolveApprovalOwner(undefined, bindings())).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBeUndefined();
   });
 
   it('no owner + no bindings → nobody', () => {
-    expect(resolveApprovalOwner(undefined, bindings())).toBeUndefined();
-    expect(resolveApprovalOwner(undefined, null)).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, null, null)).toBeUndefined();
   });
 
   it('a manually asserted record (POST /topic-operator) never counts', () => {
     expect(store.setOperator(3, { platform: 'telegram', uid: String(OP), displayName: 'Justin' })).not.toBeNull();
-    expect(bindings()).toHaveLength(1);
-    expect(resolveApprovalOwner(undefined, bindings())).toBeUndefined();
+    expect(bindings(), ever()).toHaveLength(1);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBeUndefined();
   });
 
   it('an asserted record for someone else does not make a verified operator ambiguous, nor stand in for one', () => {
     bindVerified(3, OP);
     store.setOperator(9, { platform: 'telegram', uid: '555' });
-    expect(resolveApprovalOwner(undefined, bindings())).toBe(OP);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBe(OP);
+  });
+
+  it('owner, then a second group member speaks last in the SAME topic → nobody (latest binding is the member)', () => {
+    bindVerified(3, OP);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBe(OP);
+    bindVerified(3, 555); // replaces the owner's binding on topic 3
+    expect(store.getOperator(3)?.uid).toBe('555');
+    expect(Object.keys(store.all())).toEqual(['3']); // current bindings name only the member
+    expect(ever()).toEqual([String(OP), '555']);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBeUndefined();
+    bindVerified(3, OP); // the owner speaking again does not undo the history
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBeUndefined();
+  });
+
+  it('the current bindings must name the one ever-verified id (a mismatch or a missing history is no owner)', () => {
+    bindVerified(3, OP);
+    expect(resolveApprovalOwner(undefined, bindings(), ['555'])).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, bindings(), [])).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, bindings(), null)).toBeUndefined();
+  });
+
+  it('two current verified operators refuse even if the history (e.g. a hand-edited file) names only one', () => {
+    bindVerified(3, OP);
+    bindVerified(9, 555);
+    expect(resolveApprovalOwner(undefined, bindings(), [String(OP)])).toBeUndefined();
+  });
+
+  it('an assertion that overwrites a verified binding neither erases nor adds to the ever-verified record', () => {
+    bindVerified(3, OP);
+    bindVerified(9, 555);
+    store.setOperator(9, { platform: 'telegram', uid: String(OP) }); // wipes 555's verified binding on topic 9
+    expect(Object.keys(store.all())).toEqual(['3']);
+    expect(ever()).toEqual([String(OP), '555']);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBeUndefined();
+    store.setOperator(12, { platform: 'telegram', uid: '999' });
+    expect(ever()).toEqual([String(OP), '555']);
+    // and it survives a reload from disk
+    expect(new TopicOperatorStore(dir).everVerifiedOperatorUids()).toEqual([String(OP), '555']);
+  });
+
+  it('upgrade: state written before the record existed is seeded from the current verified bindings', () => {
+    const verified = (uid: number) => ({ platform: 'telegram', uid: String(uid), names: ['justin'], boundAt: '', boundFrom: 'authenticated-inbound', establishmentEvidence: evidence(uid) });
+    fs.writeFileSync(path.join(dir, 'topic-operators.json'), JSON.stringify({
+      '3': verified(OP),
+      '9': { platform: 'telegram', uid: '555', names: [], boundAt: '', boundFrom: 'operator-api-assertion', establishmentEvidence: { kind: 'operator-api-assertion', route: 'POST /topic-operator' } },
+    }));
+    const s1 = new TopicOperatorStore(dir);
+    expect(s1.everVerifiedOperatorUids()).toEqual([String(OP)]); // the assertion is not seeded
+    expect(resolveApprovalOwner(undefined, Object.values(s1.allBindings()), s1.everVerifiedOperatorUids())).toBe(OP);
+    // two verified people already in the old state → seeded as two → no owner
+    fs.writeFileSync(path.join(dir, 'topic-operators.json'), JSON.stringify({ '3': verified(OP), '9': verified(555) }));
+    const s2 = new TopicOperatorStore(dir);
+    expect(s2.everVerifiedOperatorUids()).toEqual([String(OP), '555']);
+    expect(resolveApprovalOwner(undefined, Object.values(s2.allBindings()), s2.everVerifiedOperatorUids())).toBeUndefined();
+  });
+
+  it('an unreadable ever-verified record fails closed (reads as ambiguous, never as empty)', () => {
+    const verified = { platform: 'telegram', uid: String(OP), names: [], boundAt: '', boundFrom: 'authenticated-inbound', establishmentEvidence: evidence(OP) };
+    fs.writeFileSync(path.join(dir, 'topic-operators.json'), JSON.stringify({ '3': verified, _everVerifiedOperators: { telegram: 'oops' } }));
+    const s1 = new TopicOperatorStore(dir);
+    expect(s1.everVerifiedOperatorUids().length).toBeGreaterThan(1);
+    expect(resolveApprovalOwner(undefined, Object.values(s1.allBindings()), s1.everVerifiedOperatorUids())).toBeUndefined();
+    expect(s1.getBinding('_everVerifiedOperators')).toBeNull(); // the reserved key is never a binding
   });
 
   it('a legacy or self-described record without evidence (someone who merely messaged) never counts', () => {
     const forged = { platform: 'telegram', uid: String(OP), names: [], boundAt: '', boundFrom: 'authenticated-inbound' };
-    expect(resolveApprovalOwner(undefined, [forged])).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, [forged], [String(OP)])).toBeUndefined();
     const mismatched = { ...forged, establishmentEvidence: evidence(555) };
-    expect(resolveApprovalOwner(undefined, [mismatched])).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, [mismatched], [String(OP)])).toBeUndefined();
   });
 
   it('a verified binding on another platform does not count as a Telegram owner', () => {
     const wa = { platform: 'whatsapp', uid: String(OP), names: [], boundAt: '', boundFrom: 'authenticated-inbound', establishmentEvidence: evidence(OP) };
-    expect(resolveApprovalOwner(undefined, [wa])).toBeUndefined();
+    expect(resolveApprovalOwner(undefined, [wa], [String(OP)])).toBeUndefined();
   });
 
   it('end to end: no owner configured, the verified operator forwards → Approve prompt; anyone else → non-owner refusal', async () => {
     bindVerified(3, OP);
-    const owner = () => resolveApprovalOwner(undefined, bindings());
+    const owner = () => resolveApprovalOwner(undefined, bindings(), ever());
     const a = setup({ owner });
     await a.tg.onForwardedInvite({ ...okForward, fromUserId: OP });
     expect(a.sent[0].buttons?.map((b) => b.text)).toEqual(['Approve', 'Decline']);

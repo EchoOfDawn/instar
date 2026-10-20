@@ -3373,11 +3373,13 @@ export function createRoutes(ctx: RouteContext): Router {
       // A configured owner wins (the Telegram block's ownerUserId / promptGate.ownerId, else the
       // agent's monitoring.promptGate.ownerId, which the adapter itself never reads). With none,
       // only a single VERIFIED operator binding from authenticated inbound Telegram counts —
-      // never an asserted record, a replicated one, or "whoever messaged" (resolveApprovalOwner).
+      // never an asserted record, a replicated one, or "whoever messaged" (resolveApprovalOwner),
+      // and only while exactly one person has EVER been verified here (bindings are latest-only).
       // Scoped to pairing on purpose: getOwnerUserId() also addresses owner DMs and consent prompts.
       ownerUserId: () => resolveApprovalOwner(
         ctx.telegram!.getOwnerUserId() ?? ctx.config.monitoring?.promptGate?.ownerId,
         Object.values(ctx.topicOperatorStore?.allBindings() ?? {}),
+        ctx.topicOperatorStore?.everVerifiedOperatorUids() ?? null,
       ),
       chatId: () => ctx.telegram!.getChatId(),
       operatorTopicId: () => ctx.telegram!.getLifelineTopicId(),
