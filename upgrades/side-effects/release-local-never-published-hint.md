@@ -68,3 +68,7 @@ A clearer message on an existing stop, plus a documented asymmetry.
 ## Class-Closure Declaration (display-only mirror)
 
 No agent-authored-artifact defect — not applicable.
+
+## Review note from #2228 (Echo, non-blocking), 2026-10-20
+
+In the `--push-only` notice, the last line now begins "Otherwise (published, still in review):". With the never-published caveat above it, "re-run release-local normally" and "Do NOT publish again" each say which case they are for, so they no longer read as contradictory. The notice on the smoke path has no caveat and is unchanged. Tests: the `--push-only` notice ends with the prefixed line, after the caveat; the smoke notice has no prefix; and the end-to-end `--push-only` refusal prints it. A mutant without the prefix fails 2 tests.

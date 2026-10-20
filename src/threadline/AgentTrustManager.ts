@@ -120,6 +120,8 @@ export interface AgentTrustProfile {
    * (threadline-standalone-pairing step 3 follow-up). Cleared only by markInviteVerified.
    */
   invitePausedReason?: string;
+  /** When the pause was recorded (ISO-8601). An inherited verification ends the pause only if it is later. */
+  invitePausedAt?: string;
   /** Read-only view for threadline-core's InviteTrust: `paused: <reason>` while paused. */
   readonly via?: string;
 }
@@ -682,6 +684,7 @@ export class AgentTrustManager implements InviteTrust {
     profile.pairingState = 'mutual-verified';
     profile.verifiedAt = now;
     profile.invitePausedReason = undefined; // an operator's 12-word confirm also ends a pause
+    profile.invitePausedAt = undefined;
     if (typeof args.peerAcked === 'boolean') profile.peerAcked = args.peerAcked;
 
     // Raise to 'trusted' if below; never to 'autonomous' (FD6).
@@ -831,6 +834,7 @@ export class AgentTrustManager implements InviteTrust {
     // The operator approved a NEW invite from this peer: that is the re-confirmation a pause
     // waits for (a2a-pairing-invite-link §4.4.2), so the new invite's Finish may complete.
     profile.invitePausedReason = undefined;
+    profile.invitePausedAt = undefined;
     profile.pairingId = undefined;
     profile.sasFingerprint = undefined;
     profile.verifiedAt = undefined;
@@ -866,6 +870,7 @@ export class AgentTrustManager implements InviteTrust {
     profile.pairingState = 'mutual-verified';
     profile.peerIdentityPub = key;
     profile.invitePausedReason = undefined; // a completed pairing ends a pause
+    profile.invitePausedAt = undefined;
     // The same pairingId v2 uses (HKDF over the two identity keys), so the credential gate can
     // check our own key has not rotated since verification (CredentialShareGate check 3).
     profile.pairingId = args.ownIdentityPub
@@ -908,6 +913,7 @@ export class AgentTrustManager implements InviteTrust {
     profile.pairingState = 'invite-accepted';
     profile.verifiedAt = undefined;
     profile.invitePausedReason = String(reason || 'invite used twice');
+    profile.invitePausedAt = now;
     if (profile.source === 'mutual-verified') profile.source = 'setup-default';
     profile.updatedAt = now;
     this.save();
@@ -1054,6 +1060,19 @@ export class AgentTrustManager implements InviteTrust {
 
     profile.pairingState = 'identity-verified';
     profile.peerIdentityPub = args.peerIdentityPub;
+    // An inherited verification ends a pause only if it is an operator's confirm made AFTER the
+    // pause: its verifiedAt must be present and strictly later than this machine's recorded
+    // invitePausedAt. The revoke tombstone a demote sends is best-effort, and the replicated store
+    // can hold a concurrent put and tombstone as two versions, so an older put can still arrive
+    // here; this local timestamp check, not the tombstone, is what keeps it from clearing the pause
+    // (Echo's review of #2230). Otherwise the key is pinned as before and the pause stays.
+    // Times are compared with Date.parse; a missing or unparsable time counts as not later. verifiedAt
+    // comes from the other machine's clock: if that clock runs behind, a genuinely newer confirm can
+    // look older and the pause stays. That is the safe direction and is deliberately not "fixed".
+    if (profile.invitePausedReason !== undefined && isLaterThan(args.verifiedAt, profile.invitePausedAt)) {
+      profile.invitePausedReason = undefined;
+      profile.invitePausedAt = undefined;
+    }
     if (args.verifiedAt) profile.verifiedAt = args.verifiedAt;
     if (args.verifiedOnMachine) profile.inheritedFromMachine = args.verifiedOnMachine;
 
@@ -1481,6 +1500,8 @@ export class AgentTrustManager implements InviteTrust {
  * invite pairing is paused (core's handleFinish refuses a Finish then). A getter, so it is never
  * written to the trust file and always reflects the stored pause.
  */
+// Core must read the profile ONLY through getProfileByFingerprint: a clone or spread drops this
+// getter, so a paused pin would read as not paused and fail open.
 function withPausedVia(profile: AgentTrustProfile): AgentTrustProfile {
   if (!Object.prototype.hasOwnProperty.call(profile, 'via')) {
     Object.defineProperty(profile, 'via', {
@@ -1492,4 +1513,11 @@ function withPausedVia(profile: AgentTrustProfile): AgentTrustProfile {
     });
   }
   return profile;
+}
+
+/** True only when `a` is a valid time strictly later than `b` (a valid time). Missing or unparsable → false. */
+function isLaterThan(a: string | undefined, b: string | undefined): boolean {
+  const ta = a ? Date.parse(a) : NaN;
+  const tb = b ? Date.parse(b) : NaN;
+  return Number.isFinite(ta) && Number.isFinite(tb) && ta > tb;
 }

@@ -31,6 +31,8 @@ The pause marker is machine-local. Other machines of the same agent drop the pai
 
 A first draft cleared the marker only in `markInviteVerified`. That would have over-blocked: the remedy for a pause is a new invite, and accepting the new invite left the marker set, so its Finish would have been refused as well. The marker is now also cleared when the operator approves a new invite and on a 12-word confirm, and a test covers the new-invite case end to end.
 
+Keys pinned before this change are not re-checked: the weak-key refusal runs at pin time, by design. No real agent's key is weak, and a re-check of stored pins would need a migration with no case to justify it.
+
 ## 3. Level-of-abstraction fit
 
 The paused rule and the weak-key predicate live in threadline-core. Instar's trust store now gives the rule the state it needs and reuses the predicate rather than copying it. The degradation goes through the existing reporter.
@@ -79,3 +81,9 @@ This closes the three gaps Echo found, with tests on the real engine and the rea
 **Independent read of the artifact: concur**
 
 Checked: core's `handleFinish` reads `via` only before a first Finish promotes, so a paused pin cannot be re-promoted by a replayed Finish. `recordInviteAccepted`, which now clears a pause, is reached only through `approveAccept`, which only the operator's Telegram tap or the PIN-gated dashboard route calls, so an inbound message cannot clear a pause. The `via` getter is on the live profile object that the engine reads directly, with no clone in between. Every `peerIdentityPub` write site in `AgentTrustManager` is preceded by the weak-key check. The fixture changes keep each test's intent.
+
+## Review notes from #2229 (Echo, non-blocking), 2026-10-20
+
+- `inheritReplicatedVerification` clears the pause only when its `verifiedAt` is present and strictly later than `invitePausedAt`, a new persisted field that `demoteInvitePairing` records. Otherwise it pins the key as before and keeps the pause. The first version of this commit cleared the pause unconditionally, reasoning that the demote's revoke tombstone stops older verifications from arriving. Echo found that premise unenforced: nothing in src calls the inherit path yet, `emitRevoke` is best-effort (try/catch, and a no-op without replication), and the replicated store keeps a concurrent put and tombstone as two versions, either of which could be inherited. So an older verification minted before the pause could clear it. The guard now rests on the local timestamp comparison, not the tombstone. Times are compared with `Date.parse`; a missing or unparsable `verifiedAt` counts as not later. `verifiedAt` comes from the other machine's clock, so if that clock runs behind, a genuinely newer confirm can look older and the pause stays. That is the safe direction and is deliberately left that way. `invitePausedAt` is cleared wherever `invitePausedReason` is. Tests: newer clears; older, equal, missing and unparsable all keep the pause; the pause time survives a restart. Mutants: the unconditional clear, a missing or unparsable time counted as later, string comparison, `>=`, no clear at all, the pause time not recorded, and `markInviteVerified` keeping it. All are killed. One planned mutant (missing time read as `Infinity`) proved equivalent, because `Number.isFinite` already rejects it.
+- A comment at the `via` getter says core must read the profile only through `getProfileByFingerprint`: a clone or spread drops the getter, and a paused pin would then read as not paused.
+- Added to §2: keys pinned before this change are not re-checked.
