@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * release-cut-diff — recognise a RELEASE CUT diff (the "chore: release vX" commit
- * that publish.yml or scripts/release-local.mjs produces) so the pre-push gate's
+ * that publish.yml produces, or one cut by hand on a workstation) so the pre-push gate's
  * §3b release-fragment check can exempt it, and nothing else.
  *
  * ── Why this exists ───────────────────────────────────────────────────
@@ -12,14 +12,15 @@
  * counts package.json and package-lock.json, EVERY release cut began tripping
  * it: a cut bumps both files and CONSUMES the fragments instead of adding one.
  * publish.yml never noticed because its commit step runs with HUSKY=0. A
- * release cut pushed from a workstation (the local-release path) is refused.
+ * release cut pushed from a workstation with hooks on is refused.
  *
  * ── The rule (exact) ──────────────────────────────────────────────────
  * The diff (merge-base → HEAD, with rename detection OFF so a fragment that
  * became the versioned guide shows as one D plus one A) is a release cut iff
  * EVERY entry is one of:
  *   - M package.json        — parsed as JSON on both sides; the ONLY difference
- *                             is the top-level "version" field, and it changed.
+ *                             is the top-level "version" field, and it INCREASED
+ *                             (numeric X.Y.Z compare; equal or lower is not a cut).
  *                             REQUIRED.
  *   - M package-lock.json   — parsed as JSON on both sides; the only differences
  *                             are the top-level "version" and packages[""].version,
@@ -43,6 +44,16 @@ const SEMVER = /^\d+\.\d+\.\d+$/;
 
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Compare two X.Y.Z versions numerically: <0, 0 or >0. */
+export function compareSemver(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] - pb[i];
+  }
+  return 0;
 }
 
 /** Structural deep equality for JSON values. */
@@ -114,7 +125,8 @@ export function classifyReleaseCut({ entries, readBase, readHead }) {
   const oldVersion = pkgBase.version;
   const newVersion = pkgHead.version;
   if (typeof newVersion !== 'string' || !SEMVER.test(newVersion)) return no(`new version ${JSON.stringify(newVersion)} is not X.Y.Z`);
-  if (oldVersion === newVersion) return no('package.json version did not change');
+  if (typeof oldVersion !== 'string' || !SEMVER.test(oldVersion)) return no(`old version ${JSON.stringify(oldVersion)} is not X.Y.Z`);
+  if (compareSemver(newVersion, oldVersion) <= 0) return no(`version ${oldVersion} → ${newVersion} does not increase`);
   {
     const a = { ...pkgBase };
     const b = { ...pkgHead };

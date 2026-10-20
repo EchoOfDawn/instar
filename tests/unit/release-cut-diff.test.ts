@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { classifyReleaseCut, jsonEqual } from '../../scripts/release-cut-diff.mjs';
+import { classifyReleaseCut, compareSemver, jsonEqual } from '../../scripts/release-cut-diff.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
@@ -135,6 +135,30 @@ describe('classifyReleaseCut (pure)', () => {
     expect(v.isCut).toBe(false);
   });
 
+  it('REJECTS a version that goes DOWN (must increase, not merely differ)', () => {
+    const v = classify(
+      CUT_ENTRIES.map((e) => (e.status === 'A' ? { ...e, path: 'upgrades/1.3.1357.md' } : e)),
+      {},
+      {
+        'package.json': { ...PKG_NEW, version: '1.3.1357' },
+        'package-lock.json': { ...LOCK_NEW, version: '1.3.1357', packages: { ...LOCK_NEW.packages, '': { ...LOCK_NEW.packages[''], version: '1.3.1357' } } },
+      },
+    );
+    expect(v.isCut).toBe(false);
+    expect(v.reason).toContain('does not increase');
+  });
+
+  it('compares versions numerically, not as strings (1.3.999 → 1.3.1000 is an increase)', () => {
+    const lockAt = (ver: string) => ({ ...LOCK_OLD, version: ver, packages: { ...LOCK_OLD.packages, '': { ...LOCK_OLD.packages[''], version: ver } } });
+    const v = classify(
+      CUT_ENTRIES.map((e) => (e.status === 'A' ? { ...e, path: 'upgrades/1.3.1000.md' } : e)),
+      { 'package.json': { ...PKG_OLD, version: '1.3.999' }, 'package-lock.json': lockAt('1.3.999') },
+      { 'package.json': { ...PKG_OLD, version: '1.3.1000' }, 'package-lock.json': lockAt('1.3.1000') },
+    );
+    expect(v.isCut).toBe(true);
+    expect(compareSemver('1.3.999', '1.3.1000')).toBeLessThan(0);
+  });
+
   it('REJECTS a non-X.Y.Z version', () => {
     const v = classify(
       CUT_ENTRIES.map((e) => (e.status === 'A' ? { ...e, path: 'upgrades/1.3.1359-rc.1.md' } : e)),
@@ -246,7 +270,7 @@ describe('Pre-push gate integration — release cut commits (§3b exemption)', (
     fs.rmSync(scratch, { recursive: true, force: true });
   });
 
-  /** Perform what publish.yml / release-local does to cut 0.28.999. */
+  /** Perform what publish.yml does to cut 0.28.999. */
   function cut() {
     const pkg = JSON.parse(fs.readFileSync(path.join(scratch, 'package.json'), 'utf-8'));
     pkg.version = '0.28.999';
@@ -292,6 +316,72 @@ describe('Pre-push gate integration — release cut commits (§3b exemption)', (
     expect(out).toContain('no release-note fragment was added');
     expect(out).toContain('src/thing.ts');
     expect(status).toBe(1);
+  });
+
+  it('ACCEPTS the 5a90d6be7 shape: the fragment RENAMED (git sees R) into upgrades/<newVersion>.md', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(scratch, 'package.json'), 'utf-8'));
+    pkg.version = '0.28.999';
+    write('package.json', json(pkg));
+    const lock = JSON.parse(fs.readFileSync(path.join(scratch, 'package-lock.json'), 'utf-8'));
+    lock.version = '0.28.999';
+    lock.packages[''].version = '0.28.999';
+    write('package-lock.json', json(lock));
+    // Same content plus a title line, as the real cut did (R097).
+    const frag = fs.readFileSync(path.join(scratch, 'upgrades/next/some-fix.md'), 'utf-8');
+    fs.rmSync(path.join(scratch, 'upgrades/next/some-fix.md'));
+    write('upgrades/0.28.999.md', `# Upgrade Guide — v0.28.999\n\n${frag}`);
+    const { status, out } = commitAndRunGate();
+    // Non-vacuous: git's default (rename-detecting) diff really sees a rename.
+    expect(git('diff', '-M', '--name-status', 'main...HEAD')).toMatch(/^R\d+\tupgrades\/next\/some-fix\.md\tupgrades\/0\.28\.999\.md$/m);
+    expect(out).toContain('Release cut v0.28.999 recognised');
+    expect(status).toBe(0);
+  });
+
+  it('a release cut passes ONLY via the exemption: its fragment deletion no longer counts as a fragment', () => {
+    cut();
+    const { out } = commitAndRunGate();
+    // The gate prints this line only when the exemption fired; with §3b's
+    // fragment count now limited to ADDED/MODIFIED fragments there is no other
+    // way for a cut to pass.
+    expect(out).toContain('Release cut v0.28.999 recognised');
+  });
+
+  it('REFUSES a src change whose only fragment activity is DELETING someone else\'s fragment', () => {
+    fs.rmSync(path.join(scratch, 'upgrades/next/some-fix.md'));
+    write('src/thing.ts', 'export const x = 1;\n');
+    const { status, out } = commitAndRunGate();
+    expect(out).toContain('no release-note fragment was added');
+    expect(status).toBe(1);
+  });
+
+  it('REFUSES a src change whose fragment was moved OUT of upgrades/next/ (rename does not count)', () => {
+    fs.renameSync(path.join(scratch, 'upgrades/next/some-fix.md'), path.join(scratch, 'upgrades/0.28.999.md'));
+    write('src/thing.ts', 'export const x = 1;\n');
+    const { status, out } = commitAndRunGate();
+    expect(out).toContain('no release-note fragment was added');
+    expect(status).toBe(1);
+  });
+
+  it('a fragment renamed WITHIN upgrades/next/ (and edited) still counts — rename detection is off', () => {
+    const frag = fs.readFileSync(path.join(scratch, 'upgrades/next/some-fix.md'), 'utf-8');
+    fs.rmSync(path.join(scratch, 'upgrades/next/some-fix.md'));
+    write('upgrades/next/some-fix-renamed.md', `${frag}\nAlso tidies a log line.\n`);
+    write('src/thing.ts', 'export const x = 1;\n');
+    write('tests/thing.test.ts', 'export {};\n');
+    git('add', '-A');
+    // Non-vacuous: with rename detection on, git reports this as R, which an
+    // AM filter would drop.
+    expect(git('diff', '--cached', '-M', '--name-status')).toMatch(/^R\d+\tupgrades\/next\/some-fix\.md\tupgrades\/next\/some-fix-renamed\.md$/m);
+    const { out } = commitAndRunGate();
+    expect(out).not.toContain('no release-note fragment was added');
+  });
+
+  it('control: a src change that MODIFIES a fragment still passes §3b', () => {
+    fs.appendFileSync(path.join(scratch, 'upgrades/next/some-fix.md'), '\nAlso tidies a log line.\n');
+    write('src/thing.ts', 'export const x = 1;\n');
+    write('tests/thing.test.ts', 'export {};\n');
+    const { out } = commitAndRunGate();
+    expect(out).not.toContain('no release-note fragment was added');
   });
 
   it('control: a bare version bump with no versioned guide is still refused', () => {

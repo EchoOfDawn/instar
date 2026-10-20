@@ -193,15 +193,26 @@ try {
   // moved to the shared predicate (which counts package.json + package-lock.json),
   // every cut tripped this check: a cut bumps both files and CONSUMES the
   // fragments rather than adding one. publish.yml never saw it (its commit step
-  // runs with HUSKY=0); a cut pushed from a workstation by
-  // scripts/release-local.mjs was refused. scripts/release-cut-diff.mjs decides
+  // runs with HUSKY=0); a cut pushed from a workstation with hooks on was
+  // refused. The version must also INCREASE. scripts/release-cut-diff.mjs decides
   // "is this a cut?" by parsing both sides of package.json / package-lock.json
   // (only the version fields may differ) and requiring exactly one added
   // upgrades/<newVersion>.md plus deletions under upgrades/next/ — any other
   // file in the diff and the check below runs exactly as before.
-  const fragmentChanges = changedFiles.filter(f =>
-    f.startsWith('upgrades/next/') || f === 'upgrades/NEXT.md'
-  );
+  // Only fragments this push ADDS or MODIFIES count, with rename detection off.
+  // `--name-only` alone listed a deleted fragment's path too, so deleting
+  // someone else's (already-released) fragment satisfied this check; and with
+  // renames on, a fragment renamed into upgrades/<version>.md vanished from the
+  // list. A release cut deletes fragments and adds none, so it passes ONLY via
+  // the release-cut exemption below.
+  const fragmentChanges = execSync(
+    `git diff --name-only --no-renames --diff-filter=AM ${remoteBranch}...HEAD 2>/dev/null || git diff --name-only --no-renames --diff-filter=AM HEAD~1 2>/dev/null`,
+    { encoding: 'utf-8' },
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .filter(f => f.startsWith('upgrades/next/') || f === 'upgrades/NEXT.md');
   // Release-relevance is now the SHARED predicate (scripts/release-relevant-paths.mjs),
   // the same one the server-side Layer-1 PR gate uses — so "needs a release note?"
   // has one answer in both places. This BROADENS the old src/**.ts-only check to
