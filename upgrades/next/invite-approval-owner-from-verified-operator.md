@@ -21,5 +21,5 @@ If you forward a pairing invite to me in Telegram and you're the person I alread
 
 ## Evidence
 
-- `tests/unit/threadline/PairingInviteTelegram.test.ts` (35 pass) and `tests/integration/pairing-invite-telegram-routes.test.ts` (13 pass, through the real forward and callback routes with a real operator store): set owner wins; one verified operator approves; another person is refused as not the owner; a second group member who spoke last in the owner's topic makes the agent refuse both of them; two operators, none, a hand-typed record, or a sender whose message was not verified all get the "hasn't been told who its owner is" refusal.
+- `tests/unit/threadline/PairingInviteTelegram.test.ts` (42 pass) and `tests/integration/pairing-invite-telegram-routes.test.ts` (14 pass, through the real forward and callback routes with a real operator store): set owner wins; one verified operator approves; another person is refused as not the owner; a second group member who spoke last in the owner's topic makes the agent refuse both of them; two operators, none, a hand-typed record, or a sender whose message was not verified all get the "hasn't been told who its owner is" refusal.
 - Breakage: each guard disabled in turn made a test fail (9 of 9 for the new history guards).

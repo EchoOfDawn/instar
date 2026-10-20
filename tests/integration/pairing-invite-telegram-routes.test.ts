@@ -216,6 +216,18 @@ describe('invite pairing — Telegram routes', () => {
       expect(fx.sent.at(-1)?.text).toContain(NO_OWNER_REFUSAL);
     });
 
+    it('a corrupt operator file, then a non-owner member speaks: their invite is refused ("no owner set")', async () => {
+      fs.mkdirSync(path.join(stateDir, 'state'), { recursive: true });
+      fs.writeFileSync(path.join(stateDir, 'state', 'topic-operators.json'), '{not-json');
+      const store = operators();
+      const app = boot(dev, { owner: undefined, operators: store });
+      await forward(app, 'hello', { secret: secret(), from: 555, messageId: 10, topicId: 3 });
+      expect(store.getOperator(3)?.uid).toBe('555');
+      await forward(app, INVITE, { secret: secret(), from: 555, messageId: 11, topicId: 3 });
+      expect(fx.flow).toEqual([]);
+      expect(fx.sent.at(-1)?.text).toContain(NO_OWNER_REFUSAL);
+    });
+
     it('no binding at all → the "no owner set" refusal, not "Only the agent\'s owner"', async () => {
       const app = boot(dev, { owner: undefined, operators: operators() });
       await forward(app, INVITE, { secret: secret(), from: OP });

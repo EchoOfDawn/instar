@@ -302,13 +302,70 @@ describe('resolveApprovalOwner (who may approve when no owner id is configured)'
     expect(resolveApprovalOwner(undefined, Object.values(s2.allBindings()), s2.everVerifiedOperatorUids())).toBeUndefined();
   });
 
-  it('an unreadable ever-verified record fails closed (reads as ambiguous, never as empty)', () => {
+  it('an unreadable ever-verified record fails closed, with a visible marker (never read as empty)', () => {
     const verified = { platform: 'telegram', uid: String(OP), names: [], boundAt: '', boundFrom: 'authenticated-inbound', establishmentEvidence: evidence(OP) };
     fs.writeFileSync(path.join(dir, 'topic-operators.json'), JSON.stringify({ '3': verified, _everVerifiedOperators: { telegram: 'oops' } }));
     const s1 = new TopicOperatorStore(dir);
-    expect(s1.everVerifiedOperatorUids().length).toBeGreaterThan(1);
+    expect(s1.everVerifiedOperatorUids()).toBeNull();
     expect(resolveApprovalOwner(undefined, Object.values(s1.allBindings()), s1.everVerifiedOperatorUids())).toBeUndefined();
     expect(s1.getBinding('_everVerifiedOperators')).toBeNull(); // the reserved key is never a binding
+  });
+
+  // Echo review #1: a CORRUPT FILE (not just a corrupt record) must also fail closed. Before the
+  // fix it read as "pre-upgrade, seed from nothing", so the next member to speak became the approver.
+  it.each([
+    ['unparseable JSON', '{not-json'],
+    ['a null top level', 'null'],
+    ['an array top level', '[]'],
+    ['a scalar top level', '42'],
+  ])('a corrupt file (%s) is unreadable history: a non-owner member who binds next is NOT the approver', (_n, body) => {
+    fs.writeFileSync(path.join(dir, 'topic-operators.json'), body);
+    const s1 = new TopicOperatorStore(dir);
+    expect(s1.everVerifiedOperatorUids()).toBeNull();
+    s1.setAuthenticatedOperator(3, { platform: 'telegram', uid: '555', displayName: 'Member' }, evidence(555));
+    expect(s1.getOperator(3)?.uid).toBe('555');
+    expect(resolveApprovalOwner(undefined, Object.values(s1.allBindings()), s1.everVerifiedOperatorUids())).toBeUndefined();
+    // …and after that write, a reload still refuses.
+    const s2 = new TopicOperatorStore(dir);
+    expect(resolveApprovalOwner(undefined, Object.values(s2.allBindings()), s2.everVerifiedOperatorUids())).toBeUndefined();
+  });
+
+  it('the unreadable marker survives save() and a reload, written explicitly rather than as fake ids', () => {
+    fs.writeFileSync(path.join(dir, 'topic-operators.json'), '{not-json');
+    const s1 = new TopicOperatorStore(dir);
+    s1.setAuthenticatedOperator(3, { platform: 'telegram', uid: String(OP) }, evidence(OP));
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'topic-operators.json'), 'utf-8'));
+    expect(onDisk._everVerifiedOperators).toEqual({ telegram: [String(OP)], unreadable: true });
+    const s2 = new TopicOperatorStore(dir);
+    expect(s2.everVerifiedOperatorUids()).toBeNull();
+    expect(resolveApprovalOwner(undefined, Object.values(s2.allBindings()), s2.everVerifiedOperatorUids())).toBeUndefined();
+    // documented repair: delete the _everVerifiedOperators key → re-seeded from current verified bindings
+    delete onDisk._everVerifiedOperators;
+    fs.writeFileSync(path.join(dir, 'topic-operators.json'), JSON.stringify(onDisk));
+    const s3 = new TopicOperatorStore(dir);
+    expect(s3.everVerifiedOperatorUids()).toEqual([String(OP)]);
+    expect(resolveApprovalOwner(undefined, Object.values(s3.allBindings()), s3.everVerifiedOperatorUids())).toBe(OP);
+  });
+
+  it('an ABSENT file (fresh install) seeds exactly as before: the owner binds, approval works', () => {
+    expect(fs.existsSync(path.join(dir, 'topic-operators.json'))).toBe(false);
+    expect(store.everVerifiedOperatorUids()).toEqual([]);
+    bindVerified(3, OP);
+    expect(resolveApprovalOwner(undefined, bindings(), ever())).toBe(OP);
+    const reloaded = new TopicOperatorStore(dir);
+    expect(reloaded.everVerifiedOperatorUids()).toEqual([String(OP)]);
+    expect(resolveApprovalOwner(undefined, Object.values(reloaded.allBindings()), reloaded.everVerifiedOperatorUids())).toBe(OP);
+  });
+
+  it('only numeric ids are recorded, so a non-numeric uid can never make the record unreadable on reload', () => {
+    store.setAuthenticatedOperator(3, { platform: 'telegram', uid: 'abc' }, { ...evidence(OP), senderUid: 'abc' });
+    expect(store.getOperator(3)?.uid).toBe('abc'); // the binding itself is the store's existing behaviour
+    expect(ever()).toEqual([]);
+    bindVerified(9, OP);
+    const reloaded = new TopicOperatorStore(dir);
+    expect(reloaded.everVerifiedOperatorUids()).toEqual([String(OP)]);
+    // the non-numeric binding is still a second current principal → no owner
+    expect(resolveApprovalOwner(undefined, Object.values(reloaded.allBindings()), reloaded.everVerifiedOperatorUids())).toBeUndefined();
   });
 
   it('a legacy or self-described record without evidence (someone who merely messaged) never counts', () => {
