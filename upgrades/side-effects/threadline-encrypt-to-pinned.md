@@ -16,6 +16,14 @@ Rollout steps 5 and 5b of `docs/specs/threadline-standalone-pairing.md` (approve
 - In enforce, a pinned send that fails throws; it never falls through to plaintext.
 - Receive side, enforce only: plaintext ordinary chat under an invite-paired peer's fingerprint is delivered with a fixed server notice and its trust level capped at `verified`. Nothing is refused. This IS a behaviour change for such a sender's plaintext (it no longer gets `trusted` handling); acks and probes are untouched.
 
+## Revision (Echo's review of #2231): every chat path, and fail closed
+
+- **Every send path.** The pinned check now lives where every plaintext send funnels (`sendPlaintextTyped`) for `type: 'chat'`, and in `send()`. A caller that used `sendPlaintext` directly (CollaborationRedriveEngine's nudge) to an invite-paired peer in enforce now sends ENCRYPTED to the pin instead of plaintext; before, it bypassed D9 and, once the peer enforces `refuseDowngrade`, every nudge would have been refused. Acks and invite-control ops keep their plaintext envelopes. A test enumerates every `send*` method on the prototype and fails on an unclassified one.
+- **Fail closed in enforce (Echo's decision).** A trust lookup that throws returns `ENCRYPT_TO_LOOKUP_FAILED` (not null); the client turns that, a resolver throw, or a pinned key that is not 32 bytes / not the recipient's into `EncryptToPinnedSendError` (relay-send 502, nothing recorded as sent), and `hasEncryptedSendPath` reports no encrypted path. Watch and off keep today's behaviour. Counters: `lookupErrors`, `resolverErrors`, `malformedPinnedKey` (sends only).
+- **Over-block (new, by design).** In enforce, a broken trust store blocks ordinary chat to EVERY peer (the lookup cannot tell an invite peer from any other) until it is repaired. That is the fail-closed choice; the counters show it on `/health`.
+- **Redrive.** CollaborationRedriveEngine increments `redriveCount` before sending. A nudge refused with `EncryptToPinnedSendError` is now NOT a redrive: the increment, `lastRedriveAt` and `lastRedriveText` are restored, the commitment is skipped as `encrypted-send-refused`, and it is tried again on a later tick. Any other send error keeps the existing rule (counted).
+- **a2a redelivery.** The server's redeliver callback (now `createOutboxRedeliver`) returns false — not redelivered — on `EncryptToPinnedSendError`; the entry stays awaiting-ack.
+
 ## Decision-point inventory
 
 - `ThreadlineBootstrap` resolver: which peers always get encryption (mutual-verified AND invite-paired).
@@ -81,6 +89,7 @@ Requested from Echo on the PR.
 - `tests/unit/ThreadlineClient-encrypt-to-pinned.test.ts` (6).
 - `tests/unit/threadline/encrypt-to-pinned-switch.test.ts` (17): off / watch / enforce, backfill, the receive-side label, the relay-send 502.
 - `tests/unit/threadline/pairing-replication-merge.test.ts` (35, step 5b): the real journal, applier, commit observer, emitter and stream reader; a record lands, the inherited pin appears and in enforce the send is encrypted to it; a revoke removes it and credentials to that peer are refused; mixed-version pair; local authority wins; the startup warning.
+- Review fix: `tests/unit/ThreadlineClient-no-plaintext-chat-to-pinned.test.ts` (every public send method, pin resolved and four unresolvable shapes), the fail-closed end-to-end cases in `encrypt-to-pinned-switch.test.ts`, redrive and redeliver tests; 13 mutations of the fix, 13 killed.
 - Breakages (run on the pre-rebase branch, not re-run after the rebase onto step 3): 6 tried, 6 caught (resolver ignored in sendAuto; fp binding removed; hasEncryptedSendPath ignoring it; resend flag dropped; bootstrap allowing invite-accepted; bootstrap ignoring sasFingerprint).
 
 ## Class-Closure Declaration (display-only mirror)

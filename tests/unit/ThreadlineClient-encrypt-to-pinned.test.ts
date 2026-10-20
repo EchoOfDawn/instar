@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import crypto from 'node:crypto';
-import { ThreadlineClient } from '../../src/threadline/client/ThreadlineClient.js';
+import { ThreadlineClient, EncryptToPinnedSendError } from '../../src/threadline/client/ThreadlineClient.js';
 import { edPublicToX25519 } from '../../src/threadline/ThreadlineCrypto.js';
 
 interface Enc { pk: Buffer; xk: Buffer; threadId: string; message: Record<string, unknown>; messageId?: string }
@@ -56,17 +56,29 @@ describe('ThreadlineClient: encrypt ordinary chat to the pinned key', () => {
     expect(encrypted[0].pk.equals(peer.key)).toBe(true);
   });
 
-  it('a key that does not belong to the recipient, or a resolver that throws, is ignored (previous rule applies)', () => {
+  it('enforce fails CLOSED: a key that does not belong to the recipient, or a resolver that throws, refuses the send', () => {
     const peer = keyFor(), other = keyFor();
     client.setEncryptToResolver(() => other.key);
-    client.sendAuto(peer.fp, 'not to the wrong key');
+    expect(() => client.sendAuto(peer.fp, 'not to the wrong key')).toThrow(EncryptToPinnedSendError);
     expect(encrypted).toHaveLength(0);
-    expect(sent).toHaveLength(1); // plaintext, as before: no cached keys
+    expect(sent).toHaveLength(0);
     expect(client.hasEncryptedSendPath(peer.fp)).toBe(false);
     client.setEncryptToResolver(() => { throw new Error('store unavailable'); });
-    client.sendAuto(peer.fp, 'again');
+    expect(() => client.sendAuto(peer.fp, 'again')).toThrow(/resolver-error/);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('watch/off (failClosed false): a wrong key or a throwing resolver keeps the previous rule, and is reported', () => {
+    const peer = keyFor(), other = keyFor();
+    const failures: string[] = [];
+    client.setEncryptToResolver(() => other.key, { failClosed: () => false, onFailure: (k, use) => failures.push(`${k}:${use}`) });
+    client.sendAuto(peer.fp, 'plain as before');
     expect(encrypted).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    client.setEncryptToResolver(() => { throw new Error('boom'); }, { failClosed: () => false, onFailure: (k, use) => failures.push(`${k}:${use}`) });
+    client.sendAuto(peer.fp, 'again');
     expect(sent).toHaveLength(2);
+    expect(failures).toEqual(['malformed-pinned-key:send', 'resolver-error:send']);
   });
 
   it('a send the resolver routes to the pinned key that then fails is refused, never sent in plaintext', () => {

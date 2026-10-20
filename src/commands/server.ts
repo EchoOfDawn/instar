@@ -19507,7 +19507,7 @@ export async function startServer(options: StartOptions): Promise<void> {
       const { resolvePeerDarkNoticeConfig, createPeerDarkAuditWriter, resolvePeerDarkAuditPath } = await import('../threadline/peerDark.js');
       const peerDarkCfg = resolvePeerDarkNoticeConfig(config as { developmentAgent?: boolean; threadline?: { peerDarkNotice?: Record<string, unknown> } });
       if ((a2aDelivCfg.enabled || peerDarkCfg.enabled) && a2aDeliveryTracker) {
-        const { A2ARedeliverySentinel, DEFAULT_A2A_REDELIVERY_CONFIG } = await import('../monitoring/A2ARedeliverySentinel.js');
+        const { A2ARedeliverySentinel, DEFAULT_A2A_REDELIVERY_CONFIG, createOutboxRedeliver } = await import('../monitoring/A2ARedeliverySentinel.js');
         const priorityMap: Record<string, 'URGENT' | 'HIGH' | 'NORMAL' | 'LOW'> = {
           high: 'HIGH', medium: 'NORMAL', low: 'LOW',
         };
@@ -19543,12 +19543,10 @@ export async function startServer(options: StartOptions): Promise<void> {
             // sentinel leaves it awaiting-ack and escalates at the cap, never
             // fabricating a send). Only under the legacy gate.
             redeliver: (a2aDelivCfg.enabled && threadlineRelayClient && listenerManager)
-              ? (entry) => {
-                  const stored = listenerManager!.readCanonicalOutboxEntry(entry.messageId);
-                  if (!stored) return false;
-                  threadlineRelayClient!.sendAuto(entry.peerFp, stored.text, entry.threadId ?? stored.threadId);
-                  return true;
-                }
+              ? createOutboxRedeliver({
+                  readOutboxEntry: (id) => listenerManager!.readCanonicalOutboxEntry(id),
+                  sendAuto: (fp, text, threadId) => threadlineRelayClient!.sendAuto(fp, text, threadId),
+                })
               : undefined,
             raiseAttention: telegram
               ? async (item) => {

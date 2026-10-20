@@ -11,6 +11,7 @@ import { generateIdentityKeyPair } from '../../../src/threadline/ThreadlineCrypt
 import { AgentTrustManager, backfillPairingMethod, type AgentTrustProfile } from '../../../src/threadline/AgentTrustManager.js';
 import {
   createEncryptToPinnedResolver,
+  createEncryptToPinnedClientOptions,
   createEncryptToPinnedCounters,
   encryptToPinnedModeName,
   labelUnverifiedPinnedPlaintext,
@@ -20,6 +21,7 @@ import {
 } from '../../../src/threadline/encryptToPinned.js';
 import type { RelayUnknownSenderPassDecision } from '../../../src/threadline/relayUnknownSenderTrust.js';
 import { buildForwardAnswer } from '../../../src/threadline/relayForward.js';
+import { ThreadlineClient, EncryptToPinnedSendError, ENCRYPT_TO_LOOKUP_FAILED } from '../../../src/threadline/client/ThreadlineClient.js';
 
 const OFF: EncryptToPinnedMode = { enabled: false, dryRun: true };
 const WATCH: EncryptToPinnedMode = { enabled: true, dryRun: true };
@@ -190,12 +192,71 @@ describe('the send resolver', () => {
     expect(createEncryptToPinnedResolver({ trustManager: t, mode: () => ENFORCE })(inv.fp, 'send')).toBeNull();
   });
 
-  it('a mode reader or trust lookup that throws: null', () => {
+  it('a mode reader that throws: null (an unreadable mode is off)', () => {
     expect(createEncryptToPinnedResolver({ trustManager: t, mode: () => { throw new Error('x'); } })(inv.fp, 'send')).toBeNull();
-    const counters = createEncryptToPinnedCounters();
+  });
+
+  it('a trust lookup that throws: ENFORCE fails closed (the sentinel, not null); watch/off keep null; sends counted', () => {
     const broken = { getProfileByFingerprint: () => { throw new Error('store'); } } as unknown as AgentTrustManager;
-    expect(createEncryptToPinnedResolver({ trustManager: broken, mode: () => ENFORCE, counters })(inv.fp, 'send')).toBeNull();
-    expect(counters.lookupErrors).toBe(1);
+    const counters = createEncryptToPinnedCounters();
+    expect(createEncryptToPinnedResolver({ trustManager: broken, mode: () => ENFORCE, counters })(inv.fp, 'send')).toBe(ENCRYPT_TO_LOOKUP_FAILED);
+    expect(createEncryptToPinnedResolver({ trustManager: broken, mode: () => ENFORCE, counters })(inv.fp, 'check')).toBe(ENCRYPT_TO_LOOKUP_FAILED);
+    expect(createEncryptToPinnedResolver({ trustManager: broken, mode: () => WATCH, counters })(inv.fp, 'send')).toBeNull();
+    expect(createEncryptToPinnedResolver({ trustManager: broken, mode: () => OFF, counters })(inv.fp, 'send')).toBeNull();
+    expect(counters.lookupErrors).toBe(2); // enforce send + watch send; a check is not counted, off never looks
+  });
+});
+
+describe('fail closed end to end: the real client with the bootstrap resolver and client options', () => {
+  const p = peer();
+  function harness(mode: EncryptToPinnedMode, trust: Pick<AgentTrustManager, 'getProfileByFingerprint'>) {
+    const counters = createEncryptToPinnedCounters();
+    const wire: Array<Record<string, unknown>> = [];
+    const client = new ThreadlineClient({ name: 'T', stateDir: dir() }, () => 1);
+    const internals = client as unknown as Record<string, unknown>;
+    internals.relayClient = { sendMessage: (e: Record<string, unknown>) => { wire.push(e); } };
+    internals.identity = { fingerprint: 'self-fp' };
+    internals.encryptor = { encrypt: (_pk: Buffer, _xk: Buffer, threadId: string) => ({ threadId, messageId: 'm', ephemeralPubKey: 'e' }) };
+    client.setEncryptToResolver(
+      createEncryptToPinnedResolver({ trustManager: trust as AgentTrustManager, mode: () => mode, counters }),
+      createEncryptToPinnedClientOptions({ mode: () => mode, counters }),
+    );
+    return { client, wire, counters };
+  }
+  const broken = { getProfileByFingerprint: () => { throw new Error('store'); } };
+  const malformed = { getProfileByFingerprint: () => ({ pairingState: 'mutual-verified', pairingMethod: 'invite', peerIdentityPub: 'ab'.repeat(32) }) };
+
+  it('lookup throws: enforce refuses (EncryptToPinnedSendError, nothing on the wire); watch sends as today', () => {
+    const e = harness(ENFORCE, broken);
+    expect(() => e.client.sendAuto(p.fp, 'x')).toThrow(EncryptToPinnedSendError);
+    expect(() => e.client.sendPlaintext(p.fp, 'nudge')).toThrow(/lookup-failed/);
+    expect(e.wire).toEqual([]);
+    expect(e.counters.lookupErrors).toBe(2);
+    const w = harness(WATCH, broken);
+    w.client.sendAuto(p.fp, 'x');
+    expect(w.wire).toHaveLength(1);
+    expect(w.counters.lookupErrors).toBe(1);
+  });
+
+  it('pinned key that is not this peer\'s: enforce refuses and counts malformedPinnedKey', () => {
+    const e = harness(ENFORCE, malformed);
+    expect(() => e.client.sendAuto(p.fp, 'x')).toThrow(/malformed-pinned-key/);
+    expect(e.wire).toEqual([]);
+    expect(e.counters.malformedPinnedKey).toBe(1);
+    expect(e.counters.encryptedToPinned).toBe(1); // the resolver did hand out a key; the client refused it
+  });
+
+  it('client options: failClosed only in enforce; resolver errors and malformed keys counted on a send only', () => {
+    const counters = createEncryptToPinnedCounters();
+    for (const [mode, want] of [[OFF, false], [WATCH, false], [ENFORCE, true]] as const) {
+      expect(createEncryptToPinnedClientOptions({ mode: () => mode, counters }).failClosed!()).toBe(want);
+    }
+    const o = createEncryptToPinnedClientOptions({ mode: () => ENFORCE, counters });
+    o.onFailure!('resolver-error', 'send');
+    o.onFailure!('resolver-error', 'check');
+    o.onFailure!('malformed-pinned-key', 'send');
+    expect(counters.resolverErrors).toBe(1);
+    expect(counters.malformedPinnedKey).toBe(1);
   });
 });
 

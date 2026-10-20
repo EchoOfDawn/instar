@@ -17,7 +17,11 @@
  *  - off (`enabled` false): the resolver returns null — today's behaviour.
  *  - watch (`enabled`, `dryRun` not false): the resolver returns null, and each SEND that
  *    would have gone encrypted to the pinned key is counted (`wouldEncryptToPinned`).
- *  - enforce (`enabled`, `dryRun: false`): the resolver returns the pinned key.
+ *  - enforce (`enabled`, `dryRun: false`): the resolver returns the pinned key. Enforce
+ *    FAILS CLOSED: a trust lookup that throws returns ENCRYPT_TO_LOOKUP_FAILED (not null), and
+ *    the client turns that, a resolver throw, or a malformed pinned key into
+ *    EncryptToPinnedSendError (relay-send answers 502; nothing is recorded as sent). In watch
+ *    and off those paths keep today's behaviour and are only counted.
  *
  * Receive side (label only, never a refusal): plaintext ordinary chat arriving under the
  * fingerprint of an invite-paired, mutual-verified peer is not attributed to that peer — the
@@ -29,6 +33,11 @@
 import { resolveDevAgentGate } from '../core/devAgentGate.js';
 import type { AgentTrustLevel, AgentTrustManager } from './AgentTrustManager.js';
 import { classifyRelayPlaintextOperation, type RelayUnknownSenderPassDecision } from './relayUnknownSenderTrust.js';
+import {
+  ENCRYPT_TO_LOOKUP_FAILED,
+  type EncryptToResolverOptions,
+  type EncryptToResolverResult,
+} from './client/ThreadlineClient.js';
 
 export interface EncryptToPinnedMode {
   /** Gate-resolved: `enabled` omitted ⇒ the developmentAgent gate decides. */
@@ -71,12 +80,16 @@ export interface EncryptToPinnedCounters {
   wouldLabelUnverified: number;
   /** Enforce: plaintext under an invite peer's fingerprint delivered labelled unverified. */
   labelledUnverified: number;
-  /** The trust lookup threw (the send or delivery went on as today). */
+  /** The trust lookup threw (send or receive). Enforce: a send fails closed. Watch/off: it goes on as today. */
   lookupErrors: number;
+  /** The resolver itself threw inside the client (send use). Enforce: the send failed closed. */
+  resolverErrors: number;
+  /** The resolver handed the client a key that is not 32 bytes or not the recipient's (send use). */
+  malformedPinnedKey: number;
 }
 
 export function createEncryptToPinnedCounters(): EncryptToPinnedCounters {
-  return { wouldEncryptToPinned: 0, encryptedToPinned: 0, wouldLabelUnverified: 0, labelledUnverified: 0, lookupErrors: 0 };
+  return { wouldEncryptToPinned: 0, encryptedToPinned: 0, wouldLabelUnverified: 0, labelledUnverified: 0, lookupErrors: 0, resolverErrors: 0, malformedPinnedKey: 0 };
 }
 
 /** Process-wide counters (one relay client per server process). */
@@ -109,7 +122,7 @@ export function createEncryptToPinnedResolver(deps: {
   trustManager: TrustReader | undefined;
   mode: () => EncryptToPinnedMode;
   counters?: EncryptToPinnedCounters;
-}): (fp: string, use?: EncryptToUse) => Buffer | null {
+}): (fp: string, use?: EncryptToUse) => EncryptToResolverResult {
   const counters = deps.counters ?? encryptToPinnedCounters;
   return (fp, use = 'check') => {
     let mode: EncryptToPinnedMode;
@@ -120,7 +133,8 @@ export function createEncryptToPinnedResolver(deps: {
       key = invitePinnedKey(deps.trustManager, fp);
     } catch {
       if (use === 'send') counters.lookupErrors++;
-      return null;
+      // Enforce fails closed (spec D9); watch keeps today's behaviour.
+      return mode.dryRun ? null : ENCRYPT_TO_LOOKUP_FAILED;
     }
     if (!key) return null;
     if (mode.dryRun) {
@@ -130,6 +144,31 @@ export function createEncryptToPinnedResolver(deps: {
     if (use === 'send') counters.encryptedToPinned++;
     return key;
   };
+}
+
+/**
+ * The options handed to ThreadlineClient.setEncryptToResolver beside the resolver: fail closed
+ * only while enforcing (an unreadable mode counts as enforce there, so the client fails closed),
+ * and count the client-side failure paths on a send.
+ */
+export function createEncryptToPinnedClientOptions(deps: {
+  mode: () => EncryptToPinnedMode;
+  counters?: EncryptToPinnedCounters;
+}): EncryptToResolverOptions {
+  const counters = deps.counters ?? encryptToPinnedCounters;
+  return {
+    failClosed: () => encryptToPinnedModeName(deps.mode()) === 'enforce',
+    onFailure: (kind, use) => {
+      if (use !== 'send') return;
+      if (kind === 'resolver-error') counters.resolverErrors++;
+      else counters.malformedPinnedKey++;
+    },
+  };
+}
+
+/** True for the error a fail-closed or failed pinned send throws (any copy of the class). */
+export function isEncryptToPinnedSendError(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === 'encrypted-send-to-pinned-failed';
 }
 
 /** The fixed server notice on unverified plaintext. A server constant — never peer text. */

@@ -47,6 +47,7 @@ import {
 } from './relayUnknownSenderTrust.js';
 import {
   createEncryptToPinnedResolver,
+  createEncryptToPinnedClientOptions,
   encryptToPinnedCounters,
   labelUnverifiedPinnedPlaintext,
   type EncryptToPinnedMode,
@@ -505,7 +506,7 @@ export async function bootstrapThreadline(
       trustManager: pinnedTrust,
       mode: encryptToPinnedMode,
       counters: encryptToPinnedCounters,
-    }));
+    }), createEncryptToPinnedClientOptions({ mode: encryptToPinnedMode, counters: encryptToPinnedCounters }));
 
     // Invite pairing engine (docs/specs/a2a-pairing-invite-link.md). Identity is read fresh on
     // every use so a rotated key is never signed with stale material.
