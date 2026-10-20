@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { validateGuideContent } from './upgrade-guide-validator.mjs';
 import { assembleNextMd, gatherFragmentInputs, hasInternalOnlyMarker } from './assemble-next-md.mjs';
 import { isReleaseRelevant } from './release-relevant-paths.mjs';
+import { detectReleaseCut } from './release-cut-diff.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -186,9 +187,18 @@ try {
   // A shippable src/ change MUST carry a release-note fragment. publish.yml
   // SILENTLY skips the release when there is no upgrades/next/<slug>.md fragment
   // (and no upgrades/NEXT.md) — so the fix merges but never ships, with no
-  // signal. Mirror of the src→tests check above. The "chore: release" cut commit
-  // touches upgrades/ but not src/, so it never trips this. Bypass genuine WIP
-  // with INSTAR_PRE_PUSH_SKIP=1.
+  // signal. Mirror of the src→tests check above.
+  //
+  // The "chore: release vX" CUT commit is exempt, and only it. Once relevance
+  // moved to the shared predicate (which counts package.json + package-lock.json),
+  // every cut tripped this check: a cut bumps both files and CONSUMES the
+  // fragments rather than adding one. publish.yml never saw it (its commit step
+  // runs with HUSKY=0); a cut pushed from a workstation by
+  // scripts/release-local.mjs was refused. scripts/release-cut-diff.mjs decides
+  // "is this a cut?" by parsing both sides of package.json / package-lock.json
+  // (only the version fields may differ) and requiring exactly one added
+  // upgrades/<newVersion>.md plus deletions under upgrades/next/ — any other
+  // file in the diff and the check below runs exactly as before.
   const fragmentChanges = changedFiles.filter(f =>
     f.startsWith('upgrades/next/') || f === 'upgrades/NEXT.md'
   );
@@ -198,7 +208,13 @@ try {
   // also catch scripts/, .github/workflows/, package.json, and skill code/templates
   // (all of which ship behavior but previously slipped this local gate).
   const releaseRelevantChanges = changedFiles.filter(isReleaseRelevant);
-  if (releaseRelevantChanges.length > 0 && fragmentChanges.length === 0) {
+  const releaseCut = (releaseRelevantChanges.length > 0 && fragmentChanges.length === 0)
+    ? detectReleaseCut({ cwd: ROOT, baseRef: remoteBranch })
+    : null;
+  if (releaseCut && releaseCut.isCut) {
+    console.log(`  ✅ Release cut v${releaseCut.version} recognised (only version fields + the versioned guide + consumed fragments) — release-fragment check not applicable.`);
+  }
+  if (releaseRelevantChanges.length > 0 && fragmentChanges.length === 0 && !(releaseCut && releaseCut.isCut)) {
     errors.push(
       `${releaseRelevantChanges.length} release-relevant file(s) changed but no release-note fragment was added. ` +
       `Without upgrades/next/<slug>.md (or upgrades/NEXT.md), publish.yml SILENTLY SKIPS the ` +
