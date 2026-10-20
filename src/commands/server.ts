@@ -61,6 +61,7 @@ import { SingleInstanceLock, installReleaseHandlers } from '../core/SingleInstan
 import { resolveDevAgentGate, resolveStateSyncStores } from '../core/devAgentGate.js';
 import { resolveRelayUnknownSenderTrustMode } from '../threadline/relayUnknownSenderTrust.js';
 import { resolveEncryptToPinnedMode, encryptToPinnedModeName } from '../threadline/encryptToPinned.js';
+import { resolveRefuseDowngradeMode } from '../threadline/refuseDowngrade.js';
 import { resolveAntiThrashKnobs, readingValidity } from '../core/SwapAntiThrash.js';
 import { shouldReleaseOnComplete, planClaimOnSpawn, ownershipNonce } from '../core/ownershipFollowsLiveWork.js';
 import { PrHandLease } from '../core/PrHandLease.js';
@@ -18416,6 +18417,16 @@ export async function startServer(options: StartOptions): Promise<void> {
             dryRun: liveConfig.get<boolean | undefined>('threadline.encryptToPinned.dryRun', undefined),
           },
           config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
+        ),
+        // Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6, step 6). Read live
+        // per inbound message: `enabled` omitted rides the developmentAgent gate, `dryRun`
+        // defaults true (record marks, count would-refuse plaintext, deliver as today).
+        getRefuseDowngradeMode: () => resolveRefuseDowngradeMode(
+          {
+            enabled: liveConfig.get<boolean | undefined>('threadline.refuseDowngrade.enabled', undefined),
+            dryRun: liveConfig.get<boolean | undefined>('threadline.refuseDowngrade.dryRun', undefined),
+          },
+          config as { developmentAgent?: boolean; threadline?: { refuseDowngrade?: { enabled?: boolean; dryRun?: boolean } } },
         ),
       });
       threadlineHandshake = threadline.handshakeManager;

@@ -52,6 +52,12 @@ import {
   labelUnverifiedPinnedPlaintext,
   type EncryptToPinnedMode,
 } from './encryptToPinned.js';
+import {
+  noteEncryptedChat,
+  refuseDowngradeCounters,
+  shouldRefuseDowngradedPlaintext,
+  type RefuseDowngradeMode,
+} from './refuseDowngrade.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -132,6 +138,12 @@ export interface ThreadlineBootstrapConfig {
    * chat is encrypted only when the relay gave us the peer's keys, as before.
    */
   getEncryptToPinnedMode?: () => EncryptToPinnedMode;
+  /**
+   * Live reader for refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6/D11,
+   * rollout step 6, `threadline.refuseDowngrade`). Supplied by server.ts. When omitted it is
+   * off: no mark is recorded and no plaintext is refused.
+   */
+  getRefuseDowngradeMode?: () => RefuseDowngradeMode;
 }
 
 export interface ThreadlineBootstrapResult {
@@ -450,6 +462,16 @@ export async function bootstrapThreadline(
     }
   };
 
+  // Refuse-downgrade (spec threadline-standalone-pairing D6, step 6): the live mode (off when
+  // server.ts supplies no reader).
+  const refuseDowngradeMode = (): RefuseDowngradeMode => {
+    try {
+      return config.getRefuseDowngradeMode?.() ?? { enabled: false, dryRun: true };
+    } catch {
+      return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
+    }
+  };
+
   // Always create trust manager when relay is enabled — needed for processing
   // inbox entries even when the daemon handles the relay connection.
   if (relayEnabled) {
@@ -576,6 +598,9 @@ export async function bootstrapThreadline(
     // Route inbound relay messages through the gate
     relayClient.on('message', async (msg: ReceivedMessage) => {
       if (!inboundGate) return;
+      // Encrypted ordinary chat from an invite peer, verified against its pinned key, records
+      // the encryptedSeen mark (step 6). Off: nothing. Never blocks delivery.
+      noteEncryptedChat({ trustManager, mode: refuseDowngradeMode, counters: refuseDowngradeCounters }, msg);
       const decision = await inboundGate.evaluate(msg);
       if (decision.action === 'pass' && decision.message) {
         // Gate passed — emit for ThreadlineRouter to handle
@@ -631,6 +656,14 @@ export async function bootstrapThreadline(
       // as an ordinary message and could spawn a session).
       if (msgType && INVITE_OPS.has(msgType)) {
         void inboundGate.evaluate(received);
+        return;
+      }
+
+      // No downgrade after encryption (spec D6, step 6): an invite peer that has sent us
+      // encrypted chat does not get plaintext delivered in its name. Enforce refuses here,
+      // before anything is recorded or routed; watch only counts.
+      if (shouldRefuseDowngradedPlaintext({ trustManager, mode: refuseDowngradeMode, counters: refuseDowngradeCounters }, received.from, msgType)) {
+        console.warn(`Threadline: plaintext from ${received.from.slice(0, 12)} refused — that paired agent has sent encrypted messages before (possible downgrade by the relay)`);
         return;
       }
 

@@ -61,6 +61,8 @@ import type {
 import type { ImpactTier, OriginRecord, UnionResult } from './UnionReader.js';
 import type { ReplicatedKindBounds } from './ReplicationBudget.js';
 import type { HlcTimestamp } from './HybridLogicalClock.js';
+import { compareHlc } from './TopicPinReplicatedStore.js';
+import type { EncryptedSeenEvent } from '../threadline/encryptedSeenMark.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // A. Identity, tier, schema, bounds, caps
@@ -149,10 +151,26 @@ export const THREADLINE_PAIRING_TOMBSTONE_KNOWN_FIELDS: ReadonlyArray<string> = 
   'deletedAt',
 ]);
 
+/**
+ * Rollout step 6 (docs/specs/threadline-standalone-pairing.md D6/D11): the `encryptedSeen` mark
+ * rides this store as its own records, never as a field of a pairing record. One record per
+ * (peer, origin machine), written only by that machine, so two machines never write the same
+ * recordKey and the union never sees a concurrent conflict for a mark. Two `put` states:
+ *   - `encrypted-seen`: this machine recorded the mark for `peerIdentityPub` at `encryptedSeenAt`;
+ *   - `encrypted-seen-unpaired`: the person unpaired on this machine at `unpairedAt`, which voids
+ *     every mark for that key ordered before it (by HLC), on every machine.
+ * The merged mark is threadline-core's `unifyEncryptedSeen` over all of them (earliest valid
+ * time, union). An older machine rejects these records (an unknown state), which is harmless.
+ */
+export const ENCRYPTED_SEEN_STATE = 'encrypted-seen' as const;
+export const ENCRYPTED_SEEN_UNPAIRED_STATE = 'encrypted-seen-unpaired' as const;
+export const ENCRYPTED_SEEN_KNOWN_FIELDS: ReadonlyArray<string> = Object.freeze(['encryptedSeenAt', 'unpairedAt']);
+
 /** The full set of known store fields across BOTH op-branches. */
 const ALL_KNOWN_FIELDS: ReadonlyArray<string> = Object.freeze([
   ...THREADLINE_PAIRING_STORE_KNOWN_FIELDS,
   ...THREADLINE_PAIRING_TOMBSTONE_KNOWN_FIELDS,
+  ...ENCRYPTED_SEEN_KNOWN_FIELDS,
 ]);
 
 // ── ISO-8601 type-clamp (§3.8 explicitly requires `verifiedAt` ISO-8601-only). ───────
@@ -226,6 +244,18 @@ export const threadlinePairingRecordStoreSchema: StoreFieldSchema = {
     // derived from it). A non-hex peerFp is a tampered record → reject.
     if (!isHexString(raw.peerFp, PAIRING_FP_MIN_LEN, PAIRING_FP_MAX_LEN)) return null;
     const peerFp = raw.peerFp as string;
+
+    // Rollout step 6: an encryptedSeen mark record (see ENCRYPTED_SEEN_STATE).
+    if (raw.state === ENCRYPTED_SEEN_STATE) {
+      if (!isHexString(raw.peerIdentityPub, PAIRING_FP_MIN_LEN, PAIRING_PUB_MAX_LEN)) return null;
+      if (!isIso8601(raw.encryptedSeenAt)) return null;
+      return { peerFp, peerIdentityPub: raw.peerIdentityPub as string, state: ENCRYPTED_SEEN_STATE, encryptedSeenAt: raw.encryptedSeenAt as string };
+    }
+    if (raw.state === ENCRYPTED_SEEN_UNPAIRED_STATE) {
+      if (!isIso8601(raw.unpairedAt)) return null;
+      const key = isHexString(raw.peerIdentityPub, PAIRING_FP_MIN_LEN, PAIRING_PUB_MAX_LEN) ? (raw.peerIdentityPub as string) : undefined;
+      return { peerFp, ...(key !== undefined ? { peerIdentityPub: key } : {}), state: ENCRYPTED_SEEN_UNPAIRED_STATE, unpairedAt: raw.unpairedAt as string };
+    }
 
     // peerIdentityPub — required hex (the PINNED key the consumer honors against, §3.8).
     if (!isHexString(raw.peerIdentityPub, PAIRING_FP_MIN_LEN, PAIRING_PUB_MAX_LEN)) return null;
@@ -445,6 +475,8 @@ function viewFromOriginRecord(rec: OriginRecord, conflicted: boolean): MergedPai
 export function mergeUnionToPairings(union: Map<string, UnionResult>): MergedPairingView[] {
   const out: MergedPairingView[] = [];
   for (const result of union.values()) {
+    // Mark records (rollout step 6) are not pairings; encryptedSeenEventsFromUnion reads them.
+    if (isEncryptedSeenRecord(result.value) || result.conflict?.versions.some(isEncryptedSeenRecord)) continue;
     if (result.conflict) {
       for (const v of result.conflict.versions) {
         if (v.envelope.op === 'delete') continue;
@@ -504,6 +536,90 @@ export function revokedPairings(
   }
   return out;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// C2. The encryptedSeen mark records (rollout step 6, D6/D11)
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Is this record one of the step-6 mark records (not a pairing)? */
+export function isEncryptedSeenRecord(rec: OriginRecord | null | undefined): boolean {
+  const st = rec?.data?.state;
+  return st === ENCRYPTED_SEEN_STATE || st === ENCRYPTED_SEEN_UNPAIRED_STATE;
+}
+
+/**
+ * The recordKey of ONE machine's mark record for a peer. Keyed by (fingerprint, origin) so each
+ * machine writes only its own record: the union then never holds a concurrent conflict for a
+ * mark, and the merge (a union keeping the earliest time) reads every machine's record.
+ */
+export function deriveEncryptedSeenRecordKey(peerFp: string, origin: string): string | null {
+  const fp = (peerFp ?? '').trim().toLowerCase();
+  const o = (origin ?? '').trim();
+  if (fp.length === 0 || o.length === 0) return null;
+  return createHash('sha256').update(`threadline-encrypted-seen\x1f${fp}\x1f${o}`).digest('hex').slice(0, 32);
+}
+
+/** Build a mark record (`put`): `seen` (the mark at `at`) or `unpaired` (the person unpaired at `at`). */
+export function buildEncryptedSeenRecordData(input: {
+  peerFp: string;
+  peerIdentityPub?: string;
+  kind: 'seen' | 'unpaired';
+  at: string;
+  hlc: HlcTimestamp;
+  origin: string;
+  observed?: HlcTimestamp;
+}): ThreadlinePairingRecordData | null {
+  const recordKey = deriveEncryptedSeenRecordKey(input.peerFp, input.origin);
+  if (recordKey === null) return null;
+  const key = typeof input.peerIdentityPub === 'string' && /^[0-9a-fA-F]+$/.test(input.peerIdentityPub) ? input.peerIdentityPub : undefined;
+  if (input.kind === 'seen' && key === undefined) return null;
+  const data: ThreadlinePairingRecordData = {
+    peerFp: input.peerFp,
+    ...(key !== undefined ? { peerIdentityPub: key } : {}),
+    ...(input.kind === 'seen'
+      ? { state: ENCRYPTED_SEEN_STATE, encryptedSeenAt: input.at }
+      : { state: ENCRYPTED_SEEN_UNPAIRED_STATE, unpairedAt: input.at }),
+    recordKey,
+    hlc: input.hlc,
+    op: 'put' as ReplicatedOp,
+    origin: input.origin,
+    ...(input.observed !== undefined ? { observed: input.observed } : {}),
+  };
+  assertProjectionUnderCap(recordKey, data);
+  return data;
+}
+
+/**
+ * Every mark record in the union, as threadline-core events ordered by HLC, grouped by peer
+ * fingerprint (lowercase). Dropped (rolled-back) origins are already excluded by the reader.
+ * PURE.
+ */
+export function encryptedSeenEventsFromUnion(union: Map<string, UnionResult>): Map<string, EncryptedSeenEvent<HlcTimestamp>[]> {
+  const out = new Map<string, EncryptedSeenEvent<HlcTimestamp>[]>();
+  const add = (rec: OriginRecord): void => {
+    if (!isEncryptedSeenRecord(rec) || rec.envelope.op !== 'put' || typeof rec.data.peerFp !== 'string') return;
+    const fp = rec.data.peerFp.toLowerCase();
+    const key = typeof rec.data.peerIdentityPub === 'string' ? rec.data.peerIdentityPub.toLowerCase() : undefined;
+    let ev: EncryptedSeenEvent<HlcTimestamp> | null = null;
+    if (rec.data.state === ENCRYPTED_SEEN_STATE && key && isIso8601(rec.data.encryptedSeenAt)) {
+      ev = { kind: 'seen', peerIdentityPub: key, at: rec.data.encryptedSeenAt as string, order: rec.envelope.hlc };
+    } else if (rec.data.state === ENCRYPTED_SEEN_UNPAIRED_STATE) {
+      ev = { kind: 'unpaired', ...(key ? { peerIdentityPub: key } : {}), order: rec.envelope.hlc };
+    }
+    if (!ev) return;
+    const list = out.get(fp) ?? [];
+    list.push(ev);
+    out.set(fp, list);
+  };
+  for (const result of union.values()) {
+    if (result.value) add(result.value);
+    for (const v of result.conflict?.versions ?? []) add(v);
+  }
+  return out;
+}
+
+/** The HLC order for threadline-core's `unifyEncryptedSeen`. */
+export const encryptedSeenOrder = compareHlc;
 
 // ───────────────────────────────────────────────────────────────────────────
 // D. Consumer honoring — key-pinning (§3.8, codex finding 1)

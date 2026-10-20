@@ -27,6 +27,12 @@
  * to a different key are never touched; a newer put for the key wins over an older revoke
  * through the union's own ordering, and is then inherited again.
  *
+ * The encryptedSeen mark (rollout step 6, D6/D11): each machine writes its own mark record when
+ * it first receives encrypted ordinary chat from an invite peer, and an unpair record when the
+ * person unpairs there. Every pass folds the UNIFIED mark (threadline-core's union keeping the
+ * earliest time, voided by a later unpair) into each pinned profile with the same key, after
+ * inheritance, so a machine that takes over the relay refuses the same downgrades.
+ *
  * `attachThreadlinePairingReplication` holds ALL of the server's wiring (sender adapters,
  * read side, merge wiring, startup pass); server.ts calls it and forwards the journal
  * applier's commit observer to `onRecordsCommitted`.
@@ -39,6 +45,10 @@ import {
   buildThreadlinePairingRecordData,
   buildThreadlinePairingTombstoneData,
   deriveThreadlinePairingRecordKey,
+  buildEncryptedSeenRecordData,
+  deriveEncryptedSeenRecordKey,
+  encryptedSeenEventsFromUnion,
+  encryptedSeenOrder,
   revokedPairings,
   type PairingRevocation,
   evaluateInheritedVerification,
@@ -53,11 +63,15 @@ import type { BuildRecordData } from '../core/ReplicatedRecordEmitter.js';
 import type { ConflictStore } from '../core/ConflictStore.js';
 import type { DroppedOriginRegistry } from '../core/RollbackUnmerge.js';
 import type { AgentTrustManager, AgentTrustProfile } from './AgentTrustManager.js';
+import { unifyEncryptedSeen, type EncryptedSeenEvent } from './encryptedSeenMark.js';
+import type { HlcTimestamp } from '../core/HybridLogicalClock.js';
 
 /** What one merge pass reads: the honourable views and the revokes in force. */
 export interface PairingReplicatedState {
   views: MergedPairingView[];
   revoked: ReadonlyMap<string, PairingRevocation>;
+  /** Step 6: every machine's encryptedSeen mark/unpair records, by peer fingerprint. */
+  marks?: ReadonlyMap<string, EncryptedSeenEvent<HlcTimestamp>[]>;
 }
 
 /**
@@ -95,6 +109,7 @@ export function buildPairingViewSource(deps: {
       return {
         views: addPairingMethodWitnesses(mergeUnionToPairings(all), load, dropped),
         revoked: revokedPairings(all, load, dropped),
+        marks: encryptedSeenEventsFromUnion(all),
       };
     },
     alreadyPublishedInvite: (peerFp, peerIdentityPub) => {
@@ -119,7 +134,7 @@ export function isThreadlinePairingReplicationEnabled(config: {
 export type InheritanceTrust = Pick<
   AgentTrustManager,
   'getProfileByFingerprint' | 'inheritReplicatedVerification' | 'listProfiles' | 'revokeInheritedVerification'
->;
+> & Partial<Pick<AgentTrustManager, 'mergeEncryptedSeen'>>;
 
 export interface InheritanceSummary {
   /** Peers evaluated (distinct fingerprints in the view). */
@@ -136,6 +151,8 @@ export interface InheritanceSummary {
   revoked: number;
   /** Peers with a revoke in force whose put variants were NOT inherited (fail closed). */
   revokeHeld: number;
+  /** Step 6: pinned profiles whose encryptedSeen mark was set or moved earlier by the union. */
+  marksMerged: number;
 }
 
 /** Local pairing states that are THIS machine's own decision and are never overridden here. */
@@ -150,8 +167,9 @@ export function applyReplicatedPairingInheritance(
   views: ReadonlyArray<MergedPairingView>,
   trust: InheritanceTrust,
   revoked: ReadonlyMap<string, PairingRevocation> = new Map(),
+  marks: ReadonlyMap<string, EncryptedSeenEvent<HlcTimestamp>[]> = new Map(),
 ): InheritanceSummary {
-  const summary: InheritanceSummary = { peers: 0, inherited: 0, unchanged: 0, localWins: 0, refused: 0, revoked: 0, revokeHeld: 0 };
+  const summary: InheritanceSummary = { peers: 0, inherited: 0, unchanged: 0, localWins: 0, refused: 0, revoked: 0, revokeHeld: 0, marksMerged: 0 };
 
   // 1. Revokes first. Only INHERITED profiles (identity-verified — the state only
   //    inheritance sets); revokeInheritedVerification enforces that and the key match.
@@ -207,6 +225,19 @@ export function applyReplicatedPairingInheritance(
     if (ok) summary.inherited++;
     else summary.refused++;
   }
+
+  // 3. The unified encryptedSeen mark (step 6), AFTER inheritance so a pin inherited in this
+  //    pass gets its mark in the same pass. Only into a profile pinned to the SAME key; a mark
+  //    is only ever set or moved earlier here, never cleared (clearing is the unpair's job).
+  if (trust.mergeEncryptedSeen) {
+    for (const [fp, events] of marks) {
+      const profile = trust.getProfileByFingerprint(fp);
+      const key = profile?.peerIdentityPub?.toLowerCase();
+      if (!key) continue;
+      const at = unifyEncryptedSeen(events, key, encryptedSeenOrder);
+      if (at && trust.mergeEncryptedSeen(fp, key, at)) summary.marksMerged++;
+    }
+  }
   return summary;
 }
 
@@ -238,12 +269,12 @@ export interface PairingReplicationWiring {
 export function createPairingReplicationWiring(deps: PairingReplicationWiringDeps): PairingReplicationWiring | null {
   if (!isThreadlinePairingReplicationEnabled(deps.config)) return null;
   const log = deps.log ?? (() => {});
-  const empty = (): InheritanceSummary => ({ peers: 0, inherited: 0, unchanged: 0, localWins: 0, refused: 0, revoked: 0, revokeHeld: 0 });
+  const empty = (): InheritanceSummary => ({ peers: 0, inherited: 0, unchanged: 0, localWins: 0, refused: 0, revoked: 0, revokeHeld: 0, marksMerged: 0 });
   const applyNow = (): InheritanceSummary => {
     try {
       const state = deps.readState();
-      const s = applyReplicatedPairingInheritance(state.views, deps.trust, state.revoked);
-      if (s.inherited > 0 || s.refused > 0 || s.revoked > 0) log(`pairing inheritance: ${JSON.stringify(s)}`);
+      const s = applyReplicatedPairingInheritance(state.views, deps.trust, state.revoked, state.marks);
+      if (s.inherited > 0 || s.refused > 0 || s.revoked > 0 || s.marksMerged > 0) log(`pairing inheritance: ${JSON.stringify(s)}`);
       return s;
     } catch (err) {
       log(`pairing inheritance failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
@@ -314,6 +345,21 @@ export function attachThreadlinePairingReplication(deps: {
           deriveThreadlinePairingRecordKey(peerFp),
           (hlc, origin, observed) =>
             buildThreadlinePairingTombstoneData({ peerFp, hlc, origin, deletedAt, observed, peerIdentityPub }),
+        ),
+      // Step 6: this machine's own mark / unpair record for the peer (one recordKey per origin).
+      emitEncryptedSeen: (peerFp, peerIdentityPub, at) =>
+        emitter.emit(
+          THREADLINE_PAIRING_STORE_KEY,
+          deriveEncryptedSeenRecordKey(peerFp, deps.ownOrigin),
+          (hlc, origin, observed) =>
+            buildEncryptedSeenRecordData({ peerFp, peerIdentityPub, kind: 'seen', at, hlc, origin, observed }),
+        ),
+      emitEncryptedSeenUnpaired: (peerFp, peerIdentityPub, at) =>
+        emitter.emit(
+          THREADLINE_PAIRING_STORE_KEY,
+          deriveEncryptedSeenRecordKey(peerFp, deps.ownOrigin),
+          (hlc, origin, observed) =>
+            buildEncryptedSeenRecordData({ peerFp, peerIdentityPub, kind: 'unpaired', at, hlc, origin, observed }),
         ),
     },
     deps.ownOrigin,

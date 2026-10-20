@@ -829,6 +829,12 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     justification: 'Ships dryRun:true: a dev agent counts, on the authed /health, each send that WOULD have gone encrypted to the pinned key and each inbound plaintext that would have been labelled, and sends and delivers exactly as today. Encrypting and labelling need a deliberate dryRun:false. Reads in-memory trust profiles only: no writes, no LLM, no spend, no new outbound messages; SAS-paired and inherited pairings are never affected.',
   },
   {
+    name: 'a2aRefuseDowngrade',
+    configPath: 'threadline.refuseDowngrade.enabled',
+    description: 'Refuse-downgrade: once a peer paired by invite has sent this agent encrypted chat (verified against its pinned key), that fact is recorded on its trust profile and replicated to this agent\'s other machines, and plaintext later arriving under that peer\'s fingerprint is refused as a possible downgrade by the relay.',
+    justification: 'Ships dryRun:true: a dev agent records the mark (one field on an existing trust profile, plus one small replicated record when pairing replication is on) and counts, on the authed /health, each plaintext that WOULD have been refused, and delivers exactly as today. Refusing needs a deliberate dryRun:false. No LLM, no spend, no outbound messages; SAS-paired and method-less inherited pairings are never affected; off is the full rollback.',
+  },
+  {
     name: 'blockerLifecycleLedger',
     configPath: 'monitoring.blockerLifecycleLedger.enabled',
     description: 'Raw blocker lifecycle timing ledger and bounded summary/trend read surfaces.',

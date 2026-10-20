@@ -22,6 +22,7 @@ import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { PairingPendingStore, type PendingPairingRecord } from './PairingPendingStore.js';
 import { deriveSASv2, deriveSasBitsV2, deriveSasFingerprintV2, derivePairingIdV2 } from './ThreadlineCrypto.js';
 import { isAcceptableIdentityKey, type InviteTrust } from '@sagemindai/threadline-core';
+import { earliestMark } from './encryptedSeenMark.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -137,6 +138,15 @@ export interface AgentTrustProfile {
   invitePausedAt?: string;
   /** Read-only view for threadline-core's InviteTrust: `paused: <reason>` while paused. */
   readonly via?: string;
+  /**
+   * When this peer first sent us ENCRYPTED ordinary chat (docs/specs/threadline-standalone-pairing.md
+   * D6/D11, rollout step 6). Bound to `peerIdentityPub`: it is dropped whenever the pinned key
+   * changes. Set once, merged with the agent's other machines as a union keeping the earliest
+   * time, and removed only when the person unpairs (markVerificationFailed) or the inherited pin
+   * it belongs to is forgotten. While `threadline.refuseDowngrade` enforces, plaintext under this
+   * peer's fingerprint is refused.
+   */
+  encryptedSeenAt?: string;
 }
 
 /**
@@ -192,6 +202,10 @@ export interface PairingReplicationEmitter {
   /** Emit a `delete` tombstone for a revoked / verification-failed pairing (un-verify
    *  sticks pool-wide), keyed on the peer fingerprint. */
   emitRevoke(peerFp: string, deletedAt: string, peerIdentityPub?: string): void;
+  /** Rollout step 6 (D11): this machine recorded the encryptedSeen mark for this pinned key. */
+  emitEncryptedSeen?(peerFp: string, peerIdentityPub: string, at: string): void;
+  /** Rollout step 6 (D11): the person unpaired here, so every earlier mark for this key is void. */
+  emitEncryptedSeenUnpaired?(peerFp: string, peerIdentityPub: string | undefined, at: string): void;
 }
 
 export interface InteractionStats {
@@ -629,6 +643,7 @@ export class AgentTrustManager implements InviteTrust {
     // A new pairingId is a new handshake epoch → reset to pending + clear prior confirm.
     profile.pairingState = 'pending-verification';
     profile.pairingId = args.pairingId;
+    if (profile.peerIdentityPub !== args.peerIdentityPub) profile.encryptedSeenAt = undefined; // the mark belongs to its pin
     profile.peerIdentityPub = args.peerIdentityPub;
     profile.sasFingerprint = args.sasFingerprint;
     profile.pairingMethod = 'sas';
@@ -848,6 +863,7 @@ export class AgentTrustManager implements InviteTrust {
     }
     const now = new Date().toISOString();
     profile.pairingState = 'invite-accepted';
+    if (profile.peerIdentityPub !== key) profile.encryptedSeenAt = undefined; // the mark belongs to its pin
     profile.peerIdentityPub = key;
     // The operator approved a NEW invite from this peer: that is the re-confirmation a pause
     // waits for (a2a-pairing-invite-link §4.4.2), so the new invite's Finish may complete.
@@ -887,6 +903,7 @@ export class AgentTrustManager implements InviteTrust {
     const previousLevel = profile.level;
     const now = new Date().toISOString();
     profile.pairingState = 'mutual-verified';
+    if (profile.peerIdentityPub !== key) profile.encryptedSeenAt = undefined; // the mark belongs to its pin
     profile.peerIdentityPub = key;
     profile.invitePausedReason = undefined; // a completed pairing ends a pause
     profile.invitePausedAt = undefined;
@@ -957,6 +974,9 @@ export class AgentTrustManager implements InviteTrust {
     profile.pairingState = 'verification-failed';
     profile.verifiedAt = undefined;
     profile.peerAcked = undefined;
+    // The person unpaired (D8/D11): the encryptedSeen mark goes with the pairing, here and, through
+    // the replicated unpair record, on every other machine of this agent.
+    profile.encryptedSeenAt = undefined;
     profile.level = 'untrusted';
     profile.source = 'setup-default';
     profile.allowedOperations = [...DEFAULT_ALLOWED_OPS.untrusted];
@@ -970,6 +990,9 @@ export class AgentTrustManager implements InviteTrust {
     if (this.pairingReplication) {
       try { this.pairingReplication.emitRevoke(peerFp, now, profile.peerIdentityPub); }
       catch { /* replication failure never breaks the local trust write */ }
+      // Always sent (not only when THIS machine held a mark): another machine may hold one.
+      try { this.pairingReplication.emitEncryptedSeenUnpaired?.(peerFp, profile.peerIdentityPub, now); }
+      catch { /* best effort */ }
     }
 
     this.writeAudit({
@@ -1097,7 +1120,8 @@ export class AgentTrustManager implements InviteTrust {
 
     profile.pairingState = 'identity-verified';
     profile.pairingMethod = keepInvite ? 'invite' : method;
-    profile.peerIdentityPub = args.peerIdentityPub;
+    if (!sameKey) profile.encryptedSeenAt = undefined; // the mark belongs to its pin
+    profile.peerIdentityPub = args.peerIdentityPub.toLowerCase(); // stored lowercase, as every other pin path compares it (Echo, step 6 review)
     // An inherited verification ends a pause only if it is an operator's confirm made AFTER the
     // pause: its verifiedAt must be present and strictly later than this machine's recorded
     // invitePausedAt. The revoke tombstone a demote sends is best-effort, and the replicated store
@@ -1204,6 +1228,9 @@ export class AgentTrustManager implements InviteTrust {
     profile.verifiedAt = undefined;
     profile.peerAcked = undefined;
     profile.inheritedFromMachine = undefined;
+    // The mark lives with the pin. If a newer record re-pins the same key, the merge pass
+    // restores the mark from the replicated mark records (unless the person unpaired since).
+    profile.encryptedSeenAt = undefined;
     profile.source = 'setup-default';
     if (this.compareTrust(profile.level, 'verified') > 0) profile.level = 'verified';
     profile.allowedOperations = [...DEFAULT_ALLOWED_OPS[profile.level]];
@@ -1213,6 +1240,45 @@ export class AgentTrustManager implements InviteTrust {
       timestamp: now, agent: profile.agent, previousLevel, newLevel: profile.level, source: 'system',
       reason: `Inherited pairing revoked (${reason})`, userInitiated: false,
     });
+    return true;
+  }
+
+  /**
+   * Rollout step 6 (D6/D11): this peer sent us ENCRYPTED ordinary chat, verified against
+   * `peerIdentityPub`. Set once: an existing mark is never moved. Only for a pinned peer whose
+   * pinned key is exactly that key. Replicated to this agent's other machines as a mark record
+   * (best effort). Returns true when the mark is now set (newly or already).
+   */
+  markEncryptedSeen(peerFp: string, peerIdentityPub: string): boolean {
+    const profile = this.getProfileByFingerprint(String(peerFp || '').toLowerCase());
+    const key = String(peerIdentityPub || '').toLowerCase();
+    if (!profile?.peerIdentityPub || profile.peerIdentityPub.toLowerCase() !== key || !profile.fingerprint) return false;
+    if (profile.encryptedSeenAt) return true;
+    const now = new Date().toISOString();
+    profile.encryptedSeenAt = now;
+    profile.updatedAt = now;
+    this.save();
+    if (this.pairingReplication) {
+      try { this.pairingReplication.emitEncryptedSeen?.(profile.fingerprint, key, now); }
+      catch { /* replication failure never breaks the local write */ }
+    }
+    return true;
+  }
+
+  /**
+   * Rollout step 6 (D11): fold in the unified mark another machine recorded for this peer — a
+   * union keeping the earliest time. Applies only when `peerIdentityPub` is the key pinned here.
+   * Never clears and never moves a mark later. Emits nothing (it is already replicated). Returns
+   * true when the stored mark changed.
+   */
+  mergeEncryptedSeen(peerFp: string, peerIdentityPub: string, at: string): boolean {
+    const profile = this.getProfileByFingerprint(String(peerFp || '').toLowerCase());
+    if (!profile?.peerIdentityPub || profile.peerIdentityPub.toLowerCase() !== String(peerIdentityPub || '').toLowerCase()) return false;
+    const merged = earliestMark(profile.encryptedSeenAt, at);
+    if (merged === undefined || merged === profile.encryptedSeenAt) return false;
+    profile.encryptedSeenAt = merged;
+    profile.updatedAt = new Date().toISOString();
+    this.save();
     return true;
   }
 
