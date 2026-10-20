@@ -137,6 +137,17 @@ describe('A. a paused invite pairing refuses a late Finish', () => {
     expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBeUndefined();
   });
 
+  it('a replicated verification from another of this agent\'s machines clears the pause', async () => {
+    const net = new Net();
+    const A = makeAgent(net, 'scout'); const B = makeAgent(net, 'carl');
+    await upToFinishQueued(net, A, B);
+    B.trust.demoteInvitePairing(A.fp, 'invite used twice');
+    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice');
+    expect(B.trust.inheritReplicatedVerification(A.fp, { peerIdentityPub: A.pub, verifiedOnMachine: 'm2' })).toBe(true);
+    expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('identity-verified');
+    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBeUndefined();
+  });
+
   it('markInviteVerified (a fresh, completed pairing) clears the pause', async () => {
     const net = new Net();
     const A = makeAgent(net, 'scout'); const B = makeAgent(net, 'carl');

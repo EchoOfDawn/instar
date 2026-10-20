@@ -31,6 +31,8 @@ The pause marker is machine-local. Other machines of the same agent drop the pai
 
 A first draft cleared the marker only in `markInviteVerified`. That would have over-blocked: the remedy for a pause is a new invite, and accepting the new invite left the marker set, so its Finish would have been refused as well. The marker is now also cleared when the operator approves a new invite and on a 12-word confirm, and a test covers the new-invite case end to end.
 
+Keys pinned before this change are not re-checked: the weak-key refusal runs at pin time, by design. No real agent's key is weak, and a re-check of stored pins would need a migration with no case to justify it.
+
 ## 3. Level-of-abstraction fit
 
 The paused rule and the weak-key predicate live in threadline-core. Instar's trust store now gives the rule the state it needs and reuses the predicate rather than copying it. The degradation goes through the existing reporter.
@@ -79,3 +81,9 @@ This closes the three gaps Echo found, with tests on the real engine and the rea
 **Independent read of the artifact: concur**
 
 Checked: core's `handleFinish` reads `via` only before a first Finish promotes, so a paused pin cannot be re-promoted by a replayed Finish. `recordInviteAccepted`, which now clears a pause, is reached only through `approveAccept`, which only the operator's Telegram tap or the PIN-gated dashboard route calls, so an inbound message cannot clear a pause. The `via` getter is on the live profile object that the engine reads directly, with no clone in between. Every `peerIdentityPub` write site in `AgentTrustManager` is preceded by the weak-key check. The fixture changes keep each test's intent.
+
+## Review notes from #2229 (Echo, non-blocking), 2026-10-20
+
+- `inheritReplicatedVerification` now clears `invitePausedReason`. An inherited verification is an operator's confirm on another of this agent's machines. A demote sends a revoke tombstone, so a replicated verification can only reach this machine after a pause if it is newer than the pause. Without the clear, the profile would sit at `identity-verified` with a stale `paused:` via, which refuses the next invite Finish for an already-verified pin. Test: "a replicated verification from another of this agent's machines clears the pause". A mutant without the clear fails it.
+- A comment at the `via` getter says core must read the profile only through `getProfileByFingerprint`: a clone or spread drops the getter, and a paused pin would then read as not paused.
+- Added to §2: keys pinned before this change are not re-checked.

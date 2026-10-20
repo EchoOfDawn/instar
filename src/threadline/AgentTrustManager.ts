@@ -1054,6 +1054,10 @@ export class AgentTrustManager implements InviteTrust {
 
     profile.pairingState = 'identity-verified';
     profile.peerIdentityPub = args.peerIdentityPub;
+    // An inherited verification is an operator's confirm on another of this agent's machines. A
+    // demote sends a revoke tombstone, so only a confirm NEWER than the pause reaches here: it ends
+    // the pause like a local confirm does (Echo's review of #2229).
+    profile.invitePausedReason = undefined;
     if (args.verifiedAt) profile.verifiedAt = args.verifiedAt;
     if (args.verifiedOnMachine) profile.inheritedFromMachine = args.verifiedOnMachine;
 
@@ -1481,6 +1485,8 @@ export class AgentTrustManager implements InviteTrust {
  * invite pairing is paused (core's handleFinish refuses a Finish then). A getter, so it is never
  * written to the trust file and always reflects the stored pause.
  */
+// Core must read the profile ONLY through getProfileByFingerprint: a clone or spread drops this
+// getter, so a paused pin would read as not paused and fail open.
 function withPausedVia(profile: AgentTrustProfile): AgentTrustProfile {
   if (!Object.prototype.hasOwnProperty.call(profile, 'via')) {
     Object.defineProperty(profile, 'via', {
