@@ -19,6 +19,13 @@ After the 1.3.1362 incident (published, never landed; main rebuilt by hand in 76
 - **New lib helpers:** `npmAheadOfMain`, `unfinishedReleaseMessage`, `consumedFragmentsAt`, `bumpVersionJson`.
 - **Spec:** one paragraph (wording only, after approval), with a matching ELI16 paragraph.
 
+**Round 2 (Echo's review at 77ed9249f).**
+- **Fragment safety:** `--reconcile` deletes a fragment only if its blob on main equals its blob at gitHead AND its text is in the released guide (`fragmentReleasedIn`). Otherwise it stops and names the file.
+- **Signals that don't depend on npm:** a per-clone in-flight marker (written before publish, cleared on landing; a failure clears it only if this run wrote it and nothing can have reached npm), and a remote `v*` tag ahead of main.
+- **Auth args:** the preflight's `npm view` uses the npm auth args.
+- **Cleanup:** the tarball temp dir is removed in a `finally`.
+- **Limits:** the marker is per clone. A release left in flight on ANOTHER machine is caught only by the npm and tag signals.
+
 ## Decision-point inventory
 
 - **Preflight: npm ahead of main** — add — a stop on a real release (a dry run warns).

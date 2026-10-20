@@ -4,12 +4,12 @@
 
 ## What Changed
 
-instar 1.3.1362 was published from a machine that never finished the release, so main kept saying 1.3.1361 until the release commit was rebuilt by hand from the published package. The release tool now checks for this before doing anything. If npm already has a newer version than main, a real run refuses to start, names the unfinished version, and gives the two ways to finish it. A dry run only warns.
+instar 1.3.1362 was published from a machine that never finished the release, so main kept saying 1.3.1361 until the release commit was rebuilt by hand from the published package. The release tool now checks for this before doing anything. If npm already has a newer version than main, a real run refuses to start, names the unfinished version, and gives the two ways to finish it. It also refuses while this computer has a release in flight (a note the tool leaves just before publishing and removes once the release lands), or while GitHub has a version tag newer than main. Those two don't depend on npm, which can hide a new version while it reviews it. A dry run only warns.
 
 The two ways to finish it:
 
 - If the folder that still holds that release exists, run `--push-only` from it.
-- If that folder is gone, run `--reconcile <version>`. It downloads the version npm actually shipped, copies its release notes exactly, removes the release-note fragments that version already included (the ones present at the commit it was built from), and bumps the version files. Then it commits with all checks on and pushes, exactly like `--push-only`. It never publishes. It refuses if npm doesn't show the version, if that version isn't newer than main, or if the commit it was built from isn't part of main's history.
+- If that folder is gone, run `--reconcile <version>`. It downloads the version npm actually shipped, copies its release notes exactly, removes the release-note fragments that version already included (the ones present at the commit it was built from), and bumps the version files. Then it commits with all checks on and pushes, exactly like `--push-only`. It never publishes. It refuses if npm doesn't show the version, if that version isn't newer than main, or if the commit it was built from isn't part of main's history. It also refuses to delete a release-note fragment that was edited on main after the publish, or whose text isn't in the released notes, and names the file.
 
 ## Evidence
 

@@ -529,3 +529,56 @@ export function bumpVersionJson(text, version, { lock = false } = {}) {
   if (lock && o.packages && o.packages['']) o.packages[''].version = version;
   return JSON.stringify(o, null, 2) + '\n';
 }
+
+/**
+ * Does a fragment's text appear in the released guide? assemble-next-md
+ * replaces the H1 title and merges section bodies under one H2 each (keeping
+ * every H2 title), so the check is: every line of the fragment that is not its
+ * H1 title, an HTML comment or blank appears as a line of the guide. A fragment
+ * that fails this was never released, so --reconcile must not delete it.
+ * @returns {{ ok: boolean, missing: string[] }}
+ */
+export function fragmentReleasedIn(fragmentText, guideText) {
+  const guideLines = new Set(String(guideText).split('\n').map((l) => l.trim()));
+  const content = String(fragmentText).split('\n').map((l) => l.trim())
+    .filter((l) => l && !/^#\s/.test(l) && !/^<!--.*-->$/.test(l));
+  const missing = content.filter((l) => !guideLines.has(l));
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * The highest vX.Y.Z tag in `git ls-remote --tags <remote>` output, if it is
+ * AHEAD of main's package.json version — a secondary unfinished-release
+ * signal that does not depend on npm visibility. Returns the version or null.
+ */
+export function remoteTagAheadOf(lsRemoteOutput, local) {
+  let best = null;
+  for (const line of String(lsRemoteOutput || '').split('\n')) {
+    const m = /refs\/tags\/v(\d+\.\d+\.\d+)(\^\{\})?$/.exec(line.trim());
+    if (!m) continue;
+    if (!best || compareSemver(m[1], best) > 0) best = m[1];
+  }
+  return best && /^\d+\.\d+\.\d+$/.test(String(local)) && compareSemver(best, local) > 0 ? best : null;
+}
+
+/** The refusal for a release left in flight on THIS clone (marker present). */
+export function inflightRefusal(marker, remote = 'origin') {
+  const v = marker && marker.version ? marker.version : '<unknown>';
+  return [
+    `A release of v${v} is in flight from this clone (started ${marker && marker.startedAt ? marker.startedAt : 'at an unknown time'}` +
+      `${marker && marker.worktree ? ` in ${marker.worktree}` : ''}). It was about to publish, or published, and never landed.`,
+    `npm may still be holding it in "Validating", so \`npm view\` can show the old latest. Finish it first:`,
+    `  node scripts/release-local.mjs --push-only --remote ${remote}   (from ${marker && marker.worktree ? marker.worktree : 'the worktree that holds the cut'})`,
+    `  or, once npm shows it and that worktree is gone: node scripts/release-local.mjs --reconcile ${v} --remote ${remote}`,
+    `Both clear the marker when they land the release.`,
+  ].join('\n');
+}
+
+/**
+ * After a failure, may the in-flight marker be cleared? Only if THIS run wrote
+ * it and nothing can have reached npm (publish confirmed absent, or never
+ * attempted). Pending, unknown and published all keep it.
+ */
+export function shouldClearInflightOnFailure({ wroteMarker, published, publishUnknown, npmPending }) {
+  return Boolean(wroteMarker) && !published && !publishUnknown && !npmPending;
+}

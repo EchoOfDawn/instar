@@ -31,6 +31,10 @@ import {
   unfinishedReleaseMessage,
   consumedFragmentsAt,
   bumpVersionJson,
+  fragmentReleasedIn,
+  remoteTagAheadOf,
+  inflightRefusal,
+  shouldClearInflightOnFailure,
   isReleaseCutCommit,
   otpRequirement,
   ciRunState,
@@ -586,6 +590,44 @@ describe('unfinished release: npm ahead of main (1.3.1362 incident)', () => {
     expect(m).toContain('--reconcile 1.3.1362 --remote origin');
     expect(m).toContain('upgrades/1.3.1362.md verbatim from the tarball');
   });
+  it('fragmentReleasedIn: content lines and H2 titles must appear in the guide; the H1 title and comments are ignored', () => {
+    const frag = '# A title the assembler replaces\n\n<!-- internal-only -->\n\n## What Changed\n\nFixed the thing.\nSecond line.\n';
+    expect(fragmentReleasedIn(frag, '# Upgrade Guide — vNEXT\n\n## What Changed\n\nOther fix.\nFixed the thing.\nSecond line.\n')).toEqual({ ok: true, missing: [] });
+    expect(fragmentReleasedIn(frag, '# Upgrade Guide\n\n## What Changed\n\nFixed the thing.\n')).toEqual({ ok: false, missing: ['Second line.'] });
+    expect(fragmentReleasedIn('## A Custom Section\n\nFixed the thing.\n', '## What Changed\n\nFixed the thing.\n')).toEqual({ ok: false, missing: ['## A Custom Section'] });
+  });
+  const realPair = (() => {
+    const r = spawnSync('git', ['-C', path.join(__dirname, '..', '..'), 'cat-file', '-e', '7cdc5d571:upgrades/next/threadline-core-push-config-alias.md'], { encoding: 'utf-8' });
+    const g2 = spawnSync('git', ['-C', path.join(__dirname, '..', '..'), 'cat-file', '-e', '76d5a6098:upgrades/1.3.1362.md'], { encoding: 'utf-8' });
+    return r.status === 0 && g2.status === 0;
+  })();
+  it.skipIf(!realPair)('fragmentReleasedIn holds on the REAL 1.3.1362 pair (fragment at gitHead 7cdc5d571 vs the released guide)', () => {
+    const show = (spec: string) => execFileSync('git', ['-C', path.join(__dirname, '..', '..'), 'show', spec], { encoding: 'utf-8' });
+    expect(fragmentReleasedIn(show('7cdc5d571:upgrades/next/threadline-core-push-config-alias.md'), show('76d5a6098:upgrades/1.3.1362.md')).ok).toBe(true);
+  });
+  it('remoteTagAheadOf finds the highest vX.Y.Z tag ahead of main, numerically', () => {
+    const ls = ['abc\trefs/tags/v1.3.135', 'def\trefs/tags/v1.3.1361', 'aaa\trefs/tags/v1.3.1362', 'aaa\trefs/tags/v1.3.1362^{}', 'bbb\trefs/tags/not-a-version'].join('\n');
+    expect(remoteTagAheadOf(ls, '1.3.1361')).toBe('1.3.1362');
+    expect(remoteTagAheadOf(ls, '1.3.1362')).toBe(null);
+    expect(remoteTagAheadOf('', '1.3.1361')).toBe(null);
+    // numeric, not string: 1.3.1000 > 1.3.999
+    expect(remoteTagAheadOf('a\trefs/tags/v1.3.999\nb\trefs/tags/v1.3.1000', '1.3.999')).toBe('1.3.1000');
+  });
+  it('inflightRefusal names the version, the worktree and both remedies', () => {
+    const m = inflightRefusal({ version: '1.3.1362', startedAt: '2026-10-20T17:40:00Z', worktree: '/w/rel-1362' }, 'origin');
+    expect(m).toContain('v1.3.1362 is in flight');
+    expect(m).toContain('/w/rel-1362');
+    expect(m).toContain('--push-only --remote origin');
+    expect(m).toContain('--reconcile 1.3.1362');
+    expect(m).toContain('Validating');
+  });
+  it('shouldClearInflightOnFailure: only this run\'s marker, and only when nothing can have reached npm', () => {
+    expect(shouldClearInflightOnFailure({ wroteMarker: true, published: false, publishUnknown: false, npmPending: false })).toBe(true);
+    expect(shouldClearInflightOnFailure({ wroteMarker: false, published: false, publishUnknown: false, npmPending: false })).toBe(false);
+    expect(shouldClearInflightOnFailure({ wroteMarker: true, published: true, publishUnknown: false, npmPending: false })).toBe(false);
+    expect(shouldClearInflightOnFailure({ wroteMarker: true, published: false, publishUnknown: true, npmPending: false })).toBe(false);
+    expect(shouldClearInflightOnFailure({ wroteMarker: true, published: false, publishUnknown: false, npmPending: true })).toBe(false);
+  });
   it('bumpVersionJson sets package and lock-root versions; a no-op bump is byte-identical', () => {
     const pkg = JSON.stringify({ name: 'instar', version: '1.0.0', dependencies: { a: '^1' } }, null, 2) + '\n';
     expect(bumpVersionJson(pkg, '1.0.0')).toBe(pkg);
@@ -605,7 +647,7 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
   let clone: string;
   let bin: string;
   let gitHead: string;
-  const GUIDE = '# Upgrade Guide — v1.0.1\n\nThe notes npm actually shipped.\n';
+  const GUIDE = '# Upgrade Guide — v1.0.1\n\n## What Changed\n\nFixed the thing that broke in 1.0.0.\n\nThe notes npm actually shipped.\n';
   const g = (cwd: string, ...args: string[]) => {
     const r = runner(cwd)('git', args);
     if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
@@ -619,7 +661,12 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
   const lock = (v: string) => JSON.stringify({ name: 'instar', version: v, lockfileVersion: 3, packages: { '': { name: 'instar', version: v } } }, null, 2) + '\n';
 
   /** npm stand-in: `npm view`, `npm pack` against a fake registry holding 1.0.1. */
-  function shim({ latest = '1.0.1', has101 = true, head = () => gitHead } = {}) {
+  function shim({ latest = '1.0.1', has101 = true, head = () => gitHead, guide = GUIDE } = {}) {
+    // (re)build the tarball with the given guide
+    const pkgDir = path.join(tmp, 'registry', 'package', 'upgrades');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, '1.0.1.md'), guide);
+    execFileSync('tar', ['-czf', path.join(tmp, 'registry', 'instar-1.0.1.tgz'), '-C', path.join(tmp, 'registry'), 'package']);
     const tgzDir = path.join(tmp, 'registry');
     const script = [
       '#!/bin/sh',
@@ -647,7 +694,7 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
     write('package.json', pkg('1.0.0'));
     write('package-lock.json', lock('1.0.0'));
     write('upgrades/1.0.0.md', '# 1.0.0\n');
-    write('upgrades/next/consumed.md', '# a fix that shipped in 1.0.1\n');
+    write('upgrades/next/consumed.md', '# a fix that shipped in 1.0.1\n\n## What Changed\n\nFixed the thing that broke in 1.0.0.\n');
     g(clone, 'add', '-A');
     g(clone, 'commit', '-qm', 'merge: the fix that 1.0.1 was built from');
     gitHead = g(clone, 'rev-parse', 'HEAD'); // what `npm view instar@1.0.1 gitHead` reports
@@ -657,12 +704,8 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
     g(clone, 'add', '-A');
     g(clone, 'commit', '-qm', 'merge: a later fix');
     g(clone, 'push', '-q', 'origin', 'HEAD:main');
-    // The published tarball.
-    const pkgDir = path.join(tmp, 'registry', 'package', 'upgrades');
-    fs.mkdirSync(pkgDir, { recursive: true });
-    fs.writeFileSync(path.join(pkgDir, '1.0.1.md'), GUIDE);
-    execFileSync('tar', ['-czf', path.join(tmp, 'registry', 'instar-1.0.1.tgz'), '-C', path.join(tmp, 'registry'), 'package']);
-    shim();
+    fs.mkdirSync(path.join(tmp, 'tmpdir'));
+    shim(); // also builds the published tarball
   });
 
   afterEach(() => {
@@ -672,11 +715,38 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
   function cli(...args: string[]) {
     const r = spawnSync(process.execPath, [path.join(clone, 'scripts', 'release-local.mjs'), ...args], {
       cwd: clone,
-      env: { ...ENV, PATH: `${bin}:${process.env.PATH}`, INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS: '0' },
+      env: { ...ENV, PATH: `${bin}:${process.env.PATH}`, INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS: '0', TMPDIR: path.join(tmp, 'tmpdir') },
       encoding: 'utf-8',
     });
     return { status: r.status, out: `${r.stdout}\n${r.stderr}` };
   }
+  const markerPath = () => path.join(clone, '.git', 'release-local-inflight.json');
+  const writeMarker = (version: string) => fs.writeFileSync(markerPath(), JSON.stringify({ version, startedAt: '2026-10-20T17:40:00Z', worktree: '/w/rel-x' }));
+
+  it('a real run refuses while THIS clone has a release in flight, even when npm shows no newer version (the Validating case)', () => {
+    shim({ latest: '1.0.0' }); // npm still reports the old latest
+    writeMarker('1.0.1');
+    const before = g(bare, 'rev-parse', 'main');
+    const r = cli('--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('npm shows no unfinished release');
+    expect(r.out).toContain('v1.0.1 is in flight');
+    expect(r.out).toContain('/w/rel-x');
+    expect(g(bare, 'rev-parse', 'main')).toBe(before);
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+    expect(fs.existsSync(markerPath())).toBe(true); // a refusal never clears someone else's marker
+  });
+
+  it('a real run refuses while the remote has a v* tag ahead of main, even when npm shows no newer version', () => {
+    shim({ latest: '1.0.0' });
+    g(clone, 'tag', 'v1.0.1');
+    g(clone, 'push', '-q', 'origin', 'v1.0.1');
+    g(clone, 'tag', '-d', 'v1.0.1');
+    const r = cli('--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("origin has tag v1.0.1 but main's package.json is 1.0.0");
+    expect(r.out).toContain('--reconcile 1.0.1');
+  });
 
   it('a real release run refuses while npm is ahead of main, naming the version and both remedies; nothing changes', () => {
     const before = g(bare, 'rev-parse', 'main');
@@ -695,9 +765,12 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
     const hook = path.join(clone, '.git', 'hooks', 'pre-commit');
     fs.writeFileSync(hook, `#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
     fs.chmodSync(hook, 0o755);
+    writeMarker('1.0.1');
     const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
     expect(r.out).toContain('removed 1 fragment(s) consumed at');
     expect(r.status).toBe(0);
+    expect(fs.existsSync(markerPath())).toBe(false); // landing clears the marker
+    expect(fs.readdirSync(path.join(tmp, 'tmpdir'))).toEqual([]); // the tarball dir is removed
     expect(fs.existsSync(marker)).toBe(true);
     const head = g(clone, 'rev-parse', 'HEAD');
     expect(g(bare, 'rev-parse', 'main')).toBe(head);
@@ -709,6 +782,26 @@ describe('--reconcile <version>: rebuild a published-but-never-landed cut from n
     expect(JSON.parse(g(bare, 'show', 'main:package.json')).version).toBe('1.0.1');
     expect(JSON.parse(g(bare, 'show', 'main:package-lock.json')).packages[''].version).toBe('1.0.1');
     expect(g(bare, 'show', 'main:src/later.ts')).toBe('export const later = 1;');
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  });
+
+  it('refuses to delete a fragment edited on main after the publish (blob differs from gitHead), naming it', () => {
+    write('upgrades/next/consumed.md', '# a fix that shipped in 1.0.1\n\n## What Changed\n\nFixed the thing that broke in 1.0.0.\nPLUS an edit made on main after 1.0.1 was built.\n');
+    g(clone, 'commit', '-qam', 'edit the fragment after the publish');
+    g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('upgrades/next/consumed.md changed on main after instar@1.0.1 was built');
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+    expect(fs.readdirSync(path.join(tmp, 'tmpdir'))).toEqual([]);
+  });
+
+  it('refuses to delete a fragment whose text is NOT in the released guide, naming it', () => {
+    shim({ guide: '# Upgrade Guide — v1.0.1\n\n## What Changed\n\nSomething else entirely.\n' });
+    const r = cli('--reconcile', '1.0.1', '--remote', 'origin');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('upgrades/next/consumed.md is not in the released upgrades/1.0.1.md');
+    expect(r.out).toContain('Fixed the thing that broke in 1.0.0.');
     expect(g(clone, 'status', '--porcelain')).toBe('');
   });
 
@@ -834,7 +927,9 @@ describe('--push-only resumes a release that failed between publish and commit (
 
   it('(a) smoke failed after publish: --push-only commits the cut (hooks on) and lands it', () => {
     releaseCutInTree(); // publish succeeded, smoke failed → fail() before any commit
+    fs.writeFileSync(path.join(clone, '.git', 'release-local-inflight.json'), JSON.stringify({ version: '1.0.1' }));
     const r = pushOnly();
+    expect(fs.existsSync(path.join(clone, '.git', 'release-local-inflight.json'))).toBe(false);
     expect(r.out).toContain('exactly the release cut for v1.0.1');
     expect(r.status).toBe(0);
     assertLanded();
@@ -862,6 +957,14 @@ describe('--push-only resumes a release that failed between publish and commit (
     const r = pushOnly();
     expect(r.status).toBe(0);
     assertLanded();
+  });
+
+  it('--push-only clears only the marker for the version it landed', () => {
+    releaseCutInTree();
+    const m = path.join(clone, '.git', 'release-local-inflight.json');
+    fs.writeFileSync(m, JSON.stringify({ version: '9.9.9' }));
+    expect(pushOnly().status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(m, 'utf-8')).version).toBe('9.9.9');
   });
 
   it('refuses a dirty tree that is NOT exactly a release cut', () => {
@@ -1005,6 +1108,20 @@ describe('release-local.mjs wiring', () => {
     expect(flow.match(/if \((st|state) === 'unknown'\) publishUnknown = true;/g)?.length).toBe(2);
     expect(flow).toContain('deliberately different from the smoke path');
     expect(flow.match(/npmPendingNotice\('instar', [^)]*\{ pushOnly: true \}\)/g)?.length).toBe(2);
+  });
+  it('the in-flight marker is written after the dry-run exit and right before npm publish; fail() clears it only when safe', () => {
+    const dryExit = src.indexOf("stopCleanly('Dry run: tree restored.");
+    const write = src.indexOf('writeInflight(VERSION);');
+    const publish = src.indexOf("run('npm', ['publish'");
+    expect(dryExit).toBeGreaterThan(-1);
+    expect(write).toBeGreaterThan(dryExit);
+    expect(write).toBeLessThan(publish);
+    const failFn = src.slice(src.indexOf('function fail('), src.indexOf('function stopCleanly('));
+    expect(failFn).toContain('shouldClearInflightOnFailure({ wroteMarker: wroteInflight, published, publishUnknown, npmPending })');
+    expect(src).toContain("clearInflight(VERSION);");
+  });
+  it("the preflight's npm view uses the same npm auth args as --reconcile", () => {
+    expect(src).toContain("run('npm', ['view', 'instar', 'version', '--prefer-online', ...npmAuthArgs]");
   });
   it('a timed-out publish is passed to the registry check as timed out', () => {
     expect(src).toContain('timedOut: Boolean(pub.timedOut)');
