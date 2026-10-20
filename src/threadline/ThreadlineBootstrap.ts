@@ -32,6 +32,7 @@ import { AgentTrustManager } from './AgentTrustManager.js';
 import { EventEmitter } from 'node:events';
 import { PairingInviteStore } from './PairingInviteStore.js';
 import { PairingInviteFlow, INVITE_OPS, type InviteEvent } from './PairingInviteFlow.js';
+import { MarkedPairingInviteFlow, PairingPendingAcceptMarkers } from './PairingPendingAcceptMarkers.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
 import { IdentityManager, IdentityNotProvisionedError } from './client/IdentityManager.js';
@@ -163,7 +164,16 @@ export interface ThreadlineBootstrapResult {
    * Invite pairing (docs/specs/a2a-pairing-invite-link.md): the engine, its store, and the
    * operator-facing events (prompts and alarms) for Telegram and the dashboard to surface.
    */
-  pairingInvites?: { flow: PairingInviteFlow; store: PairingInviteStore; events: EventEmitter };
+  pairingInvites?: {
+    flow: PairingInviteFlow;
+    store: PairingInviteStore;
+    events: EventEmitter;
+    /**
+     * Secret-free markers of invites waiting for this operator, so a restart that drops one (the
+     * engine keeps them in memory only) leaves a notice instead of nothing (spec §8).
+     */
+    markers?: PairingPendingAcceptMarkers;
+  };
   /**
    * Most recent relay connection-LOSS event, or null if the relay has never
    * dropped. Exists so a status surface can report WHY the relay is down rather
@@ -539,7 +549,17 @@ export async function bootstrapThreadline(
       const client = relayClient;
       const invStore = new PairingInviteStore(config.stateDir);
       const invEvents = new EventEmitter();
-      const flow = new PairingInviteFlow({
+      // Invites pasted or forwarded here wait in the engine's memory (their secret never touches
+      // disk). The markers record only that one was waiting, so after a restart the operator is
+      // told to paste or forward it again instead of finding it silently gone.
+      const markers = new PairingPendingAcceptMarkers(config.stateDir);
+      try {
+        const notices = markers.convertAfterRestart();
+        if (notices.length) console.log(`[pairing-invite] ${notices.length} invite(s) waiting for approval were cleared by a restart; the operator will be told`);
+      } catch (err) {
+        console.warn(`[pairing-invite] could not read pending-accept markers: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const flow = new MarkedPairingInviteFlow({
         store: invStore,
         trust: trustManager!,
         identity: () => {
@@ -559,8 +579,8 @@ export async function bootstrapThreadline(
           invEvents.emit('event', e);
         },
         ownName: () => ({ owner: config.ownerName ?? '', agent: config.agentName }),
-      });
-      pairingInvites = { flow, store: invStore, events: invEvents };
+      }, markers);
+      pairingInvites = { flow, store: invStore, events: invEvents, markers };
     } catch (err) {
       // Reported, not just logged: "invite pairing is off" shows in /health and the degradation
       // digest until the store file is readable again.

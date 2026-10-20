@@ -62,6 +62,7 @@ import { resolveDevAgentGate, resolveStateSyncStores } from '../core/devAgentGat
 import { resolveRelayUnknownSenderTrustMode } from '../threadline/relayUnknownSenderTrust.js';
 import { resolveEncryptToPinnedMode, encryptToPinnedModeName } from '../threadline/encryptToPinned.js';
 import { resolveRefuseDowngradeMode } from '../threadline/refuseDowngrade.js';
+import { MarkedPairingInviteFlow } from '../threadline/PairingPendingAcceptMarkers.js';
 import { resolveAntiThrashKnobs, readingValidity } from '../core/SwapAntiThrash.js';
 import { shouldReleaseOnComplete, planClaimOnSpawn, ownershipNonce } from '../core/ownershipFollowsLiveWork.js';
 import { PrHandLease } from '../core/PrHandLease.js';
@@ -18433,6 +18434,13 @@ export async function startServer(options: StartOptions): Promise<void> {
       threadlineShutdown = threadline.shutdown;
       threadlineRelayClient = threadline.relayClient;
       threadlinePairingInvites = threadline.pairingInvites;
+      // An invite waiting for the operator's approval lives only in memory (its secret never
+      // touches disk), so an update restart would lose it. Hold automatic update restarts while
+      // one waits, each until its invite expires (docs/specs/a2a-pairing-invite-link.md §8).
+      {
+        const invFlow = threadline.pairingInvites?.flow;
+        if (invFlow instanceof MarkedPairingInviteFlow) autoUpdater.setRestartHold('pairing-invite', () => invFlow.restartHolds());
+      }
       threadlineGetLastRelayEvent = threadline.getLastRelayEvent;
       _threadlineBoot = threadline;
       // A2A cross-machine route §1: the boot-time standby fact, threaded from

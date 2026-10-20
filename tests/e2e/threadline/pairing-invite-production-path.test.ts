@@ -48,8 +48,8 @@ describe('invite pairing — production path', () => {
   let relayUrl: string;
   const sides: Side[] = [];
 
-  async function bootSide(name: string, port: number, encryptToPinned?: EncryptToPinnedMode, refuseDowngrade?: () => RefuseDowngradeMode): Promise<Side> {
-    const project = createTempProject();
+  async function bootSide(name: string, port: number, encryptToPinned?: EncryptToPinnedMode, refuseDowngrade?: () => RefuseDowngradeMode, reuseProject?: TempProject): Promise<Side> {
+    const project = reuseProject ?? createTempProject();
     const auth = `${name}-auth`;
     const boot = await bootstrapThreadline({
       agentName: name, ownerName: `${name}-owner`, stateDir: project.stateDir, projectDir: project.dir, port, relayEnabled: true, relayUrl,
@@ -349,5 +349,41 @@ describe('invite pairing — production path', () => {
     modeAtB = { enabled: false, dryRun: true };
     await sendPlaintext('plaintext, switch off again');
     await vi.waitFor(() => expect(passedAtB).toContain('plaintext, switch off again'), { timeout: 10_000 });
+  }, 60_000);
+
+  it('a server restart with an invite waiting: the invite is gone (its secret was in memory only), a notice says so, and pasting it again restores it', async () => {
+    const A = await bootSide('lyra', 4081);
+    const B = await bootSide('otto', 4082);
+    const made = await call(A, 'POST', '/threadline/pairing/invites', { ttlMinutes: 30 });
+    expect(made.status).toBe(200);
+    const message = made.body.message as string;
+    const exp = made.body.exp as string;
+    expect((await call(B, 'POST', '/threadline/pairing/invites/inspect', { invite: message })).status).toBe(200);
+    const before = await call(B, 'GET', '/threadline/pairing/invites');
+    expect((before.body.pendingAccepts as unknown[]).length).toBe(1);
+    expect(before.body.restartNotices).toEqual([]);
+
+    // Restart B: stop its server and Threadline, then boot both again on the same state dir.
+    await B.server.stop(); B.trust.shutdown(); await B.boot.shutdown();
+    sides.splice(sides.indexOf(B), 1);
+    const B2 = await bootSide('otto', 4082, undefined, undefined, B.project);
+    const after = await call(B2, 'GET', '/threadline/pairing/invites');
+    expect(after.status).toBe(200);
+    expect(after.body.pendingAccepts).toEqual([]);
+    const notices = after.body.restartNotices as Array<{ id: string; claimedAgent: string; claimedOwner: string; exp: string }>;
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ claimedAgent: 'lyra', claimedOwner: 'lyra-owner', exp });
+    expect(JSON.stringify(after.body)).not.toContain(message.slice(message.indexOf('tlinv1:'), message.indexOf('tlinv1:') + 40));
+
+    // Pasting the same invite again: waiting again, and the notice is gone.
+    expect((await call(B2, 'POST', '/threadline/pairing/invites/inspect', { invite: message })).status).toBe(200);
+    const again = await call(B2, 'GET', '/threadline/pairing/invites');
+    expect((again.body.pendingAccepts as unknown[]).length).toBe(1);
+    expect(again.body.restartNotices).toEqual([]);
+
+    // Dismiss: Bearer, 64-hex id; an unknown id is a 404, a malformed one a 400.
+    expect((await call(B2, 'DELETE', `/threadline/pairing/restart-notices/${'0'.repeat(64)}`)).status).toBe(404);
+    expect((await call(B2, 'DELETE', '/threadline/pairing/restart-notices/zz')).status).toBe(400);
+    expect((await call(B2, 'DELETE', `/threadline/pairing/restart-notices/${notices[0].id}`, undefined, false)).status).toBe(401);
   }, 60_000);
 });
