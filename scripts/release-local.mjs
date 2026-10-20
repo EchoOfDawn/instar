@@ -268,9 +268,13 @@ if (opts.pushOnly) {
     const st = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: cut.version, npmArgs: npmAuthArgs, delayMs: VIEW_RETRY_DELAY_MS });
     if (st !== 'published') {
       published = false;
+      // `unknown` (npm could not answer) is publishUnknown here, NOT pending —
+      // deliberately different from the smoke path below. --push-only has no
+      // evidence the upload was ever accepted, so it must not claim npm is
+      // reviewing it. Both outcomes stop and neither re-publishes.
       if (st === 'unknown') publishUnknown = true;
       else npmPending = true;
-      fail(`the working tree holds a release cut for ${cut.version}, but instar@${cut.version} is ${st === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --push-only never publishes and refuses until npm shows it.${st === 'absent' ? `\n${npmPendingNotice('instar', cut.version)}` : ''}`);
+      fail(`the working tree holds a release cut for ${cut.version}, but instar@${cut.version} is ${st === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --push-only never publishes and refuses until npm shows it.${st === 'absent' ? `\n${npmPendingNotice('instar', cut.version, { pushOnly: true })}` : ''}`);
     }
     console.log(`The working tree is exactly the release cut for v${cut.version}, which is on npm — committing it (hooks on).`);
     must('git', ['add', 'package.json', 'package-lock.json', 'upgrades/']);
@@ -288,9 +292,11 @@ if (opts.pushOnly) {
   const state = publishedStateAfterFailure({ run: quietRun, name: 'instar', version, npmArgs: npmAuthArgs, delayMs: VIEW_RETRY_DELAY_MS });
   if (state !== 'published') {
     published = false;
+    // As above: `unknown` is publishUnknown in --push-only (no evidence of an
+    // accepted upload), pending only on the smoke path. Both stop safely.
     if (state === 'unknown') publishUnknown = true;
     else npmPending = true;
-    fail(`instar@${version} is ${state === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --push-only only lands a version npm shows, and refuses until then.${state === 'absent' ? `\n${npmPendingNotice('instar', version)}` : ''}`);
+    fail(`instar@${version} is ${state === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --push-only only lands a version npm shows, and refuses until then.${state === 'absent' ? `\n${npmPendingNotice('instar', version, { pushOnly: true })}` : ''}`);
   }
   if (run('git', ['rev-parse', '--verify', '--quiet', `refs/tags/v${version}`], { capture: true, quiet: true }).status !== 0) {
     must('git', ['tag', `v${version}`]);
@@ -557,6 +563,10 @@ step('Post-publish smoke test (scripts/post-publish-smoke.mjs)');
     // One registry read decides what the failure means. Not visible → npm may be
     // holding it in review (PENDING); visible → the tarball failed the smoke test.
     const seen = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: VERSION, npmArgs: npmAuthArgs, retries: 0 });
+    // `unknown` counts as PENDING here, deliberately unlike --push-only (where
+    // it is publishUnknown): the smoke step only runs after `npm publish` was
+    // accepted, so a version npm cannot confirm is most likely still in review.
+    // Both treatments stop, keep the tree, and never re-publish.
     const verdict = smokeFailureVerdict(seen, 'instar', VERSION);
     if (verdict.pending) npmPending = true;
     fail(verdict.message);

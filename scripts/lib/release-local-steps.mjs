@@ -450,11 +450,18 @@ export function dirtyToolFilesOnly(porcelain) {
  * never a failed publish, and never a reason to publish again.
  * @returns {string}
  */
-export function npmPendingNotice(name, version) {
+export function npmPendingNotice(name, version, { pushOnly = false } = {}) {
   return [
     `npm has not shown ${name}@${version} yet. An accepted publish can sit in npm's "Validating" review`,
     `("Automated review hasn't finished") for well over the smoke window; the registry returns 404 until it ends.`,
     `Check as the package owner: https://www.npmjs.com/package/${name}?activeTab=versions`,
+    // --push-only cannot tell "accepted, under review" from "never published"
+    // (both read absent). The smoke path can: it only runs after npm accepted
+    // the upload, so it needs no such caveat.
+    ...(pushOnly
+      ? [`If ${name}@${version} was never published (for example the publish step itself failed), --push-only cannot land it:`,
+         `do not use --push-only; re-run release-local normally from a clean, up-to-date main.`]
+      : []),
     `Do NOT publish again. Re-run later; --push-only lands it once \`npm view ${name}@${version} version\` shows it:`,
   ].join('\n');
 }

@@ -127,6 +127,8 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
   - **not visible** → pending. The message says npm may be holding the version in review, gives the Versions-tab link, says not to publish again, and gives the `--push-only` command to re-run later;
   - **visible** → the published tarball really failed the smoke test.
 - `--push-only` keeps refusing while `npm view <name>@<v> version` does not show the version, with the same notice, and never says "Nothing was published". Once npm shows it, `--push-only` proceeds (commits the cut if it is still uncommitted, then pushes).
+- `--push-only` cannot tell "accepted, under review" from "never published", because both read absent. So its notice adds: if the version was never published (for example the publish step itself failed), do not use `--push-only`; re-run release-local normally.
+- An `unknown` registry answer (npm could not answer) is handled differently on the two paths, on purpose. The smoke path runs only after `npm publish` was accepted, so it counts `unknown` as pending. `--push-only` has no evidence of an accepted upload, so it reports `unknown` as UNKNOWN (`publishUnknown`) and does not claim npm is reviewing the version. Both stop, keep the tree, and never re-publish.
 
 **Code layout.** The decisions live in `scripts/lib/release-local-steps.mjs`: `refreshGateBaseRefs`, `pushReleaseAtomically`, `pushTagThenMain`, `isReleaseCutCommit` / `incomingCommits`, `workingTreeReleaseCut`, `headContainsRemoteMain`, `remoteTagSha`, `publishedStateAfterFailure`, `otpRequirement`, `ciRunState` / `activePublishRuns`, `ciGateAction` and `dirtyToolFilesOnly`. Each takes an injected `run(cmd, args)`, so the tests drive real git.
 
