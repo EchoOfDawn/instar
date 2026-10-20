@@ -22,6 +22,8 @@ import {
   pushReleaseAtomically,
   pushTagThenMain,
   publishedStateAfterFailure,
+  workingTreeReleaseCut,
+  remoteTagSha,
   isReleaseCutCommit,
   otpRequirement,
   ciRunState,
@@ -102,7 +104,7 @@ describe('release-local push + ref refresh (real git)', () => {
     const res = pushReleaseAtomically({ run: runner(clone, calls), remote: 'origin', version: '1.0.1' });
     expect(res.ok).toBe(false);
     expect(res.attempts).toBe(1);
-    expect(res.reason).toContain('did not move');
+    expect(res.reason).toContain('fast-forward');
     expect(res.output).toContain('HOOK SAYS NO');
     expect(calls.filter((c) => c[1] === 'push')).toHaveLength(1);
     expect(calls.some((c) => c[1] === 'rebase')).toBe(false);
@@ -180,7 +182,7 @@ describe('release-local push + ref refresh (real git)', () => {
     const calls: string[][] = [];
     const res = pushTagThenMain({ run: runner(clone, calls), remote: 'origin', version: '1.0.1' });
     expect(res.ok).toBe(false);
-    expect(res.reason).toContain('did not move');
+    expect(res.reason).toContain('fast-forward');
     expect(res.output).toContain('HOOK SAYS NO');
     expect(calls.some((c) => c[1] === 'rebase')).toBe(false);
   });
@@ -201,6 +203,65 @@ describe('release-local push + ref refresh (real git)', () => {
     expect(res.ok).toBe(false);
     expect(res.attempts).toBe(1);
     expect(g(bare, 'rev-parse', 'main')).toBe(before);
+  });
+
+  it('stale tracking ref + hook refusal: classified as a refusal at once (no rebase), not as "main moved"', () => {
+    // An extra commit so the tracking ref can be made stale.
+    fs.writeFileSync(path.join(other, 'c.txt'), 'c\n');
+    g(other, 'add', '-A');
+    g(other, 'commit', '-qm', 'older main tip');
+    g(other, 'push', '-q', 'origin', 'HEAD:main');
+    g(clone, 'fetch', '-q', 'origin', 'main');
+    g(clone, 'rebase', '-q', 'origin/main'); // our release commit now sits on the real tip
+    g(clone, 'update-ref', 'refs/remotes/origin/main', g(clone, 'rev-parse', 'HEAD~2')); // stale
+    const hook = path.join(clone, '.git', 'hooks', 'pre-push');
+    fs.writeFileSync(hook, '#!/bin/sh\necho "HOOK SAYS NO" >&2\nexit 1\n');
+    fs.chmodSync(hook, 0o755);
+    const calls: string[][] = [];
+    const res = pushReleaseAtomically({ run: runner(clone, calls), remote: 'origin', version: '1.0.1' });
+    expect(res.ok).toBe(false);
+    expect(res.attempts).toBe(1);
+    expect(res.reason).toContain('fast-forward');
+    expect(calls.some((c) => c[1] === 'rebase')).toBe(false);
+  });
+
+  it('names the CI race: the remote already has the tag on another commit', () => {
+    g(other, 'tag', 'v1.0.1');
+    g(other, 'push', '-q', 'origin', 'v1.0.1');
+    const res = pushReleaseAtomically({ run: runner(clone), remote: 'origin', version: '1.0.1' });
+    expect(res.ok).toBe(false);
+    expect(res.code).toBe('tag-exists');
+    expect(res.reason).toContain('already has tag v1.0.1');
+    expect(remoteTagSha(runner(clone), 'origin', 'v1.0.1')).toBe(g(other, 'rev-parse', 'HEAD'));
+  });
+
+  it('--keep-tag-on-published is resumable: tag already pushed, HEAD rebased off it → main push only', () => {
+    otherCodeMerge();
+    g(clone, 'tag', 'v1.0.1');
+    const published = g(clone, 'rev-parse', 'HEAD');
+    // First run: tag pushed, then the MAIN push refused by a hook after the rebase.
+    const hook = path.join(clone, '.git', 'hooks', 'pre-push');
+    fs.writeFileSync(hook, '#!/bin/sh\nwhile read l lsha r rsha; do case "$r" in refs/heads/main) [ -f "$BLOCK_FILE" ] && { echo "HOOK SAYS NO" >&2; exit 1; };; esac; done\nexit 0\n');
+    fs.chmodSync(hook, 0o755);
+    const block = path.join(tmp, 'BLOCK');
+    fs.writeFileSync(block, '');
+    ENV.BLOCK_FILE = block;
+    try {
+      const first = pushTagThenMain({ run: runner(clone), remote: 'origin', version: '1.0.1' });
+      expect(first.ok).toBe(false);
+      expect(g(bare, 'rev-parse', 'v1.0.1^{commit}')).toBe(published);
+      // The recovery text names the exact re-run and the by-hand push.
+      expect(first.reason).toContain('--push-only --keep-tag-on-published --remote origin');
+      expect(first.reason).toContain('git push origin HEAD:main');
+      // HEAD has moved off the tag (rebased) — the old code refused a re-run here.
+      fs.rmSync(block);
+      const second = pushTagThenMain({ run: runner(clone), remote: 'origin', version: '1.0.1' });
+      expect(second).toMatchObject({ ok: true });
+      expect(g(bare, 'rev-parse', 'v1.0.1^{commit}')).toBe(published);
+      expect(g(bare, 'log', '-1', '--format=%s', 'main')).toBe('chore: release v1.0.1 [skip ci]');
+    } finally {
+      delete ENV.BLOCK_FILE;
+    }
   });
 
   it('refreshes every existing gate base ref and skips ones that do not exist', () => {
@@ -239,23 +300,41 @@ describe('release-local push + ref refresh (real git)', () => {
 
 describe('publishedStateAfterFailure', () => {
   const fake = (r: R) => () => r;
+  const noSleep = () => {};
+  const E404: R = { status: 1, stdout: '', stderr: 'npm error code E404\nnpm error 404 No match found for version 1.2.3' };
   it('published when the registry returns the version', () => {
-    expect(publishedStateAfterFailure({ run: fake({ status: 0, stdout: '1.2.3\n', stderr: '' }), name: 'x', version: '1.2.3' })).toBe('published');
+    expect(publishedStateAfterFailure({ run: fake({ status: 0, stdout: '1.2.3\n', stderr: '' }), name: 'x', version: '1.2.3', sleep: noSleep })).toBe('published');
   });
-  it('absent on E404', () => {
-    expect(publishedStateAfterFailure({ run: fake({ status: 1, stdout: '', stderr: 'npm error code E404\nnpm error 404 No match found for version 1.2.3' }), name: 'x', version: '1.2.3' })).toBe('absent');
+  it('absent on E404 — but only after re-querying (registry lag)', () => {
+    let n = 0;
+    const sleeps: number[] = [];
+    const res = publishedStateAfterFailure({ run: () => { n++; return E404; }, name: 'x', version: '1.2.3', sleep: (ms: number) => sleeps.push(ms) });
+    expect(res).toBe('absent');
+    expect(n).toBe(4); // first answer + 3 re-queries
+    expect(sleeps).toEqual([10_000, 10_000, 10_000]); // ~30s by default
   });
-  it('unknown on a network or auth error — never treated as absent', () => {
-    expect(publishedStateAfterFailure({ run: fake({ status: 1, stdout: '', stderr: 'npm error code ETIMEDOUT' }), name: 'x', version: '1.2.3' })).toBe('unknown');
-    expect(publishedStateAfterFailure({ run: fake({ status: 0, stdout: '1.2.2', stderr: '' }), name: 'x', version: '1.2.3' })).toBe('unknown');
+  it('an absent that turns published during the re-queries is published', () => {
+    const answers: R[] = [E404, E404, { status: 0, stdout: '1.2.3', stderr: '' }];
+    let i = 0;
+    expect(publishedStateAfterFailure({ run: () => answers[Math.min(i++, answers.length - 1)], name: 'x', version: '1.2.3', sleep: noSleep })).toBe('published');
   });
-  it('asks the registry for exactly name@version', () => {
+  it('a TIMED-OUT publish that still reads absent is UNKNOWN, never absent', () => {
+    expect(publishedStateAfterFailure({ run: fake(E404), name: 'x', version: '1.2.3', timedOut: true, sleep: noSleep })).toBe('unknown');
+    expect(publishedStateAfterFailure({ run: fake(E404), name: 'x', version: '1.2.3', timedOut: false, sleep: noSleep })).toBe('absent');
+  });
+  it('unknown on a network or auth error — never treated as absent, and not re-queried as if absent', () => {
+    let n = 0;
+    expect(publishedStateAfterFailure({ run: () => { n++; return { status: 1, stdout: '', stderr: 'npm error code ETIMEDOUT' }; }, name: 'x', version: '1.2.3', sleep: noSleep })).toBe('unknown');
+    expect(n).toBe(1);
+    expect(publishedStateAfterFailure({ run: fake({ status: 0, stdout: '1.2.2', stderr: '' }), name: 'x', version: '1.2.3', sleep: noSleep })).toBe('unknown');
+  });
+  it('asks the registry online (not the npm cache) for exactly name@version', () => {
     const calls: string[][] = [];
     publishedStateAfterFailure({
       run: (c: string, a: string[]) => { calls.push([c, ...a]); return { status: 0, stdout: '1.2.3', stderr: '' }; },
-      name: 'instar', version: '1.2.3', npmArgs: ['--userconfig', '/x'],
+      name: 'instar', version: '1.2.3', npmArgs: ['--userconfig', '/x'], sleep: noSleep,
     });
-    expect(calls).toEqual([['npm', 'view', 'instar@1.2.3', 'version', '--userconfig', '/x']]);
+    expect(calls).toEqual([['npm', 'view', 'instar@1.2.3', 'version', '--prefer-online', '--userconfig', '/x']]);
   });
 });
 
@@ -406,6 +485,130 @@ describe('ciGateAction', () => {
   });
 });
 
+describe('--push-only resumes a release that failed between publish and commit (real CLI, bare remote)', () => {
+  // Echo #2225 blocker. Both failure points leave the SAME state — npm has the
+  // version, the release cut is in the working tree, HEAD is still main:
+  //   (a) the post-publish smoke test failed;
+  //   (b) a pre-commit hook refused the release commit.
+  // Each test builds that state, then runs the REAL CLI's --push-only to
+  // completion against a bare remote. A PATH shim answers `npm view`.
+  const ROOT_REPO = path.join(__dirname, '..', '..');
+  let tmp: string;
+  let bare: string;
+  let clone: string;
+  let bin: string;
+  const g = (cwd: string, ...args: string[]) => {
+    const r = runner(cwd)('git', args);
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const write = (rel: string, body: string) => {
+    fs.mkdirSync(path.dirname(path.join(clone, rel)), { recursive: true });
+    fs.writeFileSync(path.join(clone, rel), body);
+  };
+  const pkg = (v: string) => JSON.stringify({ name: 'instar', version: v, dependencies: { a: '^1.0.0' } }, null, 2) + '\n';
+  const lock = (v: string) => JSON.stringify({ name: 'instar', version: v, lockfileVersion: 3, packages: { '': { name: 'instar', version: v } } }, null, 2) + '\n';
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'release-local-resume-'));
+    bare = path.join(tmp, 'remote.git');
+    clone = path.join(tmp, 'clone');
+    bin = path.join(tmp, 'bin');
+    g(tmp, 'init', '--bare', '--initial-branch=main', bare);
+    g(tmp, 'clone', '-q', bare, clone);
+    for (const f of ['scripts/release-local.mjs', 'scripts/lib/release-local-steps.mjs', 'scripts/release-cut-diff.mjs']) {
+      write(f, fs.readFileSync(path.join(ROOT_REPO, f), 'utf-8'));
+    }
+    write('package.json', pkg('1.0.0'));
+    write('package-lock.json', lock('1.0.0'));
+    write('upgrades/1.0.0.md', '# 1.0.0\n');
+    write('upgrades/next/fix.md', '# a fix\n');
+    g(clone, 'add', '-A');
+    g(clone, 'commit', '-qm', 'base: a merged fix with its fragment');
+    g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    // npm shim: instar@1.0.1 is on the registry (it was published).
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'npm'), '#!/bin/sh\nif [ "$1" = view ] && [ "$2" = "instar@1.0.1" ]; then echo 1.0.1; exit 0; fi\necho "npm error code E404" >&2; exit 1\n');
+    fs.chmodSync(path.join(bin, 'npm'), 0o755);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** What steps 6-7 leave in the tree: the release cut for 1.0.1, uncommitted. */
+  function releaseCutInTree() {
+    write('package.json', pkg('1.0.1'));
+    write('package-lock.json', lock('1.0.1'));
+    fs.renameSync(path.join(clone, 'upgrades/next/fix.md'), path.join(clone, 'upgrades/1.0.1.md'));
+  }
+  function pushOnly() {
+    const r = spawnSync(process.execPath, [path.join(clone, 'scripts', 'release-local.mjs'), '--push-only', '--remote', 'origin'], {
+      cwd: clone,
+      env: { ...ENV, PATH: `${bin}:${process.env.PATH}`, INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS: '0' },
+      encoding: 'utf-8',
+    });
+    return { status: r.status, out: `${r.stdout}\n${r.stderr}` };
+  }
+  function assertLanded() {
+    const head = g(clone, 'rev-parse', 'HEAD');
+    expect(g(bare, 'rev-parse', 'main')).toBe(head);
+    expect(g(bare, 'log', '-1', '--format=%s', 'main')).toBe('chore: release v1.0.1 [skip ci]');
+    expect(g(bare, 'rev-parse', 'v1.0.1^{commit}')).toBe(head);
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  }
+
+  it('(a) smoke failed after publish: --push-only commits the cut (hooks on) and lands it', () => {
+    releaseCutInTree(); // publish succeeded, smoke failed → fail() before any commit
+    const r = pushOnly();
+    expect(r.out).toContain('exactly the release cut for v1.0.1');
+    expect(r.status).toBe(0);
+    assertLanded();
+  });
+
+  it('(b) a pre-commit hook refused the release commit: --push-only stops while it still refuses, then lands once fixed', () => {
+    releaseCutInTree();
+    const block = path.join(tmp, 'BLOCK');
+    fs.writeFileSync(block, '');
+    const hook = path.join(clone, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, `#!/bin/sh\nif [ -f "${block}" ]; then echo "PRECOMMIT SAYS NO" >&2; exit 1; fi\nexit 0\n`);
+    fs.chmodSync(hook, 0o755);
+    // The release's own commit is refused (what step 12 hit):
+    g(clone, 'add', 'package.json', 'package-lock.json', 'upgrades/');
+    expect(runner(clone)('git', ['commit', '-m', 'chore: release v1.0.1 [skip ci]']).status).not.toBe(0);
+    const before = g(bare, 'rev-parse', 'main');
+    // Resume while the hook still refuses: stops, pushes nothing, keeps the tree.
+    const stuck = pushOnly();
+    expect(stuck.status).toBe(1);
+    expect(stuck.out).toContain('PRECOMMIT SAYS NO');
+    expect(g(bare, 'rev-parse', 'main')).toBe(before);
+    expect(g(clone, 'status', '--porcelain')).not.toBe('');
+    // Fix the cause, resume again: lands.
+    fs.rmSync(block);
+    const r = pushOnly();
+    expect(r.status).toBe(0);
+    assertLanded();
+  });
+
+  it('refuses a dirty tree that is NOT exactly a release cut', () => {
+    releaseCutInTree();
+    write('scripts/extra.mjs', 'export {};\n');
+    const r = pushOnly();
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('not exactly a release cut');
+  });
+
+  it('refuses to commit a cut for a version npm does not have', () => {
+    write('package.json', pkg('1.0.2'));
+    write('package-lock.json', lock('1.0.2'));
+    fs.renameSync(path.join(clone, 'upgrades/next/fix.md'), path.join(clone, 'upgrades/1.0.2.md'));
+    const r = pushOnly();
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('NOT on npm');
+    expect(g(clone, 'log', '-1', '--format=%s')).toBe('base: a merged fix with its fragment');
+  });
+});
+
 describe('release-local.mjs wiring', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', '..', 'scripts', 'release-local.mjs'), 'utf-8');
   it('uses the atomic push, refreshes gate refs before publishing, and resolves a failed publish against npm', () => {
@@ -461,6 +664,28 @@ describe('release-local.mjs wiring', () => {
   it('the dirty-tree preflight tolerates tool files only with the flag, and fails otherwise', () => {
     expect(src).toContain('if (opts.allowDirtyToolFiles && check.ok) {');
     expect(src).toMatch(/if \(opts\.allowDirtyToolFiles && !opts\.dryRun\) \{[^\n]*process\.exit\(2\)/);
+  });
+  it('between publish and commit, a failure prints the uncommitted-cut recovery (not "keep the commit and tag")', () => {
+    const failFn = src.slice(src.indexOf('function fail('), src.indexOf('function stopCleanly('));
+    expect(failFn).toMatch(/\} else if \(published && !committed\) \{/);
+    expect(failFn.indexOf('published && !committed')).toBeLessThan(failFn.indexOf('} else if (published) {'));
+    expect(failFn).toContain('git add package.json package-lock.json upgrades/ && git commit -m "chore: release v${v} [skip ci]"');
+    // smoke stays before the commit (publish.yml order), and `committed` is set only after the commit
+    const publish = src.indexOf("run('npm', ['publish'");
+    const smoke = src.indexOf("must('node', ['scripts/post-publish-smoke.mjs'");
+    const commit = src.indexOf("must('git', ['commit', '-m', `chore: release v${VERSION} [skip ci]`]);");
+    const flag = src.indexOf('committed = true;', commit);
+    expect(publish).toBeLessThan(smoke);
+    expect(smoke).toBeLessThan(commit);
+    expect(flag).toBeGreaterThan(commit);
+    const commitLine = "must('git', ['commit', '-m', `chore: release v${VERSION} [skip ci]`]);";
+    expect(src.slice(commit + commitLine.length, flag).trim()).toBe('');
+  });
+  it('a timed-out publish is passed to the registry check as timed out', () => {
+    expect(src).toContain('timedOut: Boolean(pub.timedOut)');
+  });
+  it('the build runs with NODE_ENV=development, like the install', () => {
+    expect(src).toMatch(/must\('npm', \['run', 'build'\], \{ env: \{ \.\.\.process\.env, NODE_ENV: 'development' \} \}\)/);
   });
   it('--push-only lands only a version already on npm, and never publishes', () => {
     const flow = src.slice(src.indexOf('if (opts.pushOnly) {'), src.indexOf('// ── 0. preflight'));

@@ -34,6 +34,27 @@ export function refreshGateBaseRefs(run) {
   return { ok: failed.length === 0, refreshed, failed };
 }
 
+/** The sha a remote's tag points at (peeled when annotated), or null. */
+export function remoteTagSha(run, remote, tag) {
+  const r = run('git', ['ls-remote', '--tags', remote, `refs/tags/${tag}`, `refs/tags/${tag}^{}`]);
+  if (r.status !== 0) return null;
+  const lines = r.stdout.split('\n').filter(Boolean).map((l) => l.split('\t'));
+  const peeled = lines.find((l) => l[1] === `refs/tags/${tag}^{}`);
+  const plain = lines.find((l) => l[1] === `refs/tags/${tag}`);
+  return (peeled || plain || [null])[0];
+}
+
+/**
+ * Does HEAD already contain `<remote>/main`? If so, a refused push was a
+ * fast-forward that something refused (a hook, a permission, an existing tag);
+ * if not, main has commits HEAD lacks. This replaces comparing the tracking
+ * ref before vs after the push, which misreads a refusal whenever the tracking
+ * ref was stale (or was refreshed just before the push).
+ */
+export function headContainsRemoteMain(run, remote) {
+  return run('git', ['merge-base', '--is-ancestor', `refs/remotes/${remote}/main`, 'HEAD']).status === 0;
+}
+
 function revParse(run, ref) {
   const r = run('git', ['rev-parse', '--verify', '--quiet', ref]);
   return r.status === 0 ? r.stdout.trim() : null;
@@ -95,6 +116,9 @@ export function pushReleaseAtomically({ run, remote, version, maxAttempts = 5, l
   if (!tagHere()) return { ok: false, attempts: 0, reason: `could not create tag ${tag}` };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Fetch first: --remote need not be one of the gate remotes refreshed in
+    // preflight, so its tracking ref may be stale.
+    run('git', ['fetch', '--quiet', remote, 'main']);
     const before = revParse(run, `refs/remotes/${remote}/main`);
     const p = run('git', ['push', '--atomic', remote, 'HEAD:main', tag]);
     if (p.status === 0) return { ok: true, attempts: attempt };
@@ -105,11 +129,22 @@ export function pushReleaseAtomically({ run, remote, version, maxAttempts = 5, l
       return { ok: false, attempts: attempt, reason: `push refused and ${remote} could not be fetched to tell why`, output };
     }
     const after = revParse(run, `refs/remotes/${remote}/main`);
-    if (after === before) {
+    const fastForward = headContainsRemoteMain(run, remote);
+    const remoteTag = remoteTagSha(run, remote, tag);
+    if (remoteTag && remoteTag !== revParse(run, `refs/tags/${tag}^{commit}`)) {
       return {
         ok: false,
         attempts: attempt,
-        reason: `push refused but ${remote}/main did not move (${(after || 'none').slice(0, 10)}) — a hook or permission refused it; rebasing would not help`,
+        code: 'tag-exists',
+        reason: `${remote} already has tag ${tag} on a different commit (${remoteTag.slice(0, 10)}) — another publisher, most likely a publish.yml run, released this version. Nothing was pushed (atomic).`,
+        output,
+      };
+    }
+    if (fastForward) {
+      return {
+        ok: false,
+        attempts: attempt,
+        reason: `push refused although it was a fast-forward (HEAD already contains ${remote}/main ${(after || 'none').slice(0, 10)}) — a hook or permission refused it; rebasing would not help`,
         output,
       };
     }
@@ -136,22 +171,66 @@ export function pushReleaseAtomically({ run, remote, version, maxAttempts = 5, l
   return { ok: false, attempts: maxAttempts, reason: `could not push the release commit after ${maxAttempts} rebase-retries` };
 }
 
-/**
- * After `npm publish` exits non-zero, decide whether the version is on npm
- * anyway (a timeout after the upload, a failing postpublish, a flaky network).
- * @param {{ run: Function, name: string, version: string, npmArgs?: string[] }} o
- * @returns {'published'|'absent'|'unknown'}
- */
-export function publishedStateAfterFailure({ run, name, version, npmArgs = [] }) {
-  const r = run('npm', ['view', `${name}@${version}`, 'version', ...npmArgs]);
+/** Synchronous sleep (the CLI is a synchronous sequence). */
+export function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function viewOnce(run, name, version, npmArgs) {
+  // --prefer-online: never answer from npm's local cache, which right after a
+  // failed publish can still hold "no such version".
+  const r = run('npm', ['view', `${name}@${version}`, 'version', '--prefer-online', ...npmArgs]);
   const out = (r.stdout || '').trim();
   if (r.status === 0 && out === version) return 'published';
-  // npm view prints nothing and exits 0 for a version that does not exist (in
-  // some npm versions), or exits non-zero with E404. Anything else — a network
-  // error, an auth error — is not evidence of absence.
+  // Absent: exit 0 with no output (some npm versions) or E404.
   if (r.status === 0 && out === '') return 'absent';
   if (r.status !== 0 && /E404|404 Not Found|is not in this registry/i.test(`${r.stderr || ''}${r.stdout || ''}`)) return 'absent';
+  // Anything else (network, auth, a different version) is not evidence of absence.
   return 'unknown';
+}
+
+/**
+ * After `npm publish` exits non-zero (or times out), decide whether the
+ * version is on npm anyway. An "absent" answer straight after a publish can be
+ * registry lag, so it is re-queried `retries` times `delayMs` apart (~30s by
+ * default). If the publish TIMED OUT and npm still says absent, the answer is
+ * 'unknown': a timed-out upload may still land, and calling it absent would
+ * restore the tree and orphan the real version.
+ * @returns {'published'|'absent'|'unknown'}
+ */
+export function publishedStateAfterFailure({ run, name, version, npmArgs = [], timedOut = false, retries = 3, delayMs = 10_000, sleep = sleepSync }) {
+  let state = viewOnce(run, name, version, npmArgs);
+  for (let i = 0; i < retries && state === 'absent'; i++) {
+    sleep(delayMs);
+    state = viewOnce(run, name, version, npmArgs);
+  }
+  if (state === 'absent' && timedOut) return 'unknown';
+  return state;
+}
+
+/**
+ * Is the WORKING TREE (vs HEAD) exactly a release cut? This is the state left
+ * when a release fails after `npm publish` but before its commit (the smoke
+ * test, or a pre-commit hook refusal). Tracked changes come from `git diff
+ * --name-status --no-renames HEAD`, untracked files count as added, and the
+ * head side is read from disk. The same #2222 rule decides.
+ * @param {Function} run
+ * @param {(p: string) => (string|null)} readWorktree
+ */
+export function workingTreeReleaseCut(run, readWorktree) {
+  const d = run('git', ['diff', '--name-status', '--no-renames', 'HEAD']);
+  const u = run('git', ['ls-files', '--others', '--exclude-standard']);
+  if (d.status !== 0 || u.status !== 0) return { isCut: false, version: null, reason: 'git failed' };
+  const entries = d.stdout.split('\n').filter(Boolean).map((line) => {
+    const [status, ...rest] = line.split('\t');
+    return { status: status.trim(), path: rest.join('\t').trim() };
+  });
+  for (const f of u.stdout.split('\n').filter(Boolean)) entries.push({ status: 'A', path: f.trim() });
+  const readBase = (f) => {
+    const r = run('git', ['show', `HEAD:${f}`]);
+    return r.status === 0 ? r.stdout : null;
+  };
+  return classifyReleaseCut({ entries, readBase, readHead: readWorktree });
 }
 
 /**
@@ -167,30 +246,49 @@ export function pushTagThenMain({ run, remote, version, maxAttempts = 5, log = (
   const head = revParse(run, 'HEAD');
   const tagged = revParse(run, `refs/tags/${tag}^{commit}`);
   if (!tagged) return { ok: false, attempts: 0, reason: `local tag ${tag} does not exist` };
-  if (tagged !== head) return { ok: false, attempts: 0, reason: `local tag ${tag} is not on HEAD — run this from the published release commit` };
-  const t = run('git', ['push', remote, `refs/tags/${tag}`]);
-  if (t.status !== 0) {
-    return { ok: false, attempts: 0, reason: `could not push tag ${tag}`, output: `${t.stdout || ''}${t.stderr || ''}`.trim() };
+  const remoteTag = remoteTagSha(run, remote, tag);
+  if (remoteTag && remoteTag !== tagged) {
+    return { ok: false, attempts: 0, code: 'tag-exists', reason: `${remote} already has tag ${tag} on a different commit (${remoteTag.slice(0, 10)}) — another publisher released this version` };
   }
+  // Resumable: once the tag is on the remote (a previous keep-tag run pushed it
+  // and then the MAIN push was refused after a rebase), HEAD has legitimately
+  // moved off the tag. Only a FIRST run requires the tag to be on HEAD.
+  if (!remoteTag) {
+    if (tagged !== head) return { ok: false, attempts: 0, reason: `local tag ${tag} is not on HEAD — run this from the published release commit` };
+    const t = run('git', ['push', remote, `refs/tags/${tag}`]);
+    if (t.status !== 0) {
+      return { ok: false, attempts: 0, reason: `could not push tag ${tag}`, output: `${t.stdout || ''}${t.stderr || ''}`.trim() };
+    }
+  } else {
+    log(`${remote} already has ${tag} on the published commit ${tagged.slice(0, 10)} — resuming with the main push only`);
+  }
+  const recovery = (why) => {
+    const now = String(revParse(run, 'HEAD'));
+    return `${why}\n` +
+      `  Tag ${tag} is on ${remote} at the published commit ${tagged.slice(0, 10)} and stays there.\n` +
+      `  HEAD (${now.slice(0, 10)}) is the release commit${now === tagged ? '' : ', rebased onto main'}.\n` +
+      `  Fix the cause, then re-run: node scripts/release-local.mjs --push-only --keep-tag-on-published --remote ${remote}\n` +
+      `  (it sees ${tag} already on ${remote} and only pushes HEAD:main), or by hand: git push ${remote} HEAD:main`;
+  };
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    run('git', ['fetch', '--quiet', remote, 'main']);
     const before = revParse(run, `refs/remotes/${remote}/main`);
     const p = run('git', ['push', remote, 'HEAD:main']);
     if (p.status === 0) return { ok: true, attempts: attempt };
     const output = `${p.stdout || ''}${p.stderr || ''}`.trim();
     if (run('git', ['fetch', '--quiet', remote, 'main']).status !== 0) {
-      return { ok: false, attempts: attempt, reason: `push refused and ${remote} could not be fetched to tell why`, output };
+      return { ok: false, attempts: attempt, reason: recovery(`push refused and ${remote} could not be fetched to tell why`), output };
     }
-    const after = revParse(run, `refs/remotes/${remote}/main`);
-    if (after === before) {
-      return { ok: false, attempts: attempt, reason: `push refused but ${remote}/main did not move — a hook or permission refused it`, output };
+    if (headContainsRemoteMain(run, remote)) {
+      return { ok: false, attempts: attempt, reason: recovery(`push refused although it was a fast-forward (HEAD already contains ${remote}/main) — a hook or permission refused it`), output };
     }
-    log(`main moved; rebasing the release commit (tag ${tag} stays on the published commit) (attempt ${attempt})`);
+    log(`main moved (${String(before).slice(0, 10)} → ${String(revParse(run, `refs/remotes/${remote}/main`)).slice(0, 10)}); rebasing the release commit (tag ${tag} stays on the published commit) (attempt ${attempt})`);
     if (run('git', ['rebase', `${remote}/main`]).status !== 0) {
       run('git', ['rebase', '--abort']);
-      return { ok: false, attempts: attempt, reason: 'the release commit could not be rebased cleanly onto main (conflict) — aborted rather than force-pushing', output };
+      return { ok: false, attempts: attempt, reason: recovery('the release commit could not be rebased cleanly onto main (conflict) — aborted rather than force-pushing'), output };
     }
   }
-  return { ok: false, attempts: maxAttempts, reason: `could not push the release commit after ${maxAttempts} rebase-retries` };
+  return { ok: false, attempts: maxAttempts, reason: recovery(`could not push the release commit after ${maxAttempts} rebase-retries`) };
 }
 
 /**

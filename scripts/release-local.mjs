@@ -58,6 +58,7 @@ import {
   pushTagThenMain,
   publishedStateAfterFailure,
   isReleaseCutCommit,
+  workingTreeReleaseCut,
   otpRequirement,
   activePublishRuns,
   dirtyToolFilesOnly,
@@ -68,6 +69,12 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SEMVER = /^\d+\.\d+\.\d+$/;
 // prepublishOnly rebuilds before uploading; 20 min is far above a normal publish.
 const PUBLISH_TIMEOUT_MS = 20 * 60 * 1000;
+// Spacing of the npm re-queries after a failed publish (~30s over 3 retries).
+// The env override exists only so tests need not wait; it can only be set lower
+// by intent, and the number of re-queries is fixed.
+const VIEW_RETRY_DELAY_MS = Number(process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS) >= 0 && process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS !== undefined
+  ? Number(process.env.INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS)
+  : 10_000;
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -122,6 +129,8 @@ const npmAuthArgs = opts.userconfig ? ['--userconfig', opts.userconfig] : [];
 let stepNo = 0;
 let touchedTree = false; // set once this script edits tracked files
 let published = false;
+let committed = false; // the release commit exists (set after `git commit` succeeds)
+let VERSION_FOR_MSG = null; // the version being released, for recovery messages
 let publishUnknown = false; // npm publish failed and the registry could not confirm either way
 let START_SHA = null; // origin/main when the release began (the merge being shipped)
 let SLUG = null;      // owner/repo of the remote, for the gh run check
@@ -174,6 +183,15 @@ function fail(msg) {
   if (publishUnknown) {
     console.error('  It is UNKNOWN whether this version reached npm. The tree was NOT restored.');
     console.error('  If `npm view` shows it, land the release commit by hand; if not, re-run.');
+  } else if (published && !committed) {
+    const v = VERSION_FOR_MSG || '<version>';
+    console.error(`  The version IS on npm, but the release commit was NOT made. Nothing was undone: the`);
+    console.error('  working tree still holds the release cut (package.json, package-lock.json, upgrades/).');
+    console.error('  Fix the cause, then let --push-only commit the cut (hooks on) and push it — it never re-publishes:');
+    console.error(`    node scripts/release-local.mjs --push-only --remote ${opts.remote}${opts.userconfig ? ` --userconfig ${opts.userconfig}` : ''}`);
+    console.error('  Or by hand:');
+    console.error(`    git add package.json package-lock.json upgrades/ && git commit -m "chore: release v${v} [skip ci]"`);
+    console.error(`    node scripts/release-local.mjs --push-only --remote ${opts.remote}`);
   } else if (published) {
     console.error('  The version IS on npm. Nothing was undone. Keep the local release commit and tag.');
     console.error(`  Fix the cause, then resume the push only (no re-publish):`);
@@ -227,14 +245,40 @@ if (opts.pushOnly) {
   published = true; // by precondition below; makes every failure message say so
   step('Check the release commit and that its version is on npm');
   const dirty = must('git', ['status', '--porcelain', '--untracked-files=all'], { capture: true, quiet: true }).stdout.trim();
-  if (dirty) fail(`the working tree is not clean:\n${dirty.split('\n').slice(0, 10).join('\n')}`);
+  if (dirty) {
+    // A release that failed after `npm publish` but before its commit (smoke
+    // test, pre-commit hook) leaves the release cut in the working tree. Commit
+    // it here — only when the dirty paths are EXACTLY a release cut, HEAD is on
+    // main's history, and that version is already on npm.
+    const readWorktree = (f) => { try { return fs.readFileSync(path.join(ROOT, f), 'utf-8'); } catch { return null; } };
+    const cut = workingTreeReleaseCut(quietRun, readWorktree);
+    if (!cut.isCut) { published = false; fail(`the working tree is not clean and is not exactly a release cut (${cut.reason}):\n${dirty.split('\n').slice(0, 10).join('\n')}`); }
+    must('git', ['fetch', '--quiet', opts.remote, 'main']);
+    if (run('git', ['merge-base', '--is-ancestor', 'HEAD', `${opts.remote}/main`], { capture: true, quiet: true }).status !== 0) {
+      published = false;
+      fail(`HEAD is not on ${opts.remote}/main's history — refusing to commit a release cut on top of it`);
+    }
+    VERSION_FOR_MSG = cut.version;
+    const st = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: cut.version, npmArgs: npmAuthArgs, delayMs: VIEW_RETRY_DELAY_MS });
+    if (st !== 'published') {
+      published = false;
+      if (st === 'unknown') publishUnknown = true;
+      fail(`the working tree holds a release cut for ${cut.version}, but instar@${cut.version} is ${st === 'absent' ? 'NOT' : 'not confirmed'} on npm — --push-only never publishes`);
+    }
+    console.log(`The working tree is exactly the release cut for v${cut.version}, which is on npm — committing it (hooks on).`);
+    must('git', ['add', 'package.json', 'package-lock.json', 'upgrades/']);
+    must('git', ['commit', '-m', `chore: release v${cut.version} [skip ci]`]);
+    committed = true;
+  } else {
+    committed = true;
+  }
   const subject = must('git', ['log', '-1', '--format=%s', 'HEAD'], { capture: true, quiet: true }).stdout.trim();
   const m = /^chore: release v(\d+\.\d+\.\d+) \[skip ci\]$/.exec(subject);
   if (!m) { published = false; fail(`HEAD is not a release commit ("${subject}")`); }
   const version = m[1];
   if (!isReleaseCutCommit(quietRun, 'HEAD')) { published = false; fail('HEAD is not purely a release cut (version fields, one guide, consumed fragments)'); }
   if (readPkgVersion() !== version) { published = false; fail(`package.json says ${readPkgVersion()}, the commit says ${version}`); }
-  const state = publishedStateAfterFailure({ run: quietRun, name: 'instar', version, npmArgs: npmAuthArgs });
+  const state = publishedStateAfterFailure({ run: quietRun, name: 'instar', version, npmArgs: npmAuthArgs, delayMs: VIEW_RETRY_DELAY_MS });
   if (state !== 'published') {
     published = false;
     if (state === 'unknown') publishUnknown = true;
@@ -343,7 +387,9 @@ step('npm ci (dev dependencies included)');
 must('npm', ['ci', '--include=dev'], { env: { ...process.env, NODE_ENV: 'development' } });
 
 step('npm run build');
-must('npm', ['run', 'build']);
+// Same environment as the install: a workstation NODE_ENV=production must not
+// change what the build does relative to CI.
+must('npm', ['run', 'build'], { env: { ...process.env, NODE_ENV: 'development' } });
 
 // ── 3-4. release notes ────────────────────────────────────────────────
 step('Assemble release-note fragments (scripts/assemble-next-md.mjs)');
@@ -407,6 +453,7 @@ let VERSION;
   VERSION = must('node', ['scripts/resolve-publish-version.mjs', localVersion, npmVersion], { capture: true }).stdout.trim();
   if (!SEMVER.test(VERSION)) fail(`resolve-publish-version printed ${JSON.stringify(VERSION)}, not X.Y.Z`);
   console.log(`resolved:       ${VERSION}`);
+  VERSION_FOR_MSG = VERSION;
   must('npm', ['version', VERSION, '--no-git-tag-version', '--allow-same-version']);
   if (readPkgVersion() !== VERSION) fail(`npm version did not set package.json to ${VERSION}`);
 }
@@ -481,7 +528,7 @@ console.log('      attestation; everything else matches publish.yml.');
   } else {
     // npm can exit non-zero after the upload landed (timeout, flaky network).
     // Ask the registry before deciding which failure this is.
-    const state = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: VERSION, npmArgs: npmAuthArgs });
+    const state = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: VERSION, npmArgs: npmAuthArgs, timedOut: Boolean(pub.timedOut), delayMs: VIEW_RETRY_DELAY_MS });
     if (state === 'published') {
       published = true;
       console.log(`npm publish exited ${pub.status}, but instar@${VERSION} IS on npm — continuing down the published path.`);
@@ -502,6 +549,7 @@ must('node', ['scripts/post-publish-smoke.mjs', VERSION]);
 step(`Commit "chore: release v${VERSION} [skip ci]" (hooks run) and push to main`);
 must('git', ['add', 'package.json', 'package-lock.json', 'upgrades/']);
 must('git', ['commit', '-m', `chore: release v${VERSION} [skip ci]`]);
+committed = true;
 {
   const refs = refreshGateBaseRefs(quietRun);
   if (!refs.ok) fail(`cannot refresh ${refs.failed.map((f) => f.ref).join(', ')} before the push — the pre-push gate would diff against a stale base`);

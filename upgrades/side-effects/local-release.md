@@ -16,6 +16,13 @@ Adds `scripts/release-local.mjs` (`npm run release:local`), which runs the `publ
 
 `scripts/lint-no-direct-destructive.js` allowlists the script, which runs before `dist/` exists and so cannot import SafeGitExecutor. `CONTRIBUTING.md` gains "Releasing (maintainers)". The spec is `docs/specs/local-release.md` (approved by Justin, 2026-10-20). It depends on #2222, which makes the pre-push gate accept a release cut commit.
 
+**Round 4 (Echo's review of #2225 at 48b54e4f5).**
+- **Blocker:** a failure between publish and commit (smoke test, or a pre-commit refusal) now prints a working resume. `--push-only` commits an uncommitted release cut itself when the tree is exactly a cut for a version npm already has.
+- **Registry check:** `--prefer-online`, with re-queries over ~30 s. A timed-out publish that still reads absent is UNKNOWN.
+- **Push refusals** are classified by ancestry, not by comparing before/after shas (fetching first made that comparison wrong). The tag-exists CI race is named.
+- **`--keep-tag-on-published`** is resumable, with exact recovery steps printed.
+- **The build** runs with `NODE_ENV=development`.
+
 ## Decision-point inventory
 
 - **No agent runtime decision point.** This is maintainer tooling; it is in the npm `files` payload only because `scripts/` is.
@@ -33,12 +40,14 @@ Adds `scripts/release-local.mjs` (`npm run release:local`), which runs the `publ
 - **Unrelated workflow runs.** It refuses while ANY publish.yml run is unfinished, even one that would find nothing to publish. Intended: a queued run publishes whatever main is when it starts, and refusing costs one cancel.
 - **gh unavailable.** It refuses when `gh` can't answer, unless `--allow-unverified-ci` is given. That flag never overrides a run known to be active.
 - **2FA unknown.** It refuses when the account's 2FA mode can't be read and neither `--otp-command` nor `--token-skips-otp` is given. A granular token often can't read the profile, so its owner must pass `--token-skips-otp`.
+- **Uncommitted cut.** `--push-only` refuses a dirty tree unless it is exactly a release cut for a version npm already has, on main's history.
 - **Main moved with code.** After publish it refuses to rebase over code commits. That leaves the version on npm without its release commit until `--push-only --keep-tag-on-published` is run. Intended: the tag must match the tarball.
 - **npm view fails.** It fails closed when `npm view instar version` fails, where CI would fall back to `0.0.0`.
 
 ## 2. Under-block
 
 - **A run queued after the second check.** A publish.yml run queued after the pre-publish re-check (a merge in that window) is not caught. npm then refuses one of the two publishes of the same version, and the atomic push plus the cut-only rebase rule keep main and the tag consistent.
+- **Registry lag beyond ~30 s.** After a failed publish that did NOT time out, a registry that still reads absent after the 3 re-queries is taken as absent: the tree is restored, and a later run would bump past an orphaned version. The re-queries make this unlikely, and the timeout case is already UNKNOWN.
 - **The token assertion is trusted.** `--token-skips-otp` is an assertion by the caller. If it's wrong, publish fails with `EOTP`; it does not hang, because stdin is closed and npm 11's `otplease` rethrows with no TTY. That failure is resolved against the registry.
 
 ## 3. Level-of-abstraction fit
