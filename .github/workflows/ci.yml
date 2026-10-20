@@ -23,6 +23,27 @@ on:
     types: [submitted, dismissed]
   workflow_dispatch:
 
+# Account-wide Actions concurrency is shared across EVERY repo this owner has, and
+# measurement on 2026-10-20 showed what that costs: instar-2 held 10 jobs running
+# and 25 queued while instar held 0 running and 21 queued, so this repo's CI crawled
+# at ~3 concurrent jobs against a 20-job allowance. A single PR here needs 8 unit
+# shards, so one PR took hours and a heavy run took 17-19h end to end.
+#
+# The avoidable half of that is supersession. Without this block every push to a
+# branch started a NEW 13-job run while the previous one kept consuming shared
+# slots — 126 stale runs had to be cancelled BY HAND in one night to let a
+# single-line test-config fix through. A superseded run is waste by definition:
+# nobody is waiting on its result.
+#
+# Keyed on the PR number so every event type for one PR shares a group
+# (pull_request and pull_request_review both resolve it); falls back to the ref
+# for pushes to main.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # NEVER cancel main's post-merge run: that is the release gate and its record is
+  # the evidence a merge was sound. Only branch/PR runs supersede.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   invariants:
     name: Repo Invariants
