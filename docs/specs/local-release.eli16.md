@@ -24,6 +24,14 @@ A single command, `npm run release:local`, that does exactly what the workflow d
 
 **It cannot release against a stale picture of main.** Before publishing, it refreshes every copy of main the pre-push check might compare against, and stops if one can't be refreshed.
 
+**Its version tag always marks exactly what went to npm.** If someone merges code while a release is running, it will not slide the new release on top of that code and tag it. It stops, and says how to finish with the tag kept on the published version.
+
+**It never races GitHub's own publisher.** If GitHub's release job for the same merge is waiting or running, it refuses and shows how to cancel that job. If it can't ask GitHub, it stops instead of guessing.
+
+**It finds out about npm's one-time password before it starts.** If the npm account needs a one-time code to publish, it says so before building anything. You then either give it a command that produces a fresh code at publish time, or use a token that doesn't need one. It never sits waiting on a prompt halfway through.
+
+**A failure after publishing can be finished without publishing again.** `--push-only` lands the release commit for a version that is already on npm, and checks npm first.
+
 **It never turns off the checks.** The release commit and push run every hook; there is no force push; a conflicting rebase stops instead of overwriting.
 
 **What it cannot do locally:** npm provenance (a signed record that the package was built by GitHub) needs a token only GitHub's machines have, so local releases go out without it, and the script says so.
