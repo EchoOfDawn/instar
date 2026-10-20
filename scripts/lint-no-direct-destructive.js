@@ -163,6 +163,11 @@ const ALLOWLIST = new Set([
   // CI-only; never executes on an agent's machine, and TS isn't compiled there
   // so it cannot import the SafeGitExecutor funnel. Per RELEASE-FRAGMENT-GATE-SPEC.
   'scripts/release-skip-annotate.mjs',
+  // Release-cut recogniser for the pre-push gate (§3b). READ-ONLY git
+  // (`merge-base`, `diff --name-status --no-renames`, `show <rev>:<path>`). Runs
+  // pre-compile from scripts/pre-push-gate.js, so it cannot import the TS
+  // SafeGitExecutor funnel.
+  'scripts/release-cut-diff.mjs',
   // Tier-3 CI ratchet for the cartographer doc-tree (cartographer-doc-freshness
   // spec #2). A standalone .mjs (parity with docs-coverage.mjs) that runs in CI
   // with NO build step, so it cannot import the TS SafeGitExecutor funnel. All
