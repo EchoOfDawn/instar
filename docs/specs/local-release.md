@@ -159,7 +159,7 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
   - **Pure decision functions:**
     - the three publish-state outcomes;
     - `otpRequirement`: required, not-required, and every unreadable form → unknown;
-    - `ciRunState`: queued and in_progress are active, completed is clear, and an unreadable answer is unknown;
+    - `ciRunState`: every unfinished status (queued, in_progress, waiting, requested, action_required) is active, completed is clear, and an unreadable answer is unknown;
     - `ciGateAction`: unknown stops a real run, an active run cannot be overridden, and a dry run warns.
   - **Wiring:**
     - the gate-ref refresh and the OTP preflight both happen before `npm ci`;
