@@ -1,6 +1,8 @@
 # One-command local release — Plain-English Overview
 
-> The one-line version: when GitHub's machines are too busy to release Instar, a maintainer can now run the exact same release from their own computer with one command, and the safety check that runs before every push no longer refuses the release commit.
+> The one-line version: when GitHub's machines are too busy to release Instar, a maintainer can now run the exact same release from their own computer with one command. (The fix that lets the push check accept a release commit shipped separately, in #2222.)
+>
+> The standard this serves: **Friction Is a Spec — Productize the Workaround**. The first local release (v1.3.1359) was done by hand, copying the workflow's steps one at a time; this turns that workaround into a permanent command.
 
 ## The problem in one breath
 
@@ -30,7 +32,7 @@ A single command, `npm run release:local`, that does exactly what the workflow d
 
 **It finds out about npm's one-time password before it starts.** If the npm account needs a one-time code to publish, it says so before building anything. You then either give it a command that produces a fresh code at publish time, or use a token that doesn't need one. It never sits waiting on a prompt halfway through.
 
-**A failure after publishing can be finished without publishing again.** `--push-only` lands the release commit for a version that is already on npm, and checks npm first.
+**A failure after publishing can be finished without publishing again.** `--push-only` lands the release commit for a version that is already on npm, and checks npm first. If the failure came before the release commit was even made (the install test failed, or a commit check refused it), `--push-only` makes that commit itself, but only when the leftover changes are exactly a release and npm already has that version.
 
 **It never turns off the checks.** The release commit and push run every hook; there is no force push; a conflicting rebase stops instead of overwriting.
 

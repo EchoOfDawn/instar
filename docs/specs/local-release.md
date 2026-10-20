@@ -8,6 +8,8 @@ approved-by: "Justin (topic 61599, 2026-10-20T07:11Z, 'Approved both')"
 review-convergence: "2026-10-20T05:55:53Z"
 review-notes: "Echo review rounds 1 (2026-10-20T05:31Z), 2 (re-review at 5dc1c8a34) and 3 (db8454e92, converged on her side, plus a wording nit fixed in 2287a8310) on PR #2224. The formal /spec-converge multi-reviewer pass was not run."
 eli16-overview: "local-release.eli16.md"
+parent-principle: "Friction Is a Spec — Productize the Workaround"
+parent-principle-fit: "v1.3.1359 was released by hand-copying publish.yml's steps on a workstation while GitHub's runners were starved: a hard-won manual workaround that recurs whenever CI is starved. This spec turns it into the permanent command npm run release:local. (Sibling fit: Notice + Solve Inefficiencies, since CI starvation throttling releases is a standing inefficiency.) Added in the tool PR after approval, because the commit gate requires it; metadata only, no design change."
 ---
 
 # One-command local release
@@ -111,7 +113,15 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 - After publish, nothing is undone, and the message says the version is on npm and the release commit must land.
 - An UNKNOWN publish state does neither.
 
-**Code layout.** The decisions live in `scripts/lib/release-local-steps.mjs`: `refreshGateBaseRefs`, `pushReleaseAtomically`, `pushTagThenMain`, `isReleaseCutCommit` / `incomingCommits`, `publishedStateAfterFailure`, `otpRequirement`, `ciRunState` / `activePublishRuns`, `ciGateAction` and `dirtyToolFilesOnly`. Each takes an injected `run(cmd, args)`, so the tests drive real git.
+**Round 4 — Echo's review of the tool PR (#2225, at 48b54e4f5).** These change the behaviour above as follows:
+- **A failure between publish and commit is resumable (blocker).** Publish precedes the smoke test and the commit, as in publish.yml. If the smoke test fails or a pre-commit hook refuses the release commit, the version is on npm and the release cut is still in the working tree, uncommitted. `fail()` now tracks a `committed` flag and, for that case, prints the `--push-only` command plus the exact `git add … && git commit -m "chore: release vX [skip ci]"` alternative. `--push-only` handles that state itself: when the dirty paths are EXACTLY a release cut (the #2222 rule, run on the working tree vs HEAD), HEAD is on `<remote>/main`'s history, and npm has that version, it commits the cut with hooks on and continues to the push. Tests drive both cases through the real CLI against a bare remote: (a) smoke failed, and (b) a pre-commit hook refused (the resume first stops while the hook still refuses, then lands once it is fixed).
+- **Registry lag after a failed publish.** `npm view` runs with `--prefer-online`. An "absent" answer is re-queried 3 times, 10 s apart (~30 s). If the publish timed out and npm still says absent, the state is UNKNOWN, not absent. The tree is then kept rather than restored, so the real version can't be orphaned.
+- **Classifying a refused push.** Each attempt fetches first, because `--remote` need not be a gate remote. A refused push is classified by ancestry, not by comparing the tracking ref before and after: if HEAD already contains `<remote>/main`, the push was a fast-forward and something refused it (a hook, a permission, or an existing tag). Otherwise main has commits HEAD lacks. Comparing before and after misreads a refusal whenever the tracking ref was stale, or was freshly fetched, which would also have broken "main moved" detection once fetch-first was added.
+- **The CI race is named.** If the remote already has `vX` on a different commit, the failure says another publisher (most likely a publish.yml run) released this version. The push is atomic, so nothing was pushed.
+- **`--keep-tag-on-published` is resumable.** If the remote already has `vX` at the local tag's commit (a previous run pushed the tag and then the main push was refused after a rebase), it skips the tag push and the tag-on-HEAD check and pushes `HEAD:main` only. Every failure prints the exact re-run command and the by-hand `git push <remote> HEAD:main`.
+- **The build** runs with `NODE_ENV=development`, as the install does.
+
+**Code layout.** The decisions live in `scripts/lib/release-local-steps.mjs`: `refreshGateBaseRefs`, `pushReleaseAtomically`, `pushTagThenMain`, `isReleaseCutCommit` / `incomingCommits`, `workingTreeReleaseCut`, `headContainsRemoteMain`, `remoteTagSha`, `publishedStateAfterFailure`, `otpRequirement`, `ciRunState` / `activePublishRuns`, `ciGateAction` and `dirtyToolFilesOnly`. Each takes an injected `run(cmd, args)`, so the tests drive real git.
 
 **Docs.** CONTRIBUTING.md gets a "Releasing (maintainers)" section: local release is the default when CI is starved, the three commands, and the differences from CI.
 
