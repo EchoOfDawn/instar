@@ -36,14 +36,18 @@ describe('ci.yml concurrency invariant', () => {
     expect(ci.concurrency, 'ci.yml must declare `concurrency` so stale runs supersede').toBeTruthy();
   });
 
-  it('groups by PR so every event type for one PR shares a slot', () => {
+  it('groups by PR *and* event so a review can never cancel the push run', () => {
     const c = loadCi().concurrency as { group?: string };
     expect(typeof c.group).toBe('string');
-    // pull_request and pull_request_review must land in the SAME group, else a
-    // review event spawns a second full 13-job run alongside the push run.
     expect(c.group).toContain('github.event.pull_request.number');
-    // And a push to main (no PR number) must still resolve to something stable.
+    // A push to main (no PR number) must still resolve to something stable.
     expect(c.group).toContain('github.ref');
+    // THE EVENT NAME IS LOAD-BEARING. `pull_request_review` is a trigger of this
+    // workflow. Without it in the key, approving a PR lands in the same group as the
+    // push run and CANCELS its in-flight required checks, restarting them from zero.
+    // Anyone "simplifying" this key back to PR-number-only reintroduces that footgun,
+    // so it fails here.
+    expect(c.group).toContain('github.event_name');
   });
 
   it('cancels superseded branch runs but NEVER main', () => {

@@ -25,9 +25,18 @@ nobody is waiting on its result.
 
 This adds a top-level `concurrency` block:
 
-- **Grouped by pull-request number**, so `pull_request` and `pull_request_review` events for
-  the same pull request share one slot instead of racing. Falls back to the ref for pushes to
-  `main`.
+- **Grouped by pull-request number AND event name.** The event name is load-bearing, not
+  decoration. `pull_request_review` is one of this workflow's triggers, so a review event sharing
+  a group with the push run would mean **approving a pull request cancels its in-flight required
+  checks** and restarts them from zero — trading avoidable waste for a footgun. Scoping by event
+  means push runs supersede push runs (the actual problem) while a review run can never cancel
+  them. Falls back to the ref for pushes to `main`.
+- **Known, and deliberately left alone:** a review event therefore still starts its own run, so
+  approving a pull request costs a duplicate 13-job run. Narrowing that needs job-level `if:` on
+  the heavy jobs — and a job skipped by `if:` reports as **success** to required status checks,
+  which would let a review-triggered run paint a pull request green without the tests having run
+  on that commit. That is a safety hole, so it belongs in its own carefully-designed change, not
+  slipped in beside a capacity fix.
 - **`cancel-in-progress` excludes `main`.** A blanket `true` would be wrong: main's
   post-merge run is the release gate and its record is the evidence a merge was sound. Only
   branch and pull-request runs supersede.
