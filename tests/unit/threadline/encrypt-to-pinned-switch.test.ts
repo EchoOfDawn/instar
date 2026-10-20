@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
+import { generateIdentityKeyPair } from '../../../src/threadline/ThreadlineCrypto.js';
 import { AgentTrustManager, backfillPairingMethod, type AgentTrustProfile } from '../../../src/threadline/AgentTrustManager.js';
 import {
   createEncryptToPinnedResolver,
@@ -28,7 +28,8 @@ const MODES = [OFF, WATCH, ENFORCE];
 
 const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'enc-pinned-'));
 const peer = () => {
-  const key = crypto.randomBytes(32).toString('hex');
+  // A real Ed25519 key: random bytes are often not a curve point, which pinning refuses (SEC-16, #2229).
+  const key = generateIdentityKeyPair().publicKey.toString('hex');
   return { key, fp: key.slice(0, 32) };
 };
 const OWN_FP = 'f'.repeat(32);

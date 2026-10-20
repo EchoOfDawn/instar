@@ -11,6 +11,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { isAcceptableIdentityKey } from '@sagemindai/threadline-core';
+import { generateIdentityKeyPair } from '../../../src/threadline/ThreadlineCrypto.js';
 
 import {
   THREADLINE_PAIRING_KIND_REGISTRATION,
@@ -59,7 +61,8 @@ const GATE_ON = { multiMachine: { stateSync: { threadlinePairing: { enabled: tru
 const GATE_OFF = { multiMachine: { stateSync: { threadlinePairing: { enabled: false, dryRun: true } } } };
 
 const peer = () => {
-  const key = crypto.randomBytes(32).toString('hex');
+  // A real Ed25519 key: random bytes are often not a curve point, which pinning refuses (SEC-16, #2229).
+  const key = generateIdentityKeyPair().publicKey.toString('hex');
   return { key, fp: key.slice(0, 32) };
 };
 const hlc = (physical: number, node: string, logical = 0): HlcTimestamp => ({ physical, logical, node });
@@ -342,7 +345,11 @@ describe('inheritance wired on merge', () => {
     wiring = makeWiring(GATE_ON);
     const local = peer();
     expect(trust.markInviteVerified(local.fp, { peerIdentityPub: local.key, via: 'finish' })).toBe(true);
-    const forged = { fp: local.fp, key: local.fp + 'e'.repeat(32) };
+    // Same fingerprint, different tail, and a VALID curve point, so only the local-wins rule
+    // (not the SEC-16 weak-key check) can be what keeps the local pin.
+    let forgedKey = '';
+    do { forgedKey = local.fp + crypto.randomBytes(16).toString('hex'); } while (!isAcceptableIdentityKey(Buffer.from(forgedKey, 'hex')));
+    const forged = { fp: local.fp, key: forgedKey };
     applyPeer(PEER_A, forged, 1000, 'invite');
     expect(trust.getProfileByFingerprint(local.fp)).toMatchObject({
       pairingState: 'mutual-verified', pairingMethod: 'invite', peerIdentityPub: local.key, source: 'mutual-verified',
