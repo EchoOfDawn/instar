@@ -5589,6 +5589,14 @@ export interface ThreadlineConfig {
    * its fingerprint as unverified.
    */
   encryptToPinned?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6/D11, rollout step 6). Read
+   * live per inbound message. `enabled` omitted ⇒ the developmentAgent gate. `dryRun` defaults
+   * TRUE (watch): the encryptedSeen mark is recorded when an invite-paired peer sends encrypted
+   * chat, and plaintext later arriving under its fingerprint is counted and delivered as today;
+   * only an explicit `false` (enforce) refuses that plaintext. Off records and refuses nothing.
+   */
+  refuseDowngrade?: { enabled?: boolean; dryRun?: boolean };
 }
 
 /**

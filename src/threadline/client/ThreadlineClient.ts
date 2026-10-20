@@ -85,6 +85,10 @@ export interface ReceivedMessage {
   content: PlaintextMessage;
   timestamp: string;
   envelope: MessageEnvelope;
+  /** The identity key the envelope's signature was verified against (decrypted messages only).
+   *  The refuse-downgrade mark (spec threadline-standalone-pairing D6, step 6) is recorded only
+   *  when this is the peer's PINNED key. */
+  senderIdentityPub?: Buffer;
 }
 
 /**
@@ -1425,6 +1429,7 @@ export class ThreadlineClient extends EventEmitter {
         content: plaintext,
         timestamp: envelope.timestamp,
         envelope,
+        senderIdentityPub: Buffer.from(sender?.publicKey && sender.x25519PublicKey ? sender.publicKey : senderPub),
       };
 
       this.emit('message', received);

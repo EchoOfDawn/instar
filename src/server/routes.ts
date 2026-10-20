@@ -575,6 +575,11 @@ import {
   encryptToPinnedModeName,
   resolveEncryptToPinnedMode,
 } from '../threadline/encryptToPinned.js';
+import {
+  refuseDowngradeCounters,
+  refuseDowngradeModeName,
+  resolveRefuseDowngradeMode,
+} from '../threadline/refuseDowngrade.js';
 import { isRelayChainLoop } from '../messaging/MessageRouter.js';
 import { buildResentNotice, isValidMessageId } from '../threadline/InboundIdLedger.js';
 import { recordDuplicateAck, projectInboundRow } from '../threadline/inboundIdLedgerWiring.js';
@@ -5164,6 +5169,18 @@ export function createRoutes(ctx: RouteContext): Router {
             ctx.config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
           );
           return { ...mode, mode: encryptToPinnedModeName(mode), ...encryptToPinnedCounters };
+        })(),
+        // Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6, step 6): the live
+        // mode (off | watch | enforce) and the process-wide counters. AUTHED only.
+        refuseDowngrade: (() => {
+          const mode = resolveRefuseDowngradeMode(
+            {
+              enabled: ctx.liveConfig?.get<boolean | undefined>('threadline.refuseDowngrade.enabled', undefined),
+              dryRun: ctx.liveConfig?.get<boolean | undefined>('threadline.refuseDowngrade.dryRun', undefined),
+            },
+            ctx.config as { developmentAgent?: boolean; threadline?: { refuseDowngrade?: { enabled?: boolean; dryRun?: boolean } } },
+          );
+          return { ...mode, mode: refuseDowngradeModeName(mode), ...refuseDowngradeCounters };
         })(),
       };
       // Inbound-id ledger counters (spec "Migration parity" → counters): in
