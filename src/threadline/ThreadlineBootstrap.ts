@@ -456,22 +456,22 @@ export async function bootstrapThreadline(
     }
   };
   // Encrypt-to-pinned (spec threadline-standalone-pairing D9): the live mode. With no reader it
-  // is the shipped default (enforce, Justin 2026-10-20); an unreadable reader is off.
+  // is the shipped default (enforce, Justin 2026-10-20); so is a reader that throws (never off).
   const encryptToPinnedMode = (): EncryptToPinnedMode => {
     try {
       return config.getEncryptToPinnedMode?.() ?? { ...ENCRYPT_TO_PINNED_DEFAULT };
     } catch {
-      return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
+      return { ...ENCRYPT_TO_PINNED_DEFAULT }; // @silent-fallback-ok — an unreadable mode is the shipped default (enforce), never off
     }
   };
 
   // Refuse-downgrade (spec threadline-standalone-pairing D6, step 6): the live mode. With no
-  // reader it is the shipped default (watch); an unreadable reader is off.
+  // reader it is the shipped default (watch); so is a reader that throws (never off).
   const refuseDowngradeMode = (): RefuseDowngradeMode => {
     try {
       return config.getRefuseDowngradeMode?.() ?? { ...REFUSE_DOWNGRADE_DEFAULT };
     } catch {
-      return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
+      return { ...REFUSE_DOWNGRADE_DEFAULT }; // @silent-fallback-ok — an unreadable mode is the shipped default (watch), never off
     }
   };
 

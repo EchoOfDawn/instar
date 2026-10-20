@@ -20,6 +20,7 @@ import {
   createDowngradeRefusalLog,
   reportDowngradeRefusal,
   REFUSE_DOWNGRADE_DEFAULT,
+  readRefuseDowngradeMode,
   DOWNGRADE_REFUSAL_REASON,
   DOWNGRADE_REFUSAL_REMEDY,
   DOWNGRADE_REFUSAL_NOTICE,
@@ -322,9 +323,24 @@ describe('shouldRefuseDowngradedPlaintext per mode', () => {
     expect(c).toMatchObject({ lookupErrors: 2, refusedDowngrade: 1, wouldRefuseDowngrade: 1 });
   });
 
-  it('an unreadable mode is off', () => {
+  it('a mode reader that throws yields the SHIPPED DEFAULT (watch), never off (Echo, #2236): counted, delivered', () => {
+    const boom = (): RefuseDowngradeMode => { throw new Error('x'); };
+    expect(readRefuseDowngradeMode(boom)).toEqual(REFUSE_DOWNGRADE_DEFAULT);
+    expect(refuseDowngradeModeName(readRefuseDowngradeMode(boom))).toBe('watch');
     const { t, p } = marked();
-    expect(shouldRefuseDowngradedPlaintext({ trustManager: t, mode: () => { throw new Error('x'); } }, p.fp, undefined)).toBe(false);
+    const c = createRefuseDowngradeCounters();
+    expect(shouldRefuseDowngradedPlaintext({ trustManager: t, mode: boom, counters: c }, p.fp, undefined)).toBe(false);
+    expect(c.wouldRefuseDowngrade).toBe(1);
+    // Control: a reader that answers is used as-is.
+    expect(readRefuseDowngradeMode(() => OFF)).toEqual(OFF);
+  });
+
+  it('a mode reader that throws still records the mark (watch, not off)', () => {
+    const { t, p } = invitePaired();
+    const c = createRefuseDowngradeCounters();
+    expect(noteEncryptedChat({ trustManager: t, mode: () => { throw new Error('x'); }, counters: c }, chat(p))).toBe(true);
+    expect(t.getProfileByFingerprint(p.fp)!.encryptedSeenAt).toBeDefined();
+    expect(c.marksRecorded).toBe(1);
   });
 });
 

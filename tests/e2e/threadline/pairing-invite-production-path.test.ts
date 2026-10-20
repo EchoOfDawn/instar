@@ -51,13 +51,13 @@ describe('invite pairing — production path', () => {
   let relayUrl: string;
   const sides: Side[] = [];
 
-  async function bootSide(name: string, port: number, encryptToPinned?: EncryptToPinnedMode, refuseDowngrade?: () => RefuseDowngradeMode): Promise<Side> {
+  async function bootSide(name: string, port: number, encryptToPinned?: EncryptToPinnedMode | (() => EncryptToPinnedMode), refuseDowngrade?: () => RefuseDowngradeMode): Promise<Side> {
     const project = createTempProject();
     const auth = `${name}-auth`;
     const boot = await bootstrapThreadline({
       agentName: name, ownerName: `${name}-owner`, stateDir: project.stateDir, projectDir: project.dir, port, relayEnabled: true, relayUrl,
       getVerifiedPairingConfig: () => ({ enabled: true, dryRun: true, credentialShareEnforced: false }),
-      ...(encryptToPinned ? { getEncryptToPinnedMode: () => encryptToPinned } : {}),
+      ...(encryptToPinned ? { getEncryptToPinnedMode: typeof encryptToPinned === 'function' ? encryptToPinned : () => encryptToPinned } : {}),
       ...(refuseDowngrade ? { getRefuseDowngradeMode: refuseDowngrade } : {}),
     });
     expect(boot.relayClient?.connectionState).toBe('connected');
@@ -413,5 +413,33 @@ describe('invite pairing — production path', () => {
     expect(health.status).toBe(200);
     const rd = (health.body as { threadline?: { refuseDowngrade?: { refusals?: Array<{ fingerprint: string; reason: string }> } } } | null)?.threadline?.refuseDowngrade;
     expect(rd?.refusals).toEqual(expect.arrayContaining([expect.objectContaining({ fingerprint: A.fp, reason: DOWNGRADE_REFUSAL_REASON })]));
+  }, 60_000);
+  it('mode readers that THROW give the shipped defaults, never off (Echo, #2236): chat is still encrypted to the pin and the mark is still recorded', async () => {
+    const boomEnc = (): EncryptToPinnedMode => { throw new Error('config unreadable'); };
+    const boomRefuse = (): RefuseDowngradeMode => { throw new Error('config unreadable'); };
+    const A = await bootSide('kilo', 4087, boomEnc, boomRefuse);
+    const B = await bootSide('lima', 4088, boomEnc, boomRefuse);
+    const forgetKeys = (s: Side) => (s.boot.relayClient as unknown as { knownAgents: Map<string, unknown> }).knownAgents.clear();
+    const atB: Array<{ text: unknown; encrypted: boolean }> = [];
+    B.boot.relayClient!.on('message', (m: { from: string; content: { content?: unknown }; envelope: { ephemeralPubKey?: string } }) => {
+      if (m.from === A.fp) atB.push({ text: m.content?.content, encrypted: !!m.envelope?.ephemeralPubKey });
+    });
+    B.boot.relayClient!.on('unknown-sender', (env: { from?: string; payload?: string; ephemeralPubKey?: string }) => {
+      if (env.from !== A.fp || env.ephemeralPubKey) return;
+      try { atB.push({ text: JSON.parse(Buffer.from(String(env.payload), 'base64').toString('utf8')).text, encrypted: false }); } catch { /* not ours */ }
+    });
+    const inv = A.boot.pairingInvites!.flow.createInvite() as { ok: true; iid: string; message: string };
+    await B.boot.pairingInvites!.flow.receiveInvite(inv.message);
+    B.boot.pairingInvites!.flow.approveAccept(inv.iid);
+    await vi.waitFor(() => expect(A.events.some((e) => e.kind === 'finish-prompt')).toBe(true), { timeout: 10_000 });
+    A.boot.pairingInvites!.flow.approveFinish(inv.iid);
+    await vi.waitFor(() => expect(B.boot.trustManager!.getProfileByFingerprint(A.fp)?.pairingState).toBe('mutual-verified'), { timeout: 10_000 });
+    // No cached keys: only the pinned resolver (enforce) can encrypt; off would send plaintext.
+    forgetKeys(A); forgetKeys(B);
+    expect((await call(A, 'POST', '/threadline/relay-send', { targetAgent: B.fp, message: 'reader threw' })).status).toBeLessThan(300);
+    await vi.waitFor(() => expect(atB).toContainEqual({ text: 'reader threw', encrypted: true }), { timeout: 10_000 });
+    expect(atB).not.toContainEqual({ text: 'reader threw', encrypted: false });
+    // refuseDowngrade fell back to watch, so the encrypted chat recorded the mark.
+    await vi.waitFor(() => expect(B.boot.trustManager!.getProfileByFingerprint(A.fp)?.encryptedSeenAt).toBeDefined(), { timeout: 10_000 });
   }, 60_000);
 });

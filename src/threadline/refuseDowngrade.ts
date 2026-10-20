@@ -106,9 +106,14 @@ export interface RefuseDowngradeDeps<T> {
   counters?: RefuseDowngradeCounters;
 }
 
-function readMode(mode: () => RefuseDowngradeMode): RefuseDowngradeMode {
-  try { return mode(); } catch { return { enabled: false, dryRun: true }; /* @silent-fallback-ok — an unreadable mode is today's behaviour (off) */ }
+/**
+ * Read the live mode. A reader that throws yields the SHIPPED DEFAULT (watch), never off, so
+ * marks keep being recorded and would-refuse plaintext keeps being counted (Echo, review of #2236).
+ */
+export function readRefuseDowngradeMode(mode: () => RefuseDowngradeMode): RefuseDowngradeMode {
+  try { return mode(); } catch { return { ...REFUSE_DOWNGRADE_DEFAULT }; /* @silent-fallback-ok — an unreadable mode is the shipped default (watch), never off */ }
 }
+const readMode = readRefuseDowngradeMode;
 
 /**
  * An ENCRYPTED message arrived and was verified (ThreadlineClient 'message'). Record the mark when

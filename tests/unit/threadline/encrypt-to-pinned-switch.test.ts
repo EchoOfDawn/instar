@@ -17,6 +17,7 @@ import {
   labelUnverifiedPinnedPlaintext,
   resolveEncryptToPinnedMode,
   ENCRYPT_TO_PINNED_DEFAULT,
+  readEncryptToPinnedMode,
   UNVERIFIED_PINNED_PLAINTEXT_NOTICE,
   type EncryptToPinnedMode,
 } from '../../../src/threadline/encryptToPinned.js';
@@ -238,8 +239,19 @@ describe('the send resolver', () => {
     expect(createEncryptToPinnedResolver({ trustManager: t, mode: () => ENFORCE })(inv.fp, 'send')).toBeNull();
   });
 
-  it('a mode reader that throws: null (an unreadable mode is off)', () => {
-    expect(createEncryptToPinnedResolver({ trustManager: t, mode: () => { throw new Error('x'); } })(inv.fp, 'send')).toBeNull();
+  it('a mode reader that throws yields the SHIPPED DEFAULT (enforce), never off (Echo, #2236): the pinned key, fail-closed, the label', () => {
+    const boom = (): EncryptToPinnedMode => { throw new Error('x'); };
+    expect(readEncryptToPinnedMode(boom)).toEqual(ENCRYPT_TO_PINNED_DEFAULT);
+    expect(encryptToPinnedModeName(readEncryptToPinnedMode(boom))).toBe('enforce');
+    const counters = createEncryptToPinnedCounters();
+    const key = createEncryptToPinnedResolver({ trustManager: t, mode: boom, counters })(inv.fp, 'send');
+    expect(Buffer.isBuffer(key) && key.toString('hex')).toBe(inv.key);
+    expect(counters.encryptedToPinned).toBe(1);
+    expect(createEncryptToPinnedClientOptions({ mode: boom }).failClosed!()).toBe(true);
+    const d = { fingerprint: inv.fp, trustLevel: 'trusted' } as unknown as RelayUnknownSenderPassDecision;
+    expect(labelUnverifiedPinnedPlaintext({ trustManager: t, mode: boom, counters }, d, undefined)).toMatchObject({ notice: UNVERIFIED_PINNED_PLAINTEXT_NOTICE });
+    // Control: a reader that answers is used as-is.
+    expect(readEncryptToPinnedMode(() => OFF)).toEqual(OFF);
   });
 
   it('a trust lookup that throws: ENFORCE fails closed (the sentinel, not null); watch/off keep null; sends counted', () => {

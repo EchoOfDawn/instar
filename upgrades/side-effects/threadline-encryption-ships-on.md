@@ -13,7 +13,7 @@ Justin's ruling (topic 61599, 2026-10-20 11:50 PDT): "why is encryption shipped 
 - `threadline.refuseDowngrade` (step 6) now defaults to **watch** on every agent (`enabled` omitted means on, `dryRun` omitted means true). Marks are recorded and replicated; would-refuse plaintext is counted. Not enforce: see "Why refuseDowngrade is watch, not enforce".
 - An enforcing refusal is now loud: `reportDowngradeRefusal` logs a named reason (`plaintext-from-peer-that-sent-encrypted`) and a remedy, keeps a bounded per-peer record shown on the authed `/health` (`threadline.refuseDowngrade.refusals`), raises one degradation report and sends one fixed notice back to the sender, encrypted to its pinned key (`ThreadlineClient.sendNoticeToPinned`), per peer per hour.
 - The multi-machine startup note (enforce + pairing replication off) is now also a degradation report, with plain wording about what happens and how to fix it.
-- `ThreadlineBootstrap` with no mode reader supplied now uses the shipped defaults instead of off. An unreadable reader is still off.
+- `ThreadlineBootstrap` with no mode reader supplied now uses the shipped defaults instead of off. So does a reader that throws (see the revision below).
 
 ## Upgrade migration
 
@@ -46,6 +46,10 @@ encryptToPinned is enforce on multi-machine agents anyway. On the machine that m
 1. Peers with no pin on upgrade: above.
 2. Loud refusal: named reason + remedy in the log line; counted (`refusedDowngrade`) and recorded per peer (`count`, `firstAt`, `lastAt`, `reason`, `explanation`, `remedy`, `noticesSent`, `noticeFailures`) on the authed `/health`; one degradation report and one encrypted notice to the sender per peer per hour. The notice is a fixed server string, never peer text, sent only to the pinned key (never a relay-supplied key, never plaintext). The hourly bound keeps a forging relay from turning the agent into a sender, and breaks a loop with an old peer that replies in plaintext.
 3. Test: `tests/e2e/threadline/pairing-invite-production-path.test.ts`, "enforcing refuse-downgrade (Echo, 2026-10-20)": real relay, three real agents; the pinned peer's plaintext is refused, the refusal record carries the reason and remedy, the pinned peer receives the notice encrypted, the refusal is on `/health`; the never-paired peer's plaintext is delivered.
+
+## Revision (Echo's review of #2236): a throwing mode reader is the shipped default, never off
+
+Before: when the live mode reader threw, every fallback resolved to off, so an unreadable config silently stopped encryption. Now `readEncryptToPinnedMode` returns the shipped default (enforce) and `readRefuseDowngradeMode` returns its shipped default (watch). The send resolver, the client fail-closed check, the receive label, the mark and the refusal check all read through these. The `ThreadlineBootstrap` reader wrappers fall back to the same defaults. Tests: unit (each module with a throwing reader, plus a control that a reader that answers is used as-is), and an e2e test where both readers throw on two real agents. There, chat still goes encrypted to the pin with no cached keys, and the mark is still recorded. Mutating any of the four fallbacks back to off is caught.
 
 ## Decision-point inventory
 

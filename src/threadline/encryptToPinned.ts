@@ -73,6 +73,14 @@ export function resolveEncryptToPinnedMode(
   return { enabled, dryRun };
 }
 
+/**
+ * Read the live mode. A reader that throws yields the SHIPPED DEFAULT (enforce), never off:
+ * an unreadable switch must not silently stop encryption (Echo, review of #2236).
+ */
+export function readEncryptToPinnedMode(mode: () => EncryptToPinnedMode): EncryptToPinnedMode {
+  try { return mode(); } catch { return { ...ENCRYPT_TO_PINNED_DEFAULT }; /* @silent-fallback-ok — an unreadable mode is the shipped default (enforce), never off */ }
+}
+
 export function encryptToPinnedModeName(mode: EncryptToPinnedMode): EncryptToPinnedModeName {
   if (!mode.enabled) return 'off';
   return mode.dryRun ? 'watch' : 'enforce';
@@ -133,8 +141,7 @@ export function createEncryptToPinnedResolver(deps: {
 }): (fp: string, use?: EncryptToUse) => EncryptToResolverResult {
   const counters = deps.counters ?? encryptToPinnedCounters;
   return (fp, use = 'check') => {
-    let mode: EncryptToPinnedMode;
-    try { mode = deps.mode(); } catch { return null; /* @silent-fallback-ok — an unreadable mode is today's behaviour (off) */ }
+    const mode = readEncryptToPinnedMode(deps.mode);
     if (!mode.enabled) return null;
     let key: Buffer | null;
     try {
@@ -156,7 +163,7 @@ export function createEncryptToPinnedResolver(deps: {
 
 /**
  * The options handed to ThreadlineClient.setEncryptToResolver beside the resolver: fail closed
- * only while enforcing (an unreadable mode counts as enforce there, so the client fails closed),
+ * only while enforcing (an unreadable mode is the shipped default, enforce, so the client fails closed),
  * and count the client-side failure paths on a send.
  */
 export function createEncryptToPinnedClientOptions(deps: {
@@ -165,7 +172,7 @@ export function createEncryptToPinnedClientOptions(deps: {
 }): EncryptToResolverOptions {
   const counters = deps.counters ?? encryptToPinnedCounters;
   return {
-    failClosed: () => encryptToPinnedModeName(deps.mode()) === 'enforce',
+    failClosed: () => encryptToPinnedModeName(readEncryptToPinnedMode(deps.mode)) === 'enforce',
     onFailure: (kind, use) => {
       if (use !== 'send') return;
       if (kind === 'resolver-error') counters.resolverErrors++;
@@ -199,8 +206,7 @@ export function labelUnverifiedPinnedPlaintext(
   wireType: unknown,
 ): LabelledRelayPassDecision {
   const counters = deps.counters ?? encryptToPinnedCounters;
-  let mode: EncryptToPinnedMode;
-  try { mode = deps.mode(); } catch { return decision; /* @silent-fallback-ok — unreadable mode = off */ }
+  const mode = readEncryptToPinnedMode(deps.mode);
   if (!mode.enabled) return decision;
   if (classifyRelayPlaintextOperation(wireType) !== 'message') return decision;
   let pinned: Buffer | null;
