@@ -2,9 +2,11 @@
 title: "One-command local release (scripts/release-local.mjs)"
 slug: "local-release"
 author: "dawn"
-status: draft
-approved: false
-review-convergence: "Echo review rounds 1 (2026-10-20T05:31Z) and 2 (re-review at 5dc1c8a34) on PR #2224; every item answered in round 3, including round 2's must-settle (any publish.yml run, not just this commit). No open questions. The formal /spec-converge multi-reviewer pass has NOT been run."
+status: "approved r3"
+approved: true
+approved-by: "Justin (topic 61599, 2026-10-20T07:11Z, 'Approved both')"
+review-convergence: "2026-10-20T05:55:53Z"
+review-notes: "Echo review rounds 1 (2026-10-20T05:31Z), 2 (re-review at 5dc1c8a34) and 3 (db8454e92, converged on her side, plus a wording nit fixed in 2287a8310) on PR #2224. The formal /spec-converge multi-reviewer pass was not run."
 eli16-overview: "local-release.eli16.md"
 ---
 
