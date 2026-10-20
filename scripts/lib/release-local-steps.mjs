@@ -462,7 +462,9 @@ export function npmPendingNotice(name, version, { pushOnly = false } = {}) {
       ? [`If ${name}@${version} was never published (for example the publish step itself failed), --push-only cannot land it:`,
          `do not use --push-only; re-run release-local normally from a clean, up-to-date main.`]
       : []),
-    `Do NOT publish again. Re-run later; --push-only lands it once \`npm view ${name}@${version} version\` shows it:`,
+    // With the never-published caveat above, the last line needs its condition said out loud, or
+    // "re-run release-local normally" and "Do NOT publish again" read as contradictory (Echo, #2228).
+    `${pushOnly ? 'Otherwise (published, still in review): ' : ''}Do NOT publish again. Re-run later; --push-only lands it once \`npm view ${name}@${version} version\` shows it:`,
   ].join('\n');
 }
 

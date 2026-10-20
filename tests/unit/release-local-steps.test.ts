@@ -514,7 +514,12 @@ describe('npm "Validating" review — an accepted publish that is not visible ye
     const po = npmPendingNotice('instar', '1.3.1360', { pushOnly: true });
     expect(po).toContain('was never published (for example the publish step itself failed)');
     expect(po).toContain('do not use --push-only; re-run release-local normally');
+    // The two instructions carry their conditions, so they cannot read as contradictory (Echo, #2228).
+    expect(po.split('\n').at(-1)).toMatch(/^Otherwise \(published, still in review\): Do NOT publish again\./);
+    expect(po.indexOf('was never published')).toBeLessThan(po.indexOf('Otherwise (published, still in review)'));
     expect(npmPendingNotice('instar', '1.3.1360')).not.toContain('never published');
+    expect(npmPendingNotice('instar', '1.3.1360')).not.toContain('Otherwise (published, still in review)');
+    expect(npmPendingNotice('instar', '1.3.1360').split('\n').at(-1)).toMatch(/^Do NOT publish again\./);
     expect(smokeFailureVerdict('absent', 'instar', '1.3.1360').message).not.toContain('never published');
   });
   it('smoke failed + not visible (absent or unknown) → pending, with the notice', () => {
@@ -704,6 +709,7 @@ describe('--push-only resumes a release that failed between publish and commit (
     expect(pending.status).toBe(1);
     expect(pending.out).toContain('refuses until then');
     expect(pending.out).toContain('was never published (for example the publish step itself failed)');
+    expect(pending.out).toContain('Otherwise (published, still in review): Do NOT publish again');
     expect(pending.out).toContain('"Validating" review');
     expect(pending.out).not.toContain('Nothing was published');
     expect(g(bare, 'rev-parse', 'main')).toBe(before);
