@@ -1,6 +1,8 @@
 # One-command local release — Plain-English Overview
 
-> The one-line version: when GitHub's machines are too busy to release Instar, a maintainer can now run the exact same release from their own computer with one command, and the safety check that runs before every push no longer refuses the release commit.
+> The one-line version: when GitHub's machines are too busy to release Instar, a maintainer can now run the exact same release from their own computer with one command. (The fix that lets the push check accept a release commit shipped separately, in #2222.)
+>
+> The standard this serves: **Friction Is a Spec — Productize the Workaround**. The first local release (v1.3.1359) was done by hand, copying the workflow's steps one at a time; this turns that workaround into a permanent command.
 
 ## The problem in one breath
 

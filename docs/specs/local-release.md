@@ -8,6 +8,8 @@ approved-by: "Justin (topic 61599, 2026-10-20T07:11Z, 'Approved both')"
 review-convergence: "2026-10-20T05:55:53Z"
 review-notes: "Echo review rounds 1 (2026-10-20T05:31Z), 2 (re-review at 5dc1c8a34) and 3 (db8454e92, converged on her side, plus a wording nit fixed in 2287a8310) on PR #2224. The formal /spec-converge multi-reviewer pass was not run."
 eli16-overview: "local-release.eli16.md"
+parent-principle: "Friction Is a Spec — Productize the Workaround"
+parent-principle-fit: "v1.3.1359 was released by hand-copying publish.yml's steps on a workstation while GitHub's runners were starved: a hard-won manual workaround that recurs whenever CI is starved. This spec turns it into the permanent command npm run release:local. (Sibling fit: Notice + Solve Inefficiencies, since CI starvation throttling releases is a standing inefficiency.) Added in the tool PR after approval, because the commit gate requires it; metadata only, no design change."
 ---
 
 # One-command local release
