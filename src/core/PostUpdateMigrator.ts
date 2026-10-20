@@ -38,7 +38,7 @@ import { resolveAgentHome as resolveAgentHomeForWorktree, ensureWorktreeSpotligh
 import { fileURLToPath } from 'node:url';
 import { TreeGenerator } from '../knowledge/TreeGenerator.js';
 import { HTTP_HOOK_TEMPLATES, buildHttpHookSettings } from '../data/http-hook-templates.js';
-import { jevJobCompletionAuditAwareness, jevMemoryPickerAwareness, jevSignalLiveAwareness, jevCorrectionShadowAwareness, JEV_CORRECTION_CARD_V1_MARKER, jevCirclesShadowAwareness, jevReviewFlagShadowAwareness, REAPER_BACKGROUND_WORK_MARKER, REAPER_BACKGROUND_WORK_BULLET, STANDING_SESSIONS_MARKER, STANDING_SESSIONS_BULLET } from '../scaffold/templates.js';
+import { jevJobCompletionAuditAwareness, jevMemoryPickerAwareness, jevSignalLiveAwareness, jevCorrectionShadowAwareness, JEV_CORRECTION_CARD_V1_MARKER, jevCirclesShadowAwareness, jevReviewFlagShadowAwareness, REAPER_BACKGROUND_WORK_MARKER, REAPER_BACKGROUND_WORK_BULLET, STANDING_SESSIONS_MARKER, STANDING_SESSIONS_BULLET, AGENT_CONNECT_HEADING, agentConnectSection } from '../scaffold/templates.js';
 import { getMigrationDefaults, applyDefaults } from '../config/ConfigDefaults.js';
 import { CANONICAL_FEEDBACK_URL, LEGACY_FEEDBACK_URLS } from './canonicalFeedback.js';
 import { installBuiltinSkills } from '../commands/init.js';
@@ -8609,6 +8609,25 @@ Before I send another agent a credential, that peer must be **mutually verified*
         }
         patched = true;
       }
+    }
+
+    // "Connecting to another agent" (docs/specs/a2a-pairing-invite-link.md §3). Existing
+    // agents must know the invite flow by heart: offer an invite, a person carries it, the
+    // other person approves, mine finishes, never ask for a fingerprint. The Verified Pairing
+    // section above is framed around credentials, so "connect with Echo" never matched it
+    // (Justin, topic 61599, 2026-10-20). Byte-identical to the scaffold; placed before the
+    // Threadline "### MCP Tools Available" heading when present, else appended. Content-
+    // sniffed on the heading, so it is idempotent and never duplicates.
+    if (!content.includes(AGENT_CONNECT_HEADING)) {
+      const section = agentConnectSection(port);
+      const toolsIdx = content.indexOf('\n### MCP Tools Available\n');
+      content = toolsIdx >= 0
+        ? content.slice(0, toolsIdx + 1) + section + '\n' + content.slice(toolsIdx + 1)
+        : content + '\n' + section;
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added "Connecting to another agent" (pairing by invite)');
+    } else {
+      result.skipped.push('CLAUDE.md: "Connecting to another agent" already present');
     }
 
     // CMT-519 — Threadline hub topic + "open this"/bind guidance. Existing agents
