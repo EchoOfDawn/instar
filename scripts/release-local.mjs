@@ -60,6 +60,8 @@ import {
   isReleaseCutCommit,
   workingTreeReleaseCut,
   viewRetryDelayMs,
+  npmPendingNotice,
+  smokeFailureVerdict,
   otpRequirement,
   activePublishRuns,
   dirtyToolFilesOnly,
@@ -131,6 +133,7 @@ let touchedTree = false; // set once this script edits tracked files
 let published = false;
 let committed = false; // the release commit exists (set after `git commit` succeeds)
 let VERSION_FOR_MSG = null; // the version being released, for recovery messages
+let npmPending = false; // published (or claimed published) but npm has not shown it yet — maybe in review
 let publishUnknown = false; // npm publish failed and the registry could not confirm either way
 let START_SHA = null; // origin/main when the release began (the merge being shipped)
 let SLUG = null;      // owner/repo of the remote, for the gh run check
@@ -180,7 +183,10 @@ function restoreTree() {
 
 function fail(msg) {
   console.error(`\n✗ release-local FAILED: ${msg}`);
-  if (publishUnknown) {
+  if (npmPending) {
+    console.error(`    node scripts/release-local.mjs --push-only --remote ${opts.remote}${opts.userconfig ? ` --userconfig ${opts.userconfig}` : ''}`);
+    console.error('  Nothing was undone and nothing will be re-published.');
+  } else if (publishUnknown) {
     console.error('  It is UNKNOWN whether this version reached npm. The tree was NOT restored.');
     console.error('  If `npm view` shows it, land the release commit by hand; if not, re-run.');
   } else if (published && !committed) {
@@ -263,7 +269,8 @@ if (opts.pushOnly) {
     if (st !== 'published') {
       published = false;
       if (st === 'unknown') publishUnknown = true;
-      fail(`the working tree holds a release cut for ${cut.version}, but instar@${cut.version} is ${st === 'absent' ? 'NOT' : 'not confirmed'} on npm — --push-only never publishes`);
+      else npmPending = true;
+      fail(`the working tree holds a release cut for ${cut.version}, but instar@${cut.version} is ${st === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --push-only never publishes and refuses until npm shows it.${st === 'absent' ? `\n${npmPendingNotice('instar', cut.version)}` : ''}`);
     }
     console.log(`The working tree is exactly the release cut for v${cut.version}, which is on npm — committing it (hooks on).`);
     must('git', ['add', 'package.json', 'package-lock.json', 'upgrades/']);
@@ -282,7 +289,8 @@ if (opts.pushOnly) {
   if (state !== 'published') {
     published = false;
     if (state === 'unknown') publishUnknown = true;
-    fail(`instar@${version} is ${state === 'absent' ? 'NOT' : 'not confirmed'} on npm — --push-only only lands a version that is already published`);
+    else npmPending = true;
+    fail(`instar@${version} is ${state === 'absent' ? 'NOT visible' : 'not confirmed'} on npm — --push-only only lands a version npm shows, and refuses until then.${state === 'absent' ? `\n${npmPendingNotice('instar', version)}` : ''}`);
   }
   if (run('git', ['rev-parse', '--verify', '--quiet', `refs/tags/v${version}`], { capture: true, quiet: true }).status !== 0) {
     must('git', ['tag', `v${version}`]);
@@ -543,7 +551,17 @@ console.log('      attestation; everything else matches publish.yml.');
 
 // ── 11. smoke ─────────────────────────────────────────────────────────
 step('Post-publish smoke test (scripts/post-publish-smoke.mjs)');
-must('node', ['scripts/post-publish-smoke.mjs', VERSION]);
+{
+  const smoke = run('node', ['scripts/post-publish-smoke.mjs', VERSION]);
+  if (smoke.status !== 0) {
+    // One registry read decides what the failure means. Not visible → npm may be
+    // holding it in review (PENDING); visible → the tarball failed the smoke test.
+    const seen = publishedStateAfterFailure({ run: quietRun, name: 'instar', version: VERSION, npmArgs: npmAuthArgs, retries: 0 });
+    const verdict = smokeFailureVerdict(seen, 'instar', VERSION);
+    if (verdict.pending) npmPending = true;
+    fail(verdict.message);
+  }
+}
 
 // ── 12. commit, push, tag ─────────────────────────────────────────────
 step(`Commit "chore: release v${VERSION} [skip ci]" (hooks run) and push to main`);

@@ -440,3 +440,36 @@ export function dirtyToolFilesOnly(porcelain) {
   const others = flat.filter((p) => !TOOL_OWN_FILES.includes(p));
   return { ok: flat.length > 0 && others.length === 0, paths: flat, others };
 }
+
+/**
+ * What to tell the maintainer when an accepted `npm publish` is not yet
+ * visible. Seen on the first real local release (1.3.1360, 2026-10-20): npm
+ * accepted the upload but held the version in "Validating" ("Automated review
+ * hasn't finished. The version will remain unavailable until review
+ * completes.") for 40+ minutes, visible only to the owner. That is PENDING,
+ * never a failed publish, and never a reason to publish again.
+ * @returns {string}
+ */
+export function npmPendingNotice(name, version) {
+  return [
+    `npm has not shown ${name}@${version} yet. An accepted publish can sit in npm's "Validating" review`,
+    `("Automated review hasn't finished") for well over the smoke window; the registry returns 404 until it ends.`,
+    `Check as the package owner: https://www.npmjs.com/package/${name}?activeTab=versions`,
+    `Do NOT publish again. Re-run later; --push-only lands it once \`npm view ${name}@${version} version\` shows it:`,
+  ].join('\n');
+}
+
+/**
+ * After the post-publish smoke test fails, decide what the failure means from
+ * one registry read. Not visible (absent or unknown) → the version may be in
+ * npm's review: PENDING. Visible → the smoke test itself failed on a real
+ * tarball.
+ * @param {'published'|'absent'|'unknown'} viewState
+ * @returns {{ pending: boolean, message: string }}
+ */
+export function smokeFailureVerdict(viewState, name, version) {
+  if (viewState === 'published') {
+    return { pending: false, message: `the post-publish smoke test failed, and ${name}@${version} IS visible on npm — the published tarball itself failed the smoke test` };
+  }
+  return { pending: true, message: `the post-publish smoke test failed: ${name}@${version} is not visible on npm yet (${viewState}).\n${npmPendingNotice(name, version)}` };
+}

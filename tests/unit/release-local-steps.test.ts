@@ -25,6 +25,8 @@ import {
   workingTreeReleaseCut,
   remoteTagSha,
   viewRetryDelayMs,
+  npmPendingNotice,
+  smokeFailureVerdict,
   isReleaseCutCommit,
   otpRequirement,
   ciRunState,
@@ -500,6 +502,30 @@ describe('dirtyToolFilesOnly (--dry-run --allow-dirty-tool-files)', () => {
   });
 });
 
+describe('npm "Validating" review — an accepted publish that is not visible yet is PENDING', () => {
+  it('the notice says what is happening, how to check, and never to re-publish', () => {
+    const n = npmPendingNotice('instar', '1.3.1360');
+    expect(n).toContain('"Validating" review');
+    expect(n).toContain('https://www.npmjs.com/package/instar?activeTab=versions');
+    expect(n).toContain('Do NOT publish again');
+    expect(n).toContain('npm view instar@1.3.1360 version');
+  });
+  it('smoke failed + not visible (absent or unknown) → pending, with the notice', () => {
+    for (const st of ['absent', 'unknown'] as const) {
+      const v = smokeFailureVerdict(st, 'instar', '1.3.1360');
+      expect(v.pending).toBe(true);
+      expect(v.message).toContain('not visible on npm yet');
+      expect(v.message).toContain('Do NOT publish again');
+    }
+  });
+  it('smoke failed + visible → a real smoke failure, not pending', () => {
+    const v = smokeFailureVerdict('published', 'instar', '1.3.1360');
+    expect(v.pending).toBe(false);
+    expect(v.message).toContain('IS visible on npm');
+    expect(v.message).not.toContain('Validating');
+  });
+});
+
 describe('viewRetryDelayMs (INSTAR_RELEASE_LOCAL_VIEW_DELAY_MS)', () => {
   it('unset or empty means the default — an empty string is NOT zero', () => {
     expect(viewRetryDelayMs(undefined)).toBe(10_000);
@@ -642,14 +668,42 @@ describe('--push-only resumes a release that failed between publish and commit (
     expect(r.out).toContain('not exactly a release cut');
   });
 
-  it('refuses to commit a cut for a version npm does not have', () => {
+  it('refuses to commit a cut for a version npm does not show yet — PENDING (npm review), never "nothing was published"', () => {
     write('package.json', pkg('1.0.2'));
     write('package-lock.json', lock('1.0.2'));
     fs.renameSync(path.join(clone, 'upgrades/next/fix.md'), path.join(clone, 'upgrades/1.0.2.md'));
+    const before = g(bare, 'rev-parse', 'main');
     const r = pushOnly();
     expect(r.status).toBe(1);
-    expect(r.out).toContain('NOT on npm');
+    expect(r.out).toContain('NOT visible on npm');
+    expect(r.out).toContain('"Validating" review');
+    expect(r.out).toContain('https://www.npmjs.com/package/instar?activeTab=versions');
+    expect(r.out).toContain('Do NOT publish again');
+    expect(r.out).toContain('--push-only --remote origin');
+    expect(r.out).not.toContain('Nothing was published');
     expect(g(clone, 'log', '-1', '--format=%s')).toBe('base: a merged fix with its fragment');
+    expect(g(bare, 'rev-parse', 'main')).toBe(before);
+  });
+
+  it('a committed release whose version npm does not show yet: --push-only keeps refusing (pending), then lands once npm shows it', () => {
+    write('package.json', pkg('1.0.2'));
+    write('package-lock.json', lock('1.0.2'));
+    fs.renameSync(path.join(clone, 'upgrades/next/fix.md'), path.join(clone, 'upgrades/1.0.2.md'));
+    g(clone, 'add', '-A');
+    g(clone, 'commit', '-qm', 'chore: release v1.0.2 [skip ci]');
+    const before = g(bare, 'rev-parse', 'main');
+    const pending = pushOnly();
+    expect(pending.status).toBe(1);
+    expect(pending.out).toContain('refuses until then');
+    expect(pending.out).toContain('"Validating" review');
+    expect(pending.out).not.toContain('Nothing was published');
+    expect(g(bare, 'rev-parse', 'main')).toBe(before);
+    // npm's review finishes: the registry now shows 1.0.2.
+    fs.writeFileSync(path.join(bin, 'npm'), '#!/bin/sh\nif [ "$1" = view ] && [ "$2" = "instar@1.0.2" ]; then echo 1.0.2; exit 0; fi\necho "npm error code E404" >&2; exit 1\n');
+    const r = pushOnly();
+    expect(r.status).toBe(0);
+    expect(g(bare, 'log', '-1', '--format=%s', 'main')).toBe('chore: release v1.0.2 [skip ci]');
+    expect(g(bare, 'rev-parse', 'v1.0.2^{commit}')).toBe(g(clone, 'rev-parse', 'HEAD'));
   });
 });
 
@@ -716,7 +770,7 @@ describe('release-local.mjs wiring', () => {
     expect(failFn).toContain('git add package.json package-lock.json upgrades/ && git commit -m "chore: release v${v} [skip ci]"');
     // smoke stays before the commit (publish.yml order), and `committed` is set only after the commit
     const publish = src.indexOf("run('npm', ['publish'");
-    const smoke = src.indexOf("must('node', ['scripts/post-publish-smoke.mjs'");
+    const smoke = src.indexOf("run('node', ['scripts/post-publish-smoke.mjs'");
     const commit = src.indexOf("must('git', ['commit', '-m', `chore: release v${VERSION} [skip ci]`]);");
     const flag = src.indexOf('committed = true;', commit);
     expect(publish).toBeLessThan(smoke);
@@ -724,6 +778,18 @@ describe('release-local.mjs wiring', () => {
     expect(flag).toBeGreaterThan(commit);
     const commitLine = "must('git', ['commit', '-m', `chore: release v${VERSION} [skip ci]`]);";
     expect(src.slice(commit + commitLine.length, flag).trim()).toBe('');
+  });
+  it('a smoke failure is judged by one registry read and a pending verdict sets npmPending', () => {
+    const smoke = src.slice(src.indexOf("const smoke = run('node', ['scripts/post-publish-smoke.mjs', VERSION]);"), src.indexOf('// ── 12. commit'));
+    expect(smoke).toContain('smokeFailureVerdict(seen');
+    expect(smoke).toContain('if (verdict.pending) npmPending = true;');
+    expect(smoke).toContain('retries: 0');
+    const failFn = src.slice(src.indexOf('function fail('), src.indexOf('function stopCleanly('));
+    const pendingBranch = failFn.slice(failFn.indexOf('if (npmPending)'), failFn.indexOf('} else if (publishUnknown)'));
+    expect(pendingBranch).toContain('--push-only');
+    expect(pendingBranch).not.toContain('restoreTree');
+    expect(pendingBranch).not.toContain('Nothing was published');
+    expect(failFn.indexOf('if (npmPending)')).toBeLessThan(failFn.indexOf('} else if (publishUnknown)'));
   });
   it('a timed-out publish is passed to the registry check as timed out', () => {
     expect(src).toContain('timedOut: Boolean(pub.timedOut)');

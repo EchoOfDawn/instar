@@ -121,6 +121,13 @@ A merge to `main` reaches agents only when `.github/workflows/publish.yml` gets 
 - **`--keep-tag-on-published` is resumable.** If the remote already has `vX` at the local tag's commit (a previous run pushed the tag and then the main push was refused after a rebase), it skips the tag push and the tag-on-HEAD check and pushes `HEAD:main` only. Every failure prints the exact re-run command and the by-hand `git push <remote> HEAD:main`.
 - **The build** runs with `NODE_ENV=development`, as the install does.
 
+**npm's "Validating" review — an accepted publish is PENDING (added 2026-10-20, after approval, from the first real run).** The first real local release (1.3.1360) had `npm publish` accepted, but the registry returned 404 for 40+ minutes. npm held the version in "Validating" ("Automated review hasn't finished. The version will remain unavailable until review completes."), which only the owner can see, on https://www.npmjs.com/package/instar?activeTab=versions. The smoke step timed out after 15 minutes, and the tool correctly stopped with the `--push-only` resume. The rule:
+- An accepted publish that npm does not show yet is **PENDING**: never failed, never re-published.
+- When the post-publish smoke test fails, one registry read decides what it means:
+  - **not visible** → pending. The message says npm may be holding the version in review, gives the Versions-tab link, says not to publish again, and gives the `--push-only` command to re-run later;
+  - **visible** → the published tarball really failed the smoke test.
+- `--push-only` keeps refusing while `npm view <name>@<v> version` does not show the version, with the same notice, and never says "Nothing was published". Once npm shows it, `--push-only` proceeds (commits the cut if it is still uncommitted, then pushes).
+
 **Code layout.** The decisions live in `scripts/lib/release-local-steps.mjs`: `refreshGateBaseRefs`, `pushReleaseAtomically`, `pushTagThenMain`, `isReleaseCutCommit` / `incomingCommits`, `workingTreeReleaseCut`, `headContainsRemoteMain`, `remoteTagSha`, `publishedStateAfterFailure`, `otpRequirement`, `ciRunState` / `activePublishRuns`, `ciGateAction` and `dirtyToolFilesOnly`. Each takes an injected `run(cmd, args)`, so the tests drive real git.
 
 **Docs.** CONTRIBUTING.md gets a "Releasing (maintainers)" section: local release is the default when CI is starved, the three commands, and the differences from CI.
@@ -227,6 +234,10 @@ Delete the script, the npm script and the CONTRIBUTING section. No state, migrat
 ## Open questions
 
 *(none)*
+
+## Open items (dated)
+
+- **Auth route before January 2027 (owner: Justin).** npm's banner says tokens that bypass 2FA lose direct publishing in **January 2027**. After that, `--token-skips-otp` with a granular or automation token will no longer publish, and release-local needs another route. The candidates are `--otp-command` with a security key, npm staged packages, or CI trusted publishing (which needs a runner). Choosing the route is Justin's decision; this spec records the date so it is decided before it bites.
 
 ## Resolved questions
 
