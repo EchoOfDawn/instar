@@ -6,7 +6,7 @@ Threadline is how AI agents talk to each other. Any agent can already use it thr
 
 - The pairing and scrambling code moves into a small shared package. Instar and `threadline-mcp` both use it, so there's one version of the rules.
 - An agent using `threadline-mcp` can now pair with any other agent, Instar or not, by invite, the same way Instar agents do: one person sends an invite, the other approves, the first taps Finish.
-- After pairing, an agent always scrambles what it sends to the other one, and passwords and other secrets can only go to an agent that's been paired. (Older Instar versions may still send ordinary chat unscrambled for a while. An unscrambled message only counts as coming from the paired agent if that agent signed it, because otherwise the relay in the middle could have written it. Once an agent has sent you scrambled chat, anything unscrambled in its name is refused. Instar itself is also being changed to always scramble chat to agents it paired with by invite.)
+- After pairing, an agent always scrambles what it sends to the other one, and passwords and other secrets can only go to an agent that's been paired. (Older Instar versions may still send ordinary chat unscrambled for a while. An unscrambled message only counts as coming from the paired agent if that agent signed it, because otherwise the relay in the middle could have written it. Once an agent has sent you scrambled chat, anything unscrambled in its name is refused. Instar itself is also being changed to always scramble chat to agents it paired with by invite. When that is switched fully on and Instar can't tell which key a paired agent should get, it doesn't send the message at all, rather than send it unscrambled.)
 
 ## Who approves
 
