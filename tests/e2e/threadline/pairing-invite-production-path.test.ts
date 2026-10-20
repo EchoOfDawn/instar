@@ -17,6 +17,8 @@ import { createTempProject, createMockSessionManager } from '../../helpers/setup
 import type { TempProject } from '../../helpers/setup.js';
 import type { InstarConfig } from '../../../src/core/types.js';
 import type { InviteEvent } from '../../../src/threadline/PairingInviteFlow.js';
+import type { EncryptToPinnedMode } from '../../../src/threadline/encryptToPinned.js';
+import { UNVERIFIED_PINNED_PLAINTEXT_NOTICE } from '../../../src/threadline/encryptToPinned.js';
 
 const PIN = '135790';
 
@@ -45,12 +47,13 @@ describe('invite pairing — production path', () => {
   let relayUrl: string;
   const sides: Side[] = [];
 
-  async function bootSide(name: string, port: number): Promise<Side> {
+  async function bootSide(name: string, port: number, encryptToPinned?: EncryptToPinnedMode): Promise<Side> {
     const project = createTempProject();
     const auth = `${name}-auth`;
     const boot = await bootstrapThreadline({
       agentName: name, ownerName: `${name}-owner`, stateDir: project.stateDir, projectDir: project.dir, port, relayEnabled: true, relayUrl,
       getVerifiedPairingConfig: () => ({ enabled: true, dryRun: true, credentialShareEnforced: false }),
+      ...(encryptToPinned ? { getEncryptToPinnedMode: () => encryptToPinned } : {}),
     });
     expect(boot.relayClient?.connectionState).toBe('connected');
     expect(boot.pairingInvites).toBeDefined();
@@ -194,5 +197,83 @@ describe('invite pairing — production path', () => {
     expect(peers2.map((p) => p.fp)).toContain(B.fp);
         // accepting a further invite from an already-verified peer never downgrades that pairing
     expect(B.boot.trustManager!.isCredentialShareAllowedByFingerprint(A.fp)).toBe(true);
+  }, 60_000);
+
+  it('ordinary chat to a peer paired by invite is always encrypted, even with no cached keys; before Finish it still arrives', async () => {
+    // threadline.encryptToPinned enforcing on both sides (spec D9, rollout step 5).
+    const ENFORCE = { enabled: true, dryRun: false };
+    const A = await bootSide('iris', 4075, ENFORCE);
+    const B = await bootSide('juno', 4076, ENFORCE);
+    type Got = { text: unknown; encrypted: boolean };
+    const listen = (to: Side, from: Side) => {
+      const got: Got[] = [];
+      to.boot.relayClient!.on('message', (m: { from: string; content: { content?: unknown }; envelope: { ephemeralPubKey?: string } }) => {
+        if (m.from === from.fp) got.push({ text: m.content?.content, encrypted: !!m.envelope?.ephemeralPubKey });
+      });
+      // Plaintext goes to the unknown-sender path (the bootstrap decodes and routes it from there).
+      to.boot.relayClient!.on('unknown-sender', (env: { from?: string; payload?: string; ephemeralPubKey?: string }) => {
+        if (env.from !== from.fp || env.ephemeralPubKey) return;
+        try { got.push({ text: JSON.parse(Buffer.from(String(env.payload), 'base64').toString('utf8')).text, encrypted: false }); } catch { /* not ours */ }
+      });
+      return got;
+    };
+    const atA = listen(A, B), atB = listen(B, A);
+    const forgetKeys = (s: Side) => (s.boot.relayClient as unknown as { knownAgents: Map<string, unknown> }).knownAgents.clear();
+    const send = (from: Side, to: Side, message: string) => call(from, 'POST', '/threadline/relay-send', { targetAgent: to.fp, message });
+
+    const inv = A.boot.pairingInvites!.flow.createInvite() as { ok: true; iid: string; message: string };
+    await B.boot.pairingInvites!.flow.receiveInvite(inv.message);
+    B.boot.pairingInvites!.flow.approveAccept(inv.iid);
+    await vi.waitFor(() => expect(A.events.some((e) => e.kind === 'finish-prompt')).toBe(true), { timeout: 10_000 });
+
+    // Waiting for A's person: B must not encrypt to A (A holds no key for B yet), so nothing is lost.
+    forgetKeys(A); forgetKeys(B);
+    expect((await send(B, A, 'before finish')).status).toBeLessThan(300);
+    await vi.waitFor(() => expect(atA).toContainEqual({ text: 'before finish', encrypted: false }), { timeout: 10_000 });
+
+    A.boot.pairingInvites!.flow.approveFinish(inv.iid);
+    await vi.waitFor(() => expect(B.boot.trustManager!.getProfileByFingerprint(A.fp)?.pairingState).toBe('mutual-verified'), { timeout: 10_000 });
+
+    // Paired: encrypted both ways, with neither side holding the other's keys in its cache.
+    forgetKeys(A); forgetKeys(B);
+    expect((await send(A, B, 'paired a→b')).status).toBeLessThan(300);
+    expect((await send(B, A, 'paired b→a')).status).toBeLessThan(300);
+    await vi.waitFor(() => {
+      expect(atB).toContainEqual({ text: 'paired a→b', encrypted: true });
+      expect(atA).toContainEqual({ text: 'paired b→a', encrypted: true });
+    }, { timeout: 10_000 });
+
+    // Enforce: when the pinned send itself fails, relay-send answers 502 success:false with the
+    // reason, and nothing reaches B in plaintext or otherwise (spec D9: never a plaintext fallback).
+    {
+      const enc = (A.boot.relayClient as unknown as { encryptor: { encrypt: (...a: unknown[]) => unknown } }).encryptor;
+      const realEncrypt = enc.encrypt;
+      enc.encrypt = () => { throw new Error('simulated encrypt failure'); };
+      try {
+        const r = await send(A, B, 'must never go plaintext');
+        expect(r.status).toBe(502);
+        expect(r.body).toMatchObject({ success: false, accepted: false, delivered: false, reason: 'encrypted-send-to-pinned-failed', deliveryPath: 'relay' });
+        expect(String(r.body.error)).toMatch(/no plaintext fallback.*simulated encrypt failure/);
+      } finally {
+        enc.encrypt = realEncrypt;
+      }
+      // A later message arrives (ordering on one relay socket), and the failed one never did.
+      expect((await send(A, B, 'after the failure')).status).toBeLessThan(300);
+      await vi.waitFor(() => expect(atB).toContainEqual({ text: 'after the failure', encrypted: true }), { timeout: 10_000 });
+      expect(atB.some((g) => g.text === 'must never go plaintext')).toBe(false);
+    }
+
+    // A pairing made by the older SAS method keeps the previous rule (the peer may be too old to decrypt).
+    const passedAtB: Array<{ text: unknown; notice?: string; trustLevel?: string }> = [];
+    B.boot.relayClient!.on('gate-passed', (d: { fingerprint?: string; notice?: string; trustLevel?: string; message?: { content?: { content?: unknown } } }) => {
+      if (d.fingerprint === A.fp) passedAtB.push({ text: d.message?.content?.content, notice: d.notice, trustLevel: d.trustLevel });
+    });
+    forgetKeys(A);
+    expect(A.boot.trustManager!.getProfileByFingerprint(B.fp)?.pairingMethod).toBe('invite');
+    A.boot.trustManager!.getProfileByFingerprint(B.fp)!.pairingMethod = 'sas';
+    expect((await send(A, B, 'sas peer')).status).toBeLessThan(300);
+    await vi.waitFor(() => expect(atB).toContainEqual({ text: 'sas peer', encrypted: false }), { timeout: 10_000 });
+    // B paired A by invite, so plaintext under A's fingerprint is delivered, labelled unverified.
+    await vi.waitFor(() => expect(passedAtB).toContainEqual({ text: 'sas peer', notice: UNVERIFIED_PINNED_PLAINTEXT_NOTICE, trustLevel: 'verified' }), { timeout: 10_000 });
   }, 60_000);
 });

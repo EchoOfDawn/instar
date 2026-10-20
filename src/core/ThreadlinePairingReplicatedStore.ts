@@ -15,6 +15,8 @@
  *
  * Only FIVE fields ever cross a machine boundary:
  *     { peerFp, peerIdentityPub, state:'mutual-verified', verifiedAt, verifiedOnMachine }
+ * plus, since rollout step 5b, an OPTIONAL sixth: `pairingMethod` ('invite' | 'sas'), which
+ * says how the peer was paired (a capability fact, not a secret).
  * NEVER the SAS words, NEVER the shared secret, NEVER the relay token — those are bound to
  * the MACHINE-LOCAL handshake's ephemeral shared secret (machine A and B derive DIFFERENT
  * secrets/SAS for the same peer) and stay machine-local by design. This serializer
@@ -125,7 +127,21 @@ export const THREADLINE_PAIRING_STORE_KNOWN_FIELDS: ReadonlyArray<string> = Obje
   'state',
   'verifiedAt',
   'verifiedOnMachine',
+  // Sixth, OPTIONAL field (docs/specs/threadline-standalone-pairing.md D9/D11, rollout
+  // step 5b): how the peer was paired, 'invite' | 'sas'. It describes the PEER's capability
+  // (an invite-paired peer decrypts to its pinned key), not the machine's. An older machine
+  // drops it as an unknown field; on receive an unknown value is treated as absent, and an
+  // absent value means 'sas' for delivery (see evaluateInheritedVerification).
+  'pairingMethod',
 ]);
+
+/** The pairing methods that may cross the wire. 'inherited' is machine-local and never replicates. */
+export type ReplicatedPairingMethod = 'invite' | 'sas';
+
+/** A valid replicated pairing method, or undefined (unknown values are treated as absent). */
+export function clampReplicatedPairingMethod(v: unknown): ReplicatedPairingMethod | undefined {
+  return v === 'invite' || v === 'sas' ? v : undefined;
+}
 
 /** The tombstone's store-owned fields beyond the reserved envelope set. `deletedAt`
  *  is the only store field a delete (revoke/verification-failed) carries. */
@@ -188,11 +204,21 @@ export const threadlinePairingRecordStoreSchema: StoreFieldSchema = {
     //    carry the suppression. ──────────────────────────────────────────────────────
     if (op === 'delete') {
       const deletedAt = isIso8601(raw.deletedAt) ? (raw.deletedAt as string) : undefined;
+      // Optional (step 5b): the identity key the revoke is FOR, so a receiver only demotes
+      // an inherited profile pinned to that key. Non-hex ⇒ dropped (the revoke still stands,
+      // keyed on the fingerprint recordKey). An older machine drops it as a value field.
+      const peerIdentityPub = isHexString(raw.peerIdentityPub, PAIRING_FP_MIN_LEN, PAIRING_PUB_MAX_LEN)
+        ? (raw.peerIdentityPub as string)
+        : undefined;
       for (const k of Object.keys(raw)) {
         if (k === 'op' || k === 'deletedAt') continue;
+        if (k === 'peerIdentityPub' && peerIdentityPub !== undefined) continue;
         if (THREADLINE_PAIRING_STORE_KNOWN_FIELDS.includes(k)) ctx.countDroppedField();
       }
-      return deletedAt !== undefined ? { deletedAt } : {};
+      return {
+        ...(deletedAt !== undefined ? { deletedAt } : {}),
+        ...(peerIdentityPub !== undefined ? { peerIdentityPub } : {}),
+      };
     }
 
     // ── VALUE (put) branch. ──────────────────────────────────────────────────────────
@@ -218,12 +244,19 @@ export const threadlinePairingRecordStoreSchema: StoreFieldSchema = {
     const verifiedOnMachine = clampMachineId(raw.verifiedOnMachine);
     if (verifiedOnMachine === null) return null;
 
+    // pairingMethod — OPTIONAL. An unknown value is treated as ABSENT (counted as a dropped
+    // field), never a rejected record: a newer machine may one day send a method this
+    // version does not know, and the rest of the record is still a valid pin.
+    const pairingMethod = clampReplicatedPairingMethod(raw.pairingMethod);
+    if (raw.pairingMethod !== undefined && pairingMethod === undefined) ctx.countDroppedField();
+
     return {
       peerFp,
       peerIdentityPub,
       state: REPLICATED_PAIRING_STATE,
       verifiedAt,
       verifiedOnMachine,
+      ...(pairingMethod !== undefined ? { pairingMethod } : {}),
     };
   },
 };
@@ -269,6 +302,8 @@ export interface VerifiedPairingResult {
   verifiedAt: string;
   /** The machine id whose operator did the SAS comparison. */
   verifiedOnMachine: string;
+  /** How the peer was paired (D9). Optional; anything but 'invite' | 'sas' is omitted. */
+  pairingMethod?: ReplicatedPairingMethod;
 }
 
 /** The `data` object a `threadline-pairing-record` journal entry carries. */
@@ -316,6 +351,10 @@ export function buildThreadlinePairingRecordData(input: BuildThreadlinePairingRe
     state: REPLICATED_PAIRING_STATE,
     verifiedAt: result.verifiedAt,
     verifiedOnMachine: result.verifiedOnMachine,
+    // The optional sixth field: only a known method crosses (D9/D11).
+    ...(clampReplicatedPairingMethod(result.pairingMethod) !== undefined
+      ? { pairingMethod: clampReplicatedPairingMethod(result.pairingMethod) }
+      : {}),
     // envelope fields (recordKey = identity surface).
     recordKey,
     hlc,
@@ -345,6 +384,8 @@ export interface BuildThreadlinePairingTombstoneInput {
   origin: string;
   deletedAt: string;
   observed?: HlcTimestamp;
+  /** The pinned identity key being revoked (optional; lets receivers match by key). */
+  peerIdentityPub?: string;
 }
 
 /**
@@ -357,8 +398,12 @@ export interface BuildThreadlinePairingTombstoneInput {
 export function buildThreadlinePairingTombstoneData(input: BuildThreadlinePairingTombstoneInput): ThreadlinePairingRecordData | null {
   const recordKey = deriveThreadlinePairingRecordKey(input.peerFp);
   if (recordKey === null) return null;
+  const key = typeof input.peerIdentityPub === 'string' && /^[0-9a-fA-F]+$/.test(input.peerIdentityPub)
+    ? input.peerIdentityPub
+    : undefined;
   return {
     deletedAt: input.deletedAt,
+    ...(key !== undefined ? { peerIdentityPub: key } : {}),
     recordKey,
     hlc: input.hlc,
     op: 'delete' as ReplicatedOp,
@@ -414,6 +459,52 @@ export function mergeUnionToPairings(union: Map<string, UnionResult>): MergedPai
   return out;
 }
 
+/**
+ * A revoke the union currently says is in force for a recordKey (step 5b). `keys` are the
+ * identity keys the tombstones name; `unkeyed` is true when at least one tombstone (from a
+ * machine that does not send the key) names none, which then applies to the fingerprint.
+ */
+export interface PairingRevocation {
+  keys: ReadonlySet<string>;
+  unkeyed: boolean;
+}
+
+/**
+ * The revokes in force, by recordKey, respecting the union's ordering: a key whose union
+ * resolved to a tombstone (every origin's latest is a delete, or a delete superseded the
+ * puts) is revoked; a key whose union resolved to a NEWER put is not (the newer record
+ * wins). An OPEN conflict that includes a tombstone (a revoke concurrent with a put — no
+ * order between them) counts as revoked: fail closed until a newer record settles it.
+ * PURE apart from `loadOriginRecords`.
+ */
+export function revokedPairings(
+  union: Map<string, UnionResult>,
+  loadOriginRecords: (recordKey: string) => ReadonlyArray<OriginRecord>,
+  droppedOrigins: ReadonlySet<string> = new Set(),
+): Map<string, PairingRevocation> {
+  const out = new Map<string, PairingRevocation>();
+  const add = (recordKey: string, tombstones: ReadonlyArray<OriginRecord>): void => {
+    if (tombstones.length === 0) return;
+    const keys = new Set<string>();
+    let unkeyed = false;
+    for (const t of tombstones) {
+      if (typeof t.data.peerIdentityPub === 'string') keys.add(t.data.peerIdentityPub.toLowerCase());
+      else unkeyed = true;
+    }
+    out.set(recordKey, { keys, unkeyed });
+  };
+  for (const [recordKey, result] of union) {
+    if (result.conflict) {
+      add(recordKey, result.conflict.versions.filter((v) => v.envelope.op === 'delete'));
+      continue;
+    }
+    if (result.value) continue; // a put won (newer than any revoke)
+    const records = loadOriginRecords(recordKey).filter((r) => !droppedOrigins.has(r.origin));
+    add(recordKey, records.filter((r) => r.envelope.op === 'delete'));
+  }
+  return out;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // D. Consumer honoring — key-pinning (§3.8, codex finding 1)
 // ───────────────────────────────────────────────────────────────────────────
@@ -429,7 +520,19 @@ export type InheritDecision =
   | { honor: false; reason: 'identity-key-mismatch'; pinnedKey: string; presentedKey: string }
   /** Honor: the pinned identity key matches → B inherits `identity-verified` (NOT
    *  channel-ready; the credential gate still requires B's own encrypted channel). */
-  | { honor: true; pinnedKey: string; verifiedAt?: string; verifiedOnMachine?: string };
+  | {
+      honor: true;
+      pinnedKey: string;
+      verifiedAt?: string;
+      verifiedOnMachine?: string;
+      /** D9/D11 merge rule: 'invite' if ANY honoured view (same single pinned key) says
+       *  invite, else 'sas' (a missing method means sas for delivery). */
+      pairingMethod: ReplicatedPairingMethod;
+      /** True when at least one honoured view carried a known method. False means every
+       *  view came from a machine that does not send the field (the consumer then stores
+       *  'inherited', which the encrypt-to-pinned resolver treats as not-invite). */
+      pairingMethodKnown: boolean;
+    };
 
 /**
  * Decide whether machine B HONORS a replicated mutual-verified pairing for `peerFp`,
@@ -486,12 +589,49 @@ export function evaluateInheritedVerification(
     return { honor: false, reason: 'identity-key-mismatch', pinnedKey, presentedKey: presentedIdentityPub };
   }
 
+  // Merge rule (D9/D11): the method describes the PEER's capability, so ANY view for this
+  // single pinned key that says 'invite' wins; a view without the field (an older machine)
+  // never downgrades a known 'invite'. Absent everywhere ⇒ 'sas' (the safe delivery rule).
+  const methods = matching.map((v) => clampReplicatedPairingMethod(v.data.pairingMethod));
+  const pairingMethod: ReplicatedPairingMethod = methods.includes('invite') ? 'invite' : 'sas';
+  const pairingMethodKnown = methods.some((m) => m !== undefined);
+
   return {
     honor: true,
     pinnedKey,
     verifiedAt: typeof view.data.verifiedAt === 'string' ? (view.data.verifiedAt as string) : undefined,
     verifiedOnMachine: typeof view.data.verifiedOnMachine === 'string' ? (view.data.verifiedOnMachine as string) : undefined,
+    pairingMethod,
+    pairingMethodKnown,
   };
+}
+
+/**
+ * Add METHOD WITNESSES to a merged view (D11 mixed versions). The union resolves each
+ * recordKey to its latest record, so a later record from an older machine (no
+ * `pairingMethod`) would hide an earlier 'invite' from another origin for the SAME key.
+ * For every resolved (non-conflicted) view, this appends the other origins' current `put`
+ * records that pin the SAME identity key, so the merge rule can see their method. Records
+ * pinning a different key are never added (the single-key rule is untouched), and a
+ * dropped (rolled-back) origin is excluded. PURE.
+ */
+export function addPairingMethodWitnesses(
+  views: ReadonlyArray<MergedPairingView>,
+  loadOriginRecords: (recordKey: string) => ReadonlyArray<OriginRecord>,
+  droppedOrigins: ReadonlySet<string> = new Set(),
+): MergedPairingView[] {
+  const out: MergedPairingView[] = [...views];
+  for (const v of views) {
+    if (v.conflicted || typeof v.data.peerIdentityPub !== 'string') continue;
+    const key = (v.data.peerIdentityPub as string).toLowerCase();
+    for (const rec of loadOriginRecords(v.recordKey)) {
+      if (rec.origin === v.origin || droppedOrigins.has(rec.origin)) continue;
+      if (rec.envelope.op !== 'put' || rec.data.state !== REPLICATED_PAIRING_STATE) continue;
+      if (typeof rec.data.peerIdentityPub !== 'string' || rec.data.peerIdentityPub.toLowerCase() !== key) continue;
+      out.push(viewFromOriginRecord(rec, false));
+    }
+  }
+  return out;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -551,6 +691,9 @@ export function pairingResultToOriginRecord(result: VerifiedPairingResult, origi
     state: REPLICATED_PAIRING_STATE,
     verifiedAt: result.verifiedAt,
     verifiedOnMachine: result.verifiedOnMachine,
+    ...(clampReplicatedPairingMethod(result.pairingMethod) !== undefined
+      ? { pairingMethod: clampReplicatedPairingMethod(result.pairingMethod) }
+      : {}),
   };
   const envelope: ReplicatedEnvelope = { recordKey, hlc, op: 'put', origin };
   return { origin, envelope, data };

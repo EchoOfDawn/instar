@@ -63,6 +63,9 @@ export type PairingState =
    */
   | 'invite-accepted';
 
+/** How a pinned identity key was verified (spec threadline-standalone-pairing D9). */
+export type PairingMethod = 'invite' | 'sas' | 'inherited';
+
 export interface AgentTrustHistory {
   messagesReceived: number;
   messagesResponded: number;
@@ -103,6 +106,16 @@ export interface AgentTrustProfile {
   peerIdentityPub?: string;
   /** SAS fingerprint (FD3) — logged/audited value; the SAS WORDS are never stored here. */
   sasFingerprint?: string;
+  /**
+   * HOW the pinned key was verified (docs/specs/threadline-standalone-pairing.md D9):
+   * `invite` (invite-link pairing), `sas` (operator SAS comparison) or `inherited` (a
+   * replicated result from another of this agent's machines whose record carried no
+   * method). An inherited pairing whose record DID carry a method stores that method
+   * (`invite` | `sas`, rollout step 5b), so D9 applies on every machine that holds the
+   * same pinned key. D9's encrypt-to-pinned rule applies only to `invite`. Profiles from before this field are backfilled on load:
+   * a `mutual-verified` profile gets `sas` when it holds a sasFingerprint, else `invite`.
+   */
+  pairingMethod?: PairingMethod;
   /** When this side's operator SAS-confirmed the peer (ISO-8601). */
   verifiedAt?: string;
   /** Optional liveness flag (FD8): a signature-verified inbound peer receipt arrived. */
@@ -173,10 +186,12 @@ export interface PairingReplicationEmitter {
     peerIdentityPub: string;
     verifiedAt: string;
     verifiedOnMachine: string;
+    /** How the peer was paired (D9/D11, the optional sixth field): 'invite' | 'sas'. */
+    pairingMethod?: 'invite' | 'sas';
   }): void;
   /** Emit a `delete` tombstone for a revoked / verification-failed pairing (un-verify
    *  sticks pool-wide), keyed on the peer fingerprint. */
-  emitRevoke(peerFp: string, deletedAt: string): void;
+  emitRevoke(peerFp: string, deletedAt: string, peerIdentityPub?: string): void;
 }
 
 export interface InteractionStats {
@@ -616,6 +631,7 @@ export class AgentTrustManager implements InviteTrust {
     profile.pairingId = args.pairingId;
     profile.peerIdentityPub = args.peerIdentityPub;
     profile.sasFingerprint = args.sasFingerprint;
+    profile.pairingMethod = 'sas';
     profile.verifiedAt = undefined;
     profile.peerAcked = undefined;
     profile.pairingRecordedAt = now;
@@ -682,6 +698,7 @@ export class AgentTrustManager implements InviteTrust {
 
     // Record fields first (single source of truth, write source LAST).
     profile.pairingState = 'mutual-verified';
+    profile.pairingMethod = 'sas';
     profile.verifiedAt = now;
     profile.invitePausedReason = undefined; // an operator's 12-word confirm also ends a pause
     profile.invitePausedAt = undefined;
@@ -710,6 +727,7 @@ export class AgentTrustManager implements InviteTrust {
           peerIdentityPub: profile.peerIdentityPub,
           verifiedAt: now,
           verifiedOnMachine: this.machineId,
+          pairingMethod: 'sas',
         });
       } catch { /* replication failure never breaks the local trust write */ }
     }
@@ -837,6 +855,7 @@ export class AgentTrustManager implements InviteTrust {
     profile.invitePausedAt = undefined;
     profile.pairingId = undefined;
     profile.sasFingerprint = undefined;
+    profile.pairingMethod = 'invite';
     profile.verifiedAt = undefined;
     profile.peerAcked = undefined;
     profile.pairingRecordedAt = now;
@@ -877,6 +896,7 @@ export class AgentTrustManager implements InviteTrust {
       ? derivePairingIdV2(Buffer.from(args.ownIdentityPub, 'hex'), Buffer.from(key, 'hex'))
       : undefined;
     profile.sasFingerprint = undefined;
+    profile.pairingMethod = 'invite';
     profile.verifiedAt = now;
     if (this.compareTrust(profile.level, 'trusted') < 0) profile.level = 'trusted';
     profile.allowedOperations = [...DEFAULT_ALLOWED_OPS[profile.level]];
@@ -885,7 +905,7 @@ export class AgentTrustManager implements InviteTrust {
     this.save();
     if (this.pairingReplication) {
       try {
-        this.pairingReplication.emitVerified({ peerFp: fp, peerIdentityPub: key, verifiedAt: now, verifiedOnMachine: this.machineId });
+        this.pairingReplication.emitVerified({ peerFp: fp, peerIdentityPub: key, verifiedAt: now, verifiedOnMachine: this.machineId, pairingMethod: 'invite' });
       } catch { /* replication failure never breaks the local trust write */ }
     }
     this.writeAudit({
@@ -918,7 +938,7 @@ export class AgentTrustManager implements InviteTrust {
     profile.updatedAt = now;
     this.save();
     if (this.pairingReplication) {
-      try { this.pairingReplication.emitRevoke(fp, now); } catch { /* best effort */ }
+      try { this.pairingReplication.emitRevoke(fp, now, profile.peerIdentityPub); } catch { /* best effort */ }
     }
     this.writeAudit({
       timestamp: now, agent: profile.agent, previousLevel, newLevel: profile.level, source: 'setup-default',
@@ -948,7 +968,7 @@ export class AgentTrustManager implements InviteTrust {
     // §3.8 — propagate the un-verify as a TOMBSTONE so it sticks pool-wide (even on a
     // peer machine that was offline at revoke time). Best-effort; never throws out.
     if (this.pairingReplication) {
-      try { this.pairingReplication.emitRevoke(peerFp, now); }
+      try { this.pairingReplication.emitRevoke(peerFp, now, profile.peerIdentityPub); }
       catch { /* replication failure never breaks the local trust write */ }
     }
 
@@ -1028,7 +1048,17 @@ export class AgentTrustManager implements InviteTrust {
    */
   inheritReplicatedVerification(
     peerFp: string,
-    args: { peerIdentityPub: string; verifiedAt?: string; verifiedOnMachine?: string; presentedIdentityPub?: string; displayName?: string },
+    args: {
+      peerIdentityPub: string;
+      verifiedAt?: string;
+      verifiedOnMachine?: string;
+      presentedIdentityPub?: string;
+      displayName?: string;
+      /** The replicated method (D9/D11). 'invite' | 'sas' is stored as-is so the
+       *  encrypt-to-pinned resolver applies D9 here with the same pinned key; absent or
+       *  unknown is stored as 'inherited' (treated as not-invite). */
+      pairingMethod?: 'invite' | 'sas';
+    },
   ): boolean {
     if (!peerFp || !args.peerIdentityPub) return false;
     if (!isPinnableIdentityKeyHex(args.peerIdentityPub)) return false; // SEC-16
@@ -1058,7 +1088,15 @@ export class AgentTrustManager implements InviteTrust {
     const previousLevel = profile.level;
     const now = new Date().toISOString();
 
+    // Never downgrade a known 'invite' for the SAME pinned key (D11 mixed versions): the
+    // method is the peer's capability, and a record from an older machine without the field
+    // says nothing new about it. A different key starts over.
+    const sameKey = !!profile.peerIdentityPub && profile.peerIdentityPub.toLowerCase() === args.peerIdentityPub.toLowerCase();
+    const keepInvite = sameKey && profile.pairingState === 'identity-verified' && profile.pairingMethod === 'invite';
+    const method: PairingMethod = args.pairingMethod === 'invite' || args.pairingMethod === 'sas' ? args.pairingMethod : 'inherited';
+
     profile.pairingState = 'identity-verified';
+    profile.pairingMethod = keepInvite ? 'invite' : method;
     profile.peerIdentityPub = args.peerIdentityPub;
     // An inherited verification ends a pause only if it is an operator's confirm made AFTER the
     // pause: its verifiedAt must be present and strictly later than this machine's recorded
@@ -1094,6 +1132,86 @@ export class AgentTrustManager implements InviteTrust {
       source: 'mutual-verified',
       reason: `Inherited replicated verification (identity-verified${args.verifiedOnMachine ? `, from ${args.verifiedOnMachine}` : ''})`,
       userInitiated: false,
+    });
+    return true;
+  }
+
+  /**
+   * Upgrade migration (D11, rollout step 5b): re-send the replicated record of every LOCAL
+   * invite-paired, mutual-verified profile so its `pairingMethod` reaches the agent's other
+   * machines (records sent before the sixth field existed carry none). The emitter stamps a
+   * fresh HLC, so the re-sent record supersedes the old one; `verifiedAt` stays the original
+   * verification time. Only runs with the replication emitter attached (the
+   * `multiMachine.stateSync.threadlinePairing.enabled` gate). Idempotent through
+   * `alreadyPublished`, which the caller answers from THIS machine's own replicated stream
+   * (a record for that key already carrying 'invite' ⇒ skip). Inherited profiles never
+   * re-send. Returns the number of records emitted.
+   */
+  republishInvitePairingMethods(alreadyPublished: (peerFp: string, peerIdentityPub: string) => boolean): number {
+    if (!this.pairingReplication) return 0;
+    let sent = 0;
+    for (const profile of Object.values(this.profiles)) {
+      const fp = profile.fingerprint;
+      const key = profile.peerIdentityPub;
+      if (!fp || !key) continue;
+      if (profile.pairingState !== 'mutual-verified' || profile.source !== 'mutual-verified' || profile.pairingMethod !== 'invite') continue;
+      let published = false;
+      try { published = alreadyPublished(fp, key); } catch { published = false; }
+      if (published) continue;
+      try {
+        this.pairingReplication.emitVerified({
+          peerFp: fp,
+          peerIdentityPub: key,
+          verifiedAt: profile.verifiedAt ?? new Date().toISOString(),
+          verifiedOnMachine: this.machineId,
+          pairingMethod: 'invite',
+        });
+        sent++;
+      } catch { /* replication failure never breaks anything local */ }
+    }
+    return sent;
+  }
+
+  /**
+   * A replicated REVOKE for an inherited pairing (step 5b): the person unpaired on another
+   * of this agent's machines. Acts ONLY on an `identity-verified` profile — the state only
+   * inheritance sets — so a pairing established on THIS machine is never touched. When
+   * `revokedKeys` names keys, the profile must be pinned to one of them (a revoke for key K
+   * never touches a pin to another key); `unkeyed` (a tombstone from a machine that does
+   * not send the key) applies to the fingerprint.
+   *
+   * The inherited pin is FORGOTTEN, not marked verification-failed: the pairing state,
+   * method, pinned key and verification fields are cleared, the trust source goes back to
+   * setup-default and the level is clamped to `verified` (the same clamp as
+   * downgradeToPending), so credential-share and encrypt-to-pinned stop for the peer. A
+   * later, newer replicated record can be inherited again. Emits nothing (the revoke is
+   * already replicated). Returns true iff the profile was changed.
+   */
+  revokeInheritedVerification(
+    peerFp: string,
+    revoke: { keys: ReadonlySet<string>; unkeyed: boolean },
+    reason = 'replicated revoke',
+  ): boolean {
+    const profile = this.getProfileByFingerprint(String(peerFp || '').toLowerCase()) ?? this.getProfileByFingerprint(peerFp);
+    if (!profile || profile.pairingState !== 'identity-verified') return false;
+    const pinned = profile.peerIdentityPub?.toLowerCase();
+    if (!revoke.unkeyed && (!pinned || !revoke.keys.has(pinned))) return false;
+    const previousLevel = profile.level;
+    const now = new Date().toISOString();
+    profile.pairingState = undefined;
+    profile.pairingMethod = undefined;
+    profile.peerIdentityPub = undefined;
+    profile.verifiedAt = undefined;
+    profile.peerAcked = undefined;
+    profile.inheritedFromMachine = undefined;
+    profile.source = 'setup-default';
+    if (this.compareTrust(profile.level, 'verified') > 0) profile.level = 'verified';
+    profile.allowedOperations = [...DEFAULT_ALLOWED_OPS[profile.level]];
+    profile.updatedAt = now;
+    this.save();
+    this.writeAudit({
+      timestamp: now, agent: profile.agent, previousLevel, newLevel: profile.level, source: 'system',
+      reason: `Inherited pairing revoked (${reason})`, userInitiated: false,
     });
     return true;
   }
@@ -1467,6 +1585,7 @@ export class AgentTrustManager implements InviteTrust {
       profiles: {},
       updatedAt: '',
     });
+    backfillPairingMethod(data.profiles);
     return data.profiles;
   }
 
@@ -1520,4 +1639,24 @@ function isLaterThan(a: string | undefined, b: string | undefined): boolean {
   const ta = a ? Date.parse(a) : NaN;
   const tb = b ? Date.parse(b) : NaN;
   return Number.isFinite(ta) && Number.isFinite(tb) && ta > tb;
+}
+
+/**
+ * Backfill `pairingMethod` on profiles written before it existed (spec
+ * threadline-standalone-pairing D9). Idempotent and in memory: a `mutual-verified` profile
+ * with no method gets `sas` when it holds a sasFingerprint (only the SAS path sets one),
+ * else `invite` (the invite path clears it). An existing value is never overwritten. The
+ * field reaches disk with the next save, like every other profile field.
+ * Returns the number of profiles changed.
+ */
+export function backfillPairingMethod(profiles: Record<string, AgentTrustProfile> | undefined | null): number {
+  if (!profiles || typeof profiles !== 'object') return 0;
+  let changed = 0;
+  for (const p of Object.values(profiles)) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.pairingState !== 'mutual-verified' || p.pairingMethod) continue;
+    p.pairingMethod = p.sasFingerprint ? 'sas' : 'invite';
+    changed++;
+  }
+  return changed;
 }

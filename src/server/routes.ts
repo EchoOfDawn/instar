@@ -570,6 +570,11 @@ import {
   relayUnknownSenderTrustCounters,
   resolveRelayUnknownSenderTrustMode,
 } from '../threadline/relayUnknownSenderTrust.js';
+import {
+  encryptToPinnedCounters,
+  encryptToPinnedModeName,
+  resolveEncryptToPinnedMode,
+} from '../threadline/encryptToPinned.js';
 import { isRelayChainLoop } from '../messaging/MessageRouter.js';
 import { buildResentNotice, isValidMessageId } from '../threadline/InboundIdLedger.js';
 import { recordDuplicateAck, projectInboundRow } from '../threadline/inboundIdLedgerWiring.js';
@@ -5148,6 +5153,18 @@ export function createRoutes(ctx: RouteContext): Router {
             } catch { return null; /* @silent-fallback-ok — evidence only */ }
           })(),
         },
+        // Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9): the live mode
+        // (off | watch | enforce) and the process-wide counters. AUTHED only.
+        encryptToPinned: (() => {
+          const mode = resolveEncryptToPinnedMode(
+            {
+              enabled: ctx.liveConfig?.get<boolean | undefined>('threadline.encryptToPinned.enabled', undefined),
+              dryRun: ctx.liveConfig?.get<boolean | undefined>('threadline.encryptToPinned.dryRun', undefined),
+            },
+            ctx.config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
+          );
+          return { ...mode, mode: encryptToPinnedModeName(mode), ...encryptToPinnedCounters };
+        })(),
       };
       // Inbound-id ledger counters (spec "Migration parity" → counters): in
       // memory, surfaced on the AUTHED /health beside the relay verdicts.
@@ -38301,11 +38318,33 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         res.status(403).json({ success: false, refused: true, reason: 'credential-requires-encrypted-path', error: 'Credential-share refused: credential-requires-encrypted-path.' });
         return;
       }
-      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } = pinnedForCredential
-        ? relayClient.sendCredentialToPinned(resolvedId, pinnedForCredential, message, relayLegThreadId, msgId, relayLegResend || undefined)
-        : relayLegResend
-          ? relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId, true)
-          : relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId);
+      let sent: { messageId: string; threadId: string };
+      try {
+        sent = pinnedForCredential
+          ? relayClient.sendCredentialToPinned(resolvedId, pinnedForCredential, message, relayLegThreadId, msgId, relayLegResend || undefined)
+          : relayLegResend
+            ? relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId, true)
+            : relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId);
+      } catch (err) {
+        // Encrypt-to-pinned (spec threadline-standalone-pairing D9): the peer must be sent
+        // encrypted to its pinned key and that send failed. Nothing went on the wire and
+        // nothing is retried in plaintext: a failed send, 502 like a relay refusal, so the
+        // >=400 finish handler releases any reply claim. A standby that forwarded this
+        // (relayForward) transcribes the 502 unchanged.
+        if ((err as { code?: unknown } | null)?.code !== 'encrypted-send-to-pinned-failed') throw err;
+        res.status(502).json({
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          reason: 'encrypted-send-to-pinned-failed',
+          accepted: false,
+          delivered: false,
+          resolvedAgent: resolvedId,
+          deliveryPath: 'relay',
+          deliveryOutcome: 'not sent: the encrypted send to this paired peer failed, and it is never sent in plaintext.',
+        });
+        return;
+      }
+      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } = sent;
       // waitForReply: the reply listener is registered NOW, before any await, so
       // it runs concurrently with the verdict wait (no time comes off the reply
       // budget, and a fast reply can never land in a gap with no listener).

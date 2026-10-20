@@ -107,6 +107,19 @@ interface ClientAffinityEntry {
   lastUsedAt: number;
 }
 
+/**
+ * A send that had to go encrypted to a peer's PINNED key (spec threadline-standalone-pairing
+ * D9) and could not be built or handed to the relay. Nothing went on the wire, and no
+ * plaintext or relay-key fallback is attempted. The relay-send route answers it 502.
+ */
+export class EncryptToPinnedSendError extends Error {
+  readonly code = 'encrypted-send-to-pinned-failed';
+  constructor(recipientId: string, cause: unknown) {
+    super(`Encrypted send to pinned peer ${recipientId.slice(0, 12)} failed; not sent (no plaintext fallback): ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'EncryptToPinnedSendError';
+  }
+}
+
 export class ThreadlineClient extends EventEmitter {
   private readonly config: ThreadlineClientConfig;
   private readonly identityManager: IdentityManager;
@@ -114,6 +127,8 @@ export class ThreadlineClient extends EventEmitter {
   private relayClient: RelayClient | null = null;
   private identity: IdentityInfo | null = null;
   private pinnedKeyResolver: ((fp: string) => Buffer | null) | null = null;
+  /** The pinned key to ALWAYS encrypt ordinary chat to, or null (spec threadline-standalone-pairing D6, step 9). */
+  private encryptToResolver: ((fp: string, use?: 'send' | 'check') => Buffer | null) | null = null;
   private readonly knownAgents = new Map<AgentFingerprint, KnownAgent>();
   /** threadId of the most recent send()/sendPlaintext() envelope (synchronous; read by sendAutoWithThread). */
   private lastWireThreadId: string | null = null;
@@ -470,6 +485,19 @@ export class ThreadlineClient extends EventEmitter {
     messageId?: string,
     resend?: boolean,
   ): string {
+    // A peer paired by invite is always sent encrypted, to the PINNED key, whether or not the
+    // relay has given us its keys this session (never a silent plaintext downgrade).
+    // If that send cannot be built or handed to the relay, it FAILS: it never falls through to
+    // the plaintext / relay-key paths below (spec D9).
+    const pinned = this.resolveEncryptTo(recipientId, 'send');
+    if (pinned) {
+      try {
+        return this.sendToPinned(recipientId, pinned.toString('hex'), resend ? { content, resend: true } : { content }, threadId, messageId).messageId;
+      } catch (err) {
+        throw new EncryptToPinnedSendError(String(recipientId), err);
+      }
+    }
+
     // If we know the agent's keys, use encrypted send
     const known = this.knownAgents.get(recipientId);
     if (known?.publicKey && known?.x25519PublicKey) {
@@ -593,6 +621,7 @@ export class ThreadlineClient extends EventEmitter {
    * credential-bearing send when this returns false.
    */
   hasEncryptedSendPath(recipientId: AgentFingerprint): boolean {
+    if (this.resolveEncryptTo(recipientId, 'check')) return true;
     const known = this.knownAgents.get(recipientId);
     return Boolean(known?.publicKey && known?.x25519PublicKey);
   }
@@ -1035,6 +1064,24 @@ export class ThreadlineClient extends EventEmitter {
    */
   setPinnedKeyResolver(resolver: ((fp: string) => Buffer | null) | null): void {
     this.pinnedKeyResolver = resolver;
+  }
+
+  /**
+   * Where ordinary chat to `fp` must always be encrypted: the pinned identity key when the
+   * pairing makes that safe (the bootstrap decides: invite-paired and mutual-verified), else null.
+   */
+  setEncryptToResolver(resolver: ((fp: string, use?: 'send' | 'check') => Buffer | null) | null): void {
+    this.encryptToResolver = resolver;
+  }
+
+  /** `use`: 'send' for an actual send (counted by the bootstrap's watch mode), 'check' for a capability probe. */
+  private resolveEncryptTo(fp: string, use: 'send' | 'check'): Buffer | null {
+    try {
+      const key = this.encryptToResolver?.(String(fp).toLowerCase(), use) ?? null;
+      return key && key.length === 32 && key.subarray(0, 16).toString('hex') === String(fp).toLowerCase() ? key : null;
+    } catch {
+      return null;
+    }
   }
 
   private resolvePinnedKey(fp: string): Buffer | null {
