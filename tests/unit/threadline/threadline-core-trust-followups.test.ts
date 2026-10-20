@@ -137,15 +137,62 @@ describe('A. a paused invite pairing refuses a late Finish', () => {
     expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBeUndefined();
   });
 
-  it('a replicated verification from another of this agent\'s machines clears the pause', async () => {
+  // A replicated verification ends a pause only when its verifiedAt is strictly later than the
+  // pause (Echo's review of #2230): the revoke tombstone is best-effort and the replicated store can
+  // keep a concurrent put, so an OLDER verification can still arrive and must not unpause.
+  async function pausedAt() {
     const net = new Net();
     const A = makeAgent(net, 'scout'); const B = makeAgent(net, 'carl');
     await upToFinishQueued(net, A, B);
     B.trust.demoteInvitePairing(A.fp, 'invite used twice');
-    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice');
-    expect(B.trust.inheritReplicatedVerification(A.fp, { peerIdentityPub: A.pub, verifiedOnMachine: 'm2' })).toBe(true);
+    // The recorded pause time (a persisted field of the stored profile).
+    const t = Date.parse(String((B.trust.getProfileByFingerprint(A.fp) as { invitePausedAt?: string } | null)?.invitePausedAt));
+    expect(Number.isFinite(t)).toBe(true);
+    return { A, B, t };
+  }
+  const inherit = (B: Agent, A: Agent, verifiedAt?: string) =>
+    B.trust.inheritReplicatedVerification(A.fp, { peerIdentityPub: A.pub, verifiedOnMachine: 'm2', ...(verifiedAt !== undefined ? { verifiedAt } : {}) });
+
+  it('a replicated verification NEWER than the pause clears it', async () => {
+    const { A, B, t } = await pausedAt();
+    expect(inherit(B, A, new Date(t + 1000).toISOString())).toBe(true);
     expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('identity-verified');
     expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBeUndefined();
+  });
+
+  it('a replicated verification OLDER than the pause pins the key but keeps the pause', async () => {
+    const { A, B, t } = await pausedAt();
+    expect(inherit(B, A, new Date(t - 60_000).toISOString())).toBe(true);
+    expect(B.trust.getProfileByFingerprint(A.fp)?.pairingState).toBe('identity-verified');
+    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice');
+  });
+
+  it('a replicated verification at the SAME time as the pause keeps it (strictly later only)', async () => {
+    const { A, B, t } = await pausedAt();
+    inherit(B, A, new Date(t).toISOString());
+    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice');
+  });
+
+  it('a replicated verification with NO verifiedAt keeps the pause', async () => {
+    const { A, B } = await pausedAt();
+    expect(inherit(B, A)).toBe(true);
+    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice');
+  });
+
+  it('an UNPARSABLE verifiedAt is treated like a missing one: pause kept', async () => {
+    const { A, B } = await pausedAt();
+    // Lexically "later" than any ISO time, so a string comparison would wrongly clear the pause.
+    inherit(B, A, 'zzzz-not-a-time');
+    expect(B.trust.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice');
+  });
+
+  it('the pause time survives a restart, and a later clear removes it', async () => {
+    const { A, B, t } = await pausedAt();
+    const reloaded = new AgentTrustManager({ stateDir: B.dir });
+    reloaded.inheritReplicatedVerification(A.fp, { peerIdentityPub: A.pub, verifiedAt: new Date(t - 1000).toISOString() });
+    expect(reloaded.getProfileByFingerprint(A.fp)?.via).toBe('paused: invite used twice'); // invitePausedAt was persisted
+    expect(reloaded.markInviteVerified(A.fp, { peerIdentityPub: A.pub, via: 'x', ownFp: B.fp, ownIdentityPub: B.pub })).toBe(true);
+    expect(JSON.stringify(reloaded.getProfileByFingerprint(A.fp))).not.toContain('invitePaused');
   });
 
   it('markInviteVerified (a fresh, completed pairing) clears the pause', async () => {
