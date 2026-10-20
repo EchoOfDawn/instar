@@ -503,8 +503,15 @@ export async function bootstrapThreadline(
       });
       pairingInvites = { flow, store: invStore, events: invEvents };
     } catch (err) {
-      // Logged, not silent: invite pairing stays off until the store file is readable.
-      console.error(`[pairing-invite] invite pairing is off: ${err instanceof Error ? err.message : String(err)}`);
+      // Reported, not just logged: "invite pairing is off" shows in /health and the degradation
+      // digest until the store file is readable again.
+      DegradationReporter.getInstance().report({
+        feature: 'Threadline.pairingInvites',
+        primary: 'pair with another agent by invite (pairing-invites.json)',
+        fallback: 'invite pairing is off on this agent; the rest of Threadline keeps running and the file is left untouched',
+        reason: err instanceof Error ? err.message : String(err),
+        impact: 'invites cannot be sent, accepted or finished until threadline/pairing-invites.json can be read; it is never replaced with an empty file',
+      });
     }
 
     // Create inbound message gate (imports ThreadlineRouter lazily if needed)

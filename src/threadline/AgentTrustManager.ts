@@ -21,7 +21,7 @@ import path from 'node:path';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { PairingPendingStore, type PendingPairingRecord } from './PairingPendingStore.js';
 import { deriveSASv2, deriveSasBitsV2, deriveSasFingerprintV2, derivePairingIdV2 } from './ThreadlineCrypto.js';
-import type { InviteTrust } from '@sagemindai/threadline-core';
+import { isAcceptableIdentityKey, type InviteTrust } from '@sagemindai/threadline-core';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -113,6 +113,24 @@ export interface AgentTrustProfile {
   /** When the pairingState is `identity-verified` (§3.8), the machine id whose operator
    *  SAS-compared (carried by the replicated record). Audit/observability only. */
   inheritedFromMachine?: string;
+  /**
+   * Set when an invite pairing was paused because its invite was used twice (spec
+   * a2a-pairing-invite-link §4.4.2): the reason given at the pause. Exposed to the invite engine
+   * as `via: "paused: <reason>"`, so a late Finish cannot re-promote the pin
+   * (threadline-standalone-pairing step 3 follow-up). Cleared only by markInviteVerified.
+   */
+  invitePausedReason?: string;
+  /** Read-only view for threadline-core's InviteTrust: `paused: <reason>` while paused. */
+  readonly via?: string;
+}
+
+/**
+ * SEC-16 (spec threadline-standalone-pairing D8): a key that is small-order or not canonical is
+ * refused when pinning. Hex in, so every pinning path can share it.
+ */
+function isPinnableIdentityKeyHex(hex: string | undefined): boolean {
+  if (!hex || !/^[0-9a-fA-F]{64}$/.test(hex)) return false;
+  return isAcceptableIdentityKey(Buffer.from(hex, 'hex'));
 }
 
 export interface TrustAuditEntry {
@@ -341,7 +359,7 @@ export class AgentTrustManager implements InviteTrust {
   getProfileByFingerprint(fingerprint: string): AgentTrustProfile | null {
     for (const profile of Object.values(this.profiles)) {
       if (profile.fingerprint === fingerprint) {
-        return profile;
+        return withPausedVia(profile);
       }
     }
     return null;
@@ -586,6 +604,7 @@ export class AgentTrustManager implements InviteTrust {
   ): boolean {
     // FD12 — self-pair guard.
     if (!peerFp || peerFp === args.ownFp) return false;
+    if (!isPinnableIdentityKeyHex(args.peerIdentityPub)) return false; // SEC-16
 
     const profile = this.getOrCreateProfileByFingerprint(peerFp, args.displayName);
     const now = new Date().toISOString();
@@ -662,6 +681,7 @@ export class AgentTrustManager implements InviteTrust {
     // Record fields first (single source of truth, write source LAST).
     profile.pairingState = 'mutual-verified';
     profile.verifiedAt = now;
+    profile.invitePausedReason = undefined; // an operator's 12-word confirm also ends a pause
     if (typeof args.peerAcked === 'boolean') profile.peerAcked = args.peerAcked;
 
     // Raise to 'trusted' if below; never to 'autonomous' (FD6).
@@ -737,12 +757,13 @@ export class AgentTrustManager implements InviteTrust {
     args: { ownIdentityPub: Buffer; peerIdentityPub: Buffer; ownFp: string; displayName?: string; clearFailed?: boolean },
   ):
     | { outcome: 'started' | 'already-pending' | 'already-verified'; pairingId: string; sasFingerprint: string }
-    | { outcome: 'self-pair' | 'fingerprint-mismatch' | 'refused-failed' } {
+    | { outcome: 'self-pair' | 'fingerprint-mismatch' | 'refused-failed' | 'unacceptable-key' } {
     const fp = (peerFp || '').toLowerCase();
     if (!fp || fp === (args.ownFp || '').toLowerCase()) return { outcome: 'self-pair' };
     if (args.peerIdentityPub.length !== 32 || args.peerIdentityPub.subarray(0, 16).toString('hex') !== fp) {
       return { outcome: 'fingerprint-mismatch' };
     }
+    if (!isAcceptableIdentityKey(args.peerIdentityPub)) return { outcome: 'unacceptable-key' };
     const pairingId = derivePairingIdV2(args.ownIdentityPub, args.peerIdentityPub);
     const sasBits = deriveSasBitsV2(args.ownIdentityPub, args.peerIdentityPub);
     const sasFingerprint = deriveSasFingerprintV2(sasBits);
@@ -799,6 +820,7 @@ export class AgentTrustManager implements InviteTrust {
     const key = String(args.peerIdentityPub || '').toLowerCase();
     if (!/^[0-9a-f]{32}$/.test(fp) || !/^[0-9a-f]{64}$/.test(key) || key.slice(0, 32) !== fp) return false;
     if (args.ownFp && fp === args.ownFp.toLowerCase()) return false; // self-pair
+    if (!isPinnableIdentityKeyHex(key)) return false; // SEC-16
     const profile = this.getOrCreateProfileByFingerprint(fp, args.displayName);
     if ((profile.pairingState === 'mutual-verified' || profile.pairingState === 'identity-verified') && profile.peerIdentityPub === key) {
       return true; // already verified for this exact key
@@ -806,6 +828,9 @@ export class AgentTrustManager implements InviteTrust {
     const now = new Date().toISOString();
     profile.pairingState = 'invite-accepted';
     profile.peerIdentityPub = key;
+    // The operator approved a NEW invite from this peer: that is the re-confirmation a pause
+    // waits for (a2a-pairing-invite-link §4.4.2), so the new invite's Finish may complete.
+    profile.invitePausedReason = undefined;
     profile.pairingId = undefined;
     profile.sasFingerprint = undefined;
     profile.verifiedAt = undefined;
@@ -830,6 +855,7 @@ export class AgentTrustManager implements InviteTrust {
     const key = String(args.peerIdentityPub || '').toLowerCase();
     if (!/^[0-9a-f]{32}$/.test(fp) || !/^[0-9a-f]{64}$/.test(key) || key.slice(0, 32) !== fp) return false;
     if (args.ownFp && fp === args.ownFp.toLowerCase()) return false;
+    if (!isPinnableIdentityKeyHex(key)) return false; // SEC-16
     const profile = this.getOrCreateProfileByFingerprint(fp, args.displayName);
     // A pinned key may only be replaced by re-pairing: never silently swap keys here.
     if (profile.peerIdentityPub && profile.peerIdentityPub !== key && profile.pairingState !== 'verification-failed' && profile.pairingState !== undefined) {
@@ -839,6 +865,7 @@ export class AgentTrustManager implements InviteTrust {
     const now = new Date().toISOString();
     profile.pairingState = 'mutual-verified';
     profile.peerIdentityPub = key;
+    profile.invitePausedReason = undefined; // a completed pairing ends a pause
     // The same pairingId v2 uses (HKDF over the two identity keys), so the credential gate can
     // check our own key has not rotated since verification (CredentialShareGate check 3).
     profile.pairingId = args.ownIdentityPub
@@ -880,6 +907,7 @@ export class AgentTrustManager implements InviteTrust {
     const now = new Date().toISOString();
     profile.pairingState = 'invite-accepted';
     profile.verifiedAt = undefined;
+    profile.invitePausedReason = String(reason || 'invite used twice');
     if (profile.source === 'mutual-verified') profile.source = 'setup-default';
     profile.updatedAt = now;
     this.save();
@@ -997,6 +1025,7 @@ export class AgentTrustManager implements InviteTrust {
     args: { peerIdentityPub: string; verifiedAt?: string; verifiedOnMachine?: string; presentedIdentityPub?: string; displayName?: string },
   ): boolean {
     if (!peerFp || !args.peerIdentityPub) return false;
+    if (!isPinnableIdentityKeyHex(args.peerIdentityPub)) return false; // SEC-16
 
     const profile = this.getOrCreateProfileByFingerprint(peerFp, args.displayName);
 
@@ -1445,4 +1474,22 @@ export class AgentTrustManager implements InviteTrust {
   private compareTrust(a: AgentTrustLevel, b: AgentTrustLevel): number {
     return TRUST_ORDER.indexOf(a) - TRUST_ORDER.indexOf(b);
   }
+}
+
+/**
+ * The profile as threadline-core's invite engine reads it: `via` is `paused: <reason>` while an
+ * invite pairing is paused (core's handleFinish refuses a Finish then). A getter, so it is never
+ * written to the trust file and always reflects the stored pause.
+ */
+function withPausedVia(profile: AgentTrustProfile): AgentTrustProfile {
+  if (!Object.prototype.hasOwnProperty.call(profile, 'via')) {
+    Object.defineProperty(profile, 'via', {
+      enumerable: false,
+      configurable: true,
+      get(this: AgentTrustProfile) {
+        return this.invitePausedReason !== undefined ? `paused: ${this.invitePausedReason}` : undefined;
+      },
+    });
+  }
+  return profile;
 }
