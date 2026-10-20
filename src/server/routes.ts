@@ -19000,6 +19000,9 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       case 'refused-failed':
         res.status(409).json({ error: 'this pairing was denied by an operator; clearing it requires the dashboard PIN (clearFailed: true)' });
         return;
+      case 'unacceptable-key':
+        res.status(409).json({ error: 'that agent\'s identity key is a weak or non-canonical key, so it cannot be paired' });
+        return;
       default:
         res.json({
           outcome: result.outcome,
