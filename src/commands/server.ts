@@ -62,6 +62,7 @@ import { resolveDevAgentGate, resolveStateSyncStores } from '../core/devAgentGat
 import { resolveRelayUnknownSenderTrustMode } from '../threadline/relayUnknownSenderTrust.js';
 import { resolveEncryptToPinnedMode, encryptToPinnedModeName } from '../threadline/encryptToPinned.js';
 import { resolveRefuseDowngradeMode } from '../threadline/refuseDowngrade.js';
+import { MarkedPairingInviteFlow } from '../threadline/PairingPendingAcceptMarkers.js';
 import { resolveAntiThrashKnobs, readingValidity } from '../core/SwapAntiThrash.js';
 import { shouldReleaseOnComplete, planClaimOnSpawn, ownershipNonce } from '../core/ownershipFollowsLiveWork.js';
 import { PrHandLease } from '../core/PrHandLease.js';
@@ -18413,8 +18414,8 @@ export async function startServer(options: StartOptions): Promise<void> {
           config as { developmentAgent?: boolean; threadline?: { relayUnknownSenderTrust?: { enabled?: boolean; dryRun?: boolean } } },
         ),
         // Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9). Read live per
-        // send: `enabled` omitted rides the developmentAgent gate, `dryRun` defaults true
-        // (count would-encrypt sends, send as today).
+        // send. Ships ON for every agent (Justin 2026-10-20): omitted means enforce; an explicit
+        // `enabled: false` is off and `dryRun: true` is watch.
         getEncryptToPinnedMode: () => resolveEncryptToPinnedMode(
           {
             enabled: liveConfig.get<boolean | undefined>('threadline.encryptToPinned.enabled', undefined),
@@ -18423,8 +18424,8 @@ export async function startServer(options: StartOptions): Promise<void> {
           config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
         ),
         // Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6, step 6). Read live
-        // per inbound message: `enabled` omitted rides the developmentAgent gate, `dryRun`
-        // defaults true (record marks, count would-refuse plaintext, deliver as today).
+        // per inbound message. Ships at WATCH for every agent: `enabled` omitted means on,
+        // `dryRun` omitted means true (record marks, count would-refuse plaintext, deliver).
         getRefuseDowngradeMode: () => resolveRefuseDowngradeMode(
           {
             enabled: liveConfig.get<boolean | undefined>('threadline.refuseDowngrade.enabled', undefined),
@@ -18437,6 +18438,13 @@ export async function startServer(options: StartOptions): Promise<void> {
       threadlineShutdown = threadline.shutdown;
       threadlineRelayClient = threadline.relayClient;
       threadlinePairingInvites = threadline.pairingInvites;
+      // An invite waiting for the operator's approval lives only in memory (its secret never
+      // touches disk), so an update restart would lose it. Hold automatic update restarts while
+      // one waits, each until its invite expires (docs/specs/a2a-pairing-invite-link.md §8).
+      {
+        const invFlow = threadline.pairingInvites?.flow;
+        if (invFlow instanceof MarkedPairingInviteFlow) autoUpdater.setRestartHold('pairing-invite', () => invFlow.restartHolds());
+      }
       threadlineGetLastRelayEvent = threadline.getLastRelayEvent;
       _threadlineBoot = threadline;
       // A2A cross-machine route §1: the boot-time standby fact, threaded from
@@ -18529,7 +18537,18 @@ export async function startServer(options: StartOptions): Promise<void> {
           activeMachineCount: coordinator.enabled ? coordinator.managers.identityManager.getActiveMachines().length : 1,
           pairingReplicationEnabled: isThreadlinePairingReplicationEnabled(config),
         });
-        if (note) console.warn(pc.yellow(`  [threadline] ${note}`));
+        if (note) {
+          console.warn(pc.yellow(`  [threadline] ${note}`));
+          // Encryption ships on (Justin 2026-10-20), so this now applies to every multi-machine
+          // agent that has not turned pairing replication on: surface it, not just log it.
+          DegradationReporter.getInstance().report({
+            feature: 'Threadline.encryptToPinned',
+            primary: 'every machine of this agent encrypts ordinary chat to peers paired by invite',
+            fallback: 'only the machine that made the pairing always encrypts; another machine that takes the relay uses the older rule',
+            reason: 'pairing replication (multiMachine.stateSync.threadlinePairing) is off on a multi-machine agent',
+            impact: note,
+          });
+        }
       } catch { /* @silent-fallback-ok — an advisory startup note must never endanger boot */ }
 
       if (threadlineRelayClient) {

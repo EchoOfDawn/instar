@@ -580,6 +580,7 @@ import {
 import {
   refuseDowngradeCounters,
   refuseDowngradeModeName,
+  downgradeRefusals,
   resolveRefuseDowngradeMode,
 } from '../threadline/refuseDowngrade.js';
 import { isRelayChainLoop } from '../messaging/MessageRouter.js';
@@ -3397,6 +3398,16 @@ export function createRoutes(ctx: RouteContext): Router {
       operatorTopicId: () => ctx.telegram!.getLifelineTopicId(),
       enforcing: () => lifelineIngressGuard.mode() === 'enforce'
         && (ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true,
+      // Invites that were waiting for approval when the server restarted: told once each (spec §8).
+      restartNotices: ctx.pairingInvites.markers
+        ? { list: () => ctx.pairingInvites!.markers!.notices(), markNotified: (id: string) => ctx.pairingInvites!.markers!.markTelegramNotified(id) }
+        : undefined,
+      // The expiry in that notice is in the owner's own time zone when their user profile has one.
+      timeZone: async (owner) => {
+        if (owner === undefined) return undefined;
+        const { UserManager } = await import('../users/UserManager.js');
+        return new UserManager(ctx.config.stateDir).resolveFromTelegramUserId(owner)?.preferences?.timezone;
+      },
     })
     : null;
   ctx.guardRegistry?.register('telegramIngress.lifelineSecret', () => lifelineIngressGuard.guardStatus());
@@ -5182,7 +5193,9 @@ export function createRoutes(ctx: RouteContext): Router {
             },
             ctx.config as { developmentAgent?: boolean; threadline?: { refuseDowngrade?: { enabled?: boolean; dryRun?: boolean } } },
           );
-          return { ...mode, mode: refuseDowngradeModeName(mode), ...refuseDowngradeCounters };
+          // `refusals`: one record per peer whose plaintext was refused, with the named reason,
+          // the remedy and the notices sent back (Echo, 2026-10-20: never a silent drop).
+          return { ...mode, mode: refuseDowngradeModeName(mode), ...refuseDowngradeCounters, refusals: downgradeRefusals.snapshot() };
         })(),
       };
       // Inbound-id ledger counters (spec "Migration parity" → counters): in
@@ -18860,7 +18873,27 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       .filter((p) => typeof p.fingerprint === 'string' && /^[0-9a-f]{32}$/.test(p.fingerprint) && p.fingerprint !== ownFp
         && (!p.relayFirstContact || p.pairingState !== undefined))
       .map((p) => ({ fp: p.fingerprint as string, name: p.agent, pairingState: p.pairingState ?? null }));
-    res.json({ invites: pi.store.list(), pendingAccepts: pi.flow.listPendingAccepts(), knownPeers });
+    // restartNotices: invites that were waiting for approval when the server restarted (their
+    // secret was in memory only, so they are gone). Secret-free: a hash id, claimed names, expiry.
+    let restartNotices: unknown[] = [];
+    try { restartNotices = (pi.markers?.notices() ?? []).map(({ id, claimedAgent, claimedOwner, exp }) => ({ id, claimedAgent, claimedOwner, exp })); } catch { restartNotices = []; }
+    res.json({ invites: pi.store.list(), pendingAccepts: pi.flow.listPendingAccepts(), knownPeers, restartNotices });
+  });
+
+  // Dismiss a restart notice. Bearer: dismissing a reminder grants nothing.
+  router.delete('/threadline/pairing/restart-notices/:id', (req, res) => {
+    const pi = invitesOrRefuse(req, res);
+    if (!pi) return;
+    const id = String(req.params.id || '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(id)) {
+      res.status(400).json({ error: 'id must be 64 hex characters' });
+      return;
+    }
+    if (!pi.markers?.dismiss(id)) {
+      res.status(404).json({ error: 'no such notice' });
+      return;
+    }
+    res.json({ ok: true, id });
   });
 
   // Revoke an open invite (making it useless). Bearer: revoking only removes an option.
