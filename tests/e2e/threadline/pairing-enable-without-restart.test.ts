@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { RelayServer } from '../../../src/threadline/relay/RelayServer.js';
 import { bootstrapThreadline } from '../../../src/threadline/ThreadlineBootstrap.js';
+import { useHermeticHome } from '../../setup/hermetic-home.js';
 import { createUnifiedTrustSystem } from '../../../src/threadline/UnifiedTrustWiring.js';
 import { HandshakeManager } from '../../../src/threadline/HandshakeManager.js';
 import { AgentServer } from '../../../src/server/AgentServer.js';
@@ -30,6 +31,9 @@ import { useHermeticHome } from '../../setup/hermetic-home.js';
 
 // HOME → temp for every test here: bootstrapThreadline() writes the user-scope
 // ~/.claude.json, and this file must never touch the operator's real one.
+useHermeticHome();
+
+// bootstrapThreadline writes ~/.claude.json — keep it off the real HOME.
 useHermeticHome();
 
 const AUTH = 'pp-auth';
