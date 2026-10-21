@@ -32984,6 +32984,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
             expiresAt, verificationMethod, verificationPath,
             // Promise Beacon fields (PROMISE-BEACON-SPEC.md Phase 1)
             beaconEnabled, cadenceMs, nextUpdateDueAt,
+            checkInAt,
             softDeadlineAt, hardDeadlineAt, sessionEpoch,
             ownerMachineId, externalKey, beaconCreatedBySource,
             followThroughOptOutReason,
@@ -33020,6 +33021,29 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     for (const [field, value] of deadlineFields) {
       if (value !== undefined && value !== null && !isIso8601(value)) {
         res.status(400).json({ error: `"${field}" must be a valid ISO 8601 timestamp` });
+        return;
+      }
+    }
+    // checkInAt — a promised MOMENT, validated more strictly than the deadline
+    // fields above, and deliberately NOT one of them (see below).
+    //
+    // The contract says "an absolute ISO instant — resolve 'Friday' to a real
+    // moment at creation time; never store a bare date". `isIso8601` would accept
+    // `2026-10-24`, which Date.parse reads as midnight UTC — a reminder promised
+    // for "Friday" would then fire at 5pm Thursday for an operator in Pacific
+    // time. So a date with no time component is REFUSED with the reason, rather
+    // than silently resolved to an hour nobody chose.
+    if (checkInAt !== undefined && checkInAt !== null) {
+      if (!isIso8601(checkInAt)) {
+        res.status(400).json({ error: '"checkInAt" must be a valid ISO 8601 timestamp' });
+        return;
+      }
+      if (!/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(checkInAt)) {
+        res.status(400).json({
+          error: '"checkInAt" must be an absolute instant with a time, not a bare date '
+            + '(a bare date resolves to midnight UTC, which is an hour nobody chose). '
+            + 'Resolve the promise to a real moment first, e.g. 2026-10-24T17:00:00Z',
+        });
         return;
       }
     }
@@ -33094,6 +33118,14 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         configPath, configExpectedValue, behavioralRule,
         expiresAt, verificationMethod, verificationPath,
         beaconEnabled: effectiveBeaconEnabled, cadenceMs, nextUpdateDueAt,
+        // NOT folded into `deadlineFields`, and NOT accepted as the single
+        // follow-through choice. The reconciler that acts on a dated check-in ships
+        // `dryRun: true`, so a commitment carrying ONLY a checkInAt would be
+        // recorded as "covered" by a mechanism that currently sends nothing — the
+        // exact dark-feature trap that let five fixes ship unannounced this morning.
+        // It is additive to beacon enrollment until that dryRun is deliberately
+        // flipped; `GET /commitments/check-in-reminder` reports the flag.
+        checkInAt,
         softDeadlineAt, hardDeadlineAt, sessionEpoch,
         ownerMachineId, externalKey, beaconCreatedBySource,
         ...(normalizedOptOutReason ? { followThroughOptOutReason: normalizedOptOutReason } : {}),
