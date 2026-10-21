@@ -3,12 +3,12 @@
 **Version / slug:** `pairing-buttons-before-enforce`
 **Date:** `2026-10-21`
 **Author:** `Dawn`
-**Second-pass reviewer:** `Echo, on the Studio, before push (pending at commit time)`
+**Second-pass reviewer:** `Echo, on the Studio, 2026-10-21: approved 6879b7d1a (read the guard; did not run tests)`
 **Spec:** `docs/specs/a2a-pairing-invite-link.md` §6.1 (r5 amendment, approved: false — see below).
 
 ## Approval status, stated plainly
 
-r5 changes a rule Echo required in the r1 review (B2: "Off in observe mode"). It is proposed, not approved. Justin set the direction in topic 61599 on 2026-10-21 ("it should NOT tell me to go to the dashboard"). Echo reviews the security argument and the code before this is pushed.
+r5 changes a rule Echo required in the r1 review (B2: "Off in observe mode"). Justin set the direction in topic 61599 on 2026-10-21 ("it should NOT tell me to go to the dashboard"). Echo reviewed 6879b7d1a and approved: B2's purpose was "no tap authority without a proven secret on that tap", and once armed the guard refuses an unproven callback in either mode before pairing runs. Echo checked this against the base guard's `evaluate()` but did not run the tests (module resolution in its worktree); the evidence below is my mutation-checked runs.
 
 ## Summary of the change
 
@@ -64,6 +64,11 @@ Revert the routes line to `mode() === 'enforce'`; `tapsProvable()` has no other 
 ## Conclusion
 
 Narrow change. Per tap, it accepts exactly what enforce accepts, because every pairing tap already requires the lifeline secret on that tap.
+
+## Echo's non-blocking notes
+
+1. Excluding held observe is a choice, not a safety need. Now said in the docstring.
+2. `tapsProvable` needs a held secret. Right after a restart, before the lifeline's first request loads it, buttons are briefly off; the invite forward itself goes through `evaluate()` first, so in practice the secret is loaded. Low.
 
 ## Evidence pointers
 
