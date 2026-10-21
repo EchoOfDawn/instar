@@ -16,6 +16,14 @@ A live walk on 1.3.1362 (pairing enforcing) showed the dashboard reload passes b
 
 Files: `src/threadline/PairingPendingAcceptMarkers.ts`, `src/threadline/ThreadlineBootstrap.ts`, `src/threadline/PairingInviteTelegram.ts`, `src/server/routes.ts`, `src/core/UpdateGate.ts`, `src/core/AutoUpdater.ts`, `src/commands/server.ts`, `dashboard/pairing.js`, tests.
 
+## Revision after Echo's review (bounded hold)
+
+Echo found the hold was bounded only by the invite's `exp`, which the INVITER writes: core 0.1.0 (pinned from npm, so not changed here) checks only that `exp` parses, and `INVITE_MAX_TTL_MS` (24 h) is applied in `createInvite`, never on receipt. An invite with `exp` in 2099, forwarded and left unapproved, would have held every automatic update until 2099. Three fixes, all on the Instar side:
+
+- **Refused on receipt** (`MarkedPairingInviteFlow.receiveInvite`, the Instar wrapper, chosen because core is pinned): an invite whose `exp` is more than `INVITE_MAX_TTL_MS` + 5 min skew ahead is refused with the named reason `EXP_TOO_FAR_REASON` before the engine sees it. No pending accept, marker, notice or hold is created. This covers the dashboard paste and the Telegram forward, which both call this method.
+- **Clamp** (defence in depth): each hold's `until` is `min(exp, firstSeen + INVITE_MAX_TTL_MS)`, where firstSeen is when this engine recorded the accept (or first listed it, if it entered some other way).
+- **maxDeferralHours**: the hold path now stops holding once this version's durable deferral (`restartDeferral.firstDeferredAt`, whatever started it) is older than the gate's `maxDeferralHours` (4 h default). It logs that, and the re-check lands at that ceiling. Holds can therefore never exceed the session gate's own ceiling, and a server restart does not reset the clock.
+
 ## Decision-point inventory
 
 - `AutoUpdater.gatedRestart` restart-hold check — **add** — automatic update restart deferred while a hold is in force (bounded by the hold's `until`).
@@ -29,7 +37,7 @@ Files: `src/threadline/PairingPendingAcceptMarkers.ts`, `src/threadline/Threadli
 
 ## 1. Over-block
 
-The only blocking surface is the restart hold. An automatic update restart is delayed while an invite waits, at most until that invite expires (1 h default, 24 h maximum, set by the inviter). An operator who wants the update right away can use the manual apply (`POST /updates/apply`, dashboard Update button), which is not held. An invite the operator has forgotten holds updates for up to its lifetime; that is the trade the design accepted (losing the invite is worse than a delay of at most its own lifetime).
+The only blocking surfaces are the restart hold and the receipt check. An automatic update restart is delayed while an invite waits, at most until the soonest of: the invite's expiry, 24 h after it was first seen, and the gate's maxDeferralHours (4 h) from the version's first deferral. The receipt check refuses an invite claiming more than 24 h + 5 min of life; a genuine invite made by `createInvite` can never exceed 24 h, so only a recipient clock more than 5 min behind could see a real 24 h invite refused. An operator who wants the update right away can use the manual apply (`POST /updates/apply`, dashboard Update button), which is not held. An invite the operator has forgotten holds updates for up to its lifetime; that is the trade the design accepted (losing the invite is worse than a delay of at most its own lifetime).
 
 ## 2. Under-block
 

@@ -93,6 +93,47 @@ describe('AutoUpdater restart holds', () => {
     u.stop();
   });
 
+  it('respects maxDeferralHours (4 h): a hold that would last 20 h stops holding after 4 h', async () => {
+    const u = updater(() => [{ name: 'pairing-invite:abcd1234', until: Date.now() + 20 * 3_600_000, reason: 'invite waiting' }]);
+    await gated(u);
+    await vi.advanceTimersByTimeAsync(3 * 3_600_000 + 50 * 60_000);
+    expect(fs.existsSync(restartFile())).toBe(false);
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(fs.existsSync(restartFile())).toBe(true);
+    expect(log.mock.calls.some((c) => String(c[0]).includes('Restart holds for v0.9.9 ignored: max deferral (4h) reached'))).toBe(true);
+    u.stop();
+  });
+
+  it('the max-deferral clock is the durable first deferral: a server restart does not reset it', async () => {
+    const holds = () => [{ name: 'pairing-invite:abcd1234', until: Date.now() + 20 * 3_600_000, reason: 'invite waiting' }];
+    fs.writeFileSync(path.join(tmpDir, 'state', 'auto-updater.json'), JSON.stringify({
+      restartDeferral: {
+        active: true, targetVersion: '0.9.9', firstDeferredAt: new Date(Date.now() - 5 * 3_600_000).toISOString(),
+        reason: 'held', currentBlockers: ['pairing-invite:abcd1234'], nextRetryAt: new Date(Date.now() + 3_600_000).toISOString(), updatedAt: new Date().toISOString(),
+      },
+    }));
+    const u = updater(holds);
+    await gated(u);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fs.existsSync(restartFile())).toBe(true);
+    u.stop();
+  });
+
+  it('near the max-deferral ceiling the re-check lands at the ceiling, not a full 5 minutes later', async () => {
+    const holds = () => [{ name: 'pairing-invite:abcd1234', until: Date.now() + 20 * 3_600_000, reason: 'invite waiting' }];
+    const first = Date.now() - (4 * 3_600_000 - 2 * 60_000); // ceiling in 2 min
+    fs.writeFileSync(path.join(tmpDir, 'state', 'auto-updater.json'), JSON.stringify({
+      restartDeferral: {
+        active: true, targetVersion: '0.9.9', firstDeferredAt: new Date(first).toISOString(),
+        reason: 'held', currentBlockers: ['pairing-invite:abcd1234'], nextRetryAt: new Date(Date.now() + 3_600_000).toISOString(), updatedAt: new Date().toISOString(),
+      },
+    }));
+    const u = updater(holds);
+    await gated(u);
+    expect(Date.parse(u.getStatus().restartDeferral!.nextRetryAt!)).toBeLessThanOrEqual(first + 4 * 3_600_000 + 1_000);
+    u.stop();
+  });
+
   it('a manual apply (operator act) is not held', async () => {
     const u = updater(() => [{ name: 'pairing-invite:abcd1234', until: Date.now() + 40 * 60_000, reason: 'invite waiting' }]);
     await gated(u, true);

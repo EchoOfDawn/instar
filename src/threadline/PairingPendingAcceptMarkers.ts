@@ -29,6 +29,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { PairingInviteFlow, type InviteFlowDeps, type Result } from './PairingInviteFlow.js';
+import { decodeInvite, findInviteToken, INVITE_MAX_TTL_MS } from './PairingInvite.js';
+
+/** Clock skew tolerated between inviter and recipient when checking an invite's lifetime. */
+export const INVITE_EXP_SKEW_MS = 5 * 60_000;
+/** The reason an invite whose expiry is further out than any invite may live is refused. */
+export const EXP_TOO_FAR_REASON = 'this invite claims to stay valid for longer than 24 hours, which no real invite does; do not pair, ask for a new one';
 
 export const PENDING_ACCEPT_MARKERS_FILE = 'pairing-pending-accept-markers.json';
 
@@ -169,8 +175,13 @@ export class PairingPendingAcceptMarkers {
  * keeps them (its in-memory map); this subclass only reads the engine's own secret-free listing.
  */
 export class MarkedPairingInviteFlow extends PairingInviteFlow {
+  private readonly clock: () => Date;
+  /** When each pending accept was first recorded here: the clamp for its restart hold. */
+  private readonly recordedAt = new Map<string, number>();
+
   constructor(deps: InviteFlowDeps, readonly markers: PairingPendingAcceptMarkers) {
     super(deps);
+    this.clock = deps.now ?? (() => new Date());
   }
 
   /** Marker writes are reminders: a failed write must never fail the pairing step itself. */
@@ -184,10 +195,28 @@ export class MarkedPairingInviteFlow extends PairingInviteFlow {
     return super.listPendingAccepts().map((p) => p.iid);
   }
 
+  /**
+   * Refuse on receipt any invite whose expiry is more than INVITE_MAX_TTL_MS (+ 5 min skew) ahead.
+   * The expiry is written by the INVITER and core 0.1.0 (pinned from npm) checks only that it
+   * parses: the 24 h cap is applied when an invite is created, never when one is received. An
+   * unbounded expiry would otherwise bound nothing: the marker, the notice and the auto-updater's
+   * restart hold all end at it (Echo's review of this change).
+   */
   override async receiveInvite(text: string): Promise<Result> {
+    const token = findInviteToken(String(text ?? ''));
+    if (token) {
+      const d = decodeInvite(token);
+      if (d.ok) {
+        const exp = Date.parse(d.invite.exp);
+        if (Number.isFinite(exp) && exp > this.clock().getTime() + INVITE_MAX_TTL_MS + INVITE_EXP_SKEW_MS) {
+          return { ok: false, reason: EXP_TOO_FAR_REASON };
+        }
+      }
+    }
     const r = await super.receiveInvite(text);
     if (r.ok) {
       const iid = String(r.iid);
+      this.recordedAt.set(iid, this.clock().getTime());
       const p = super.listPendingAccepts().find((x) => x.iid === iid);
       if (p) this.safely(() => this.markers.recordPending({ iid, claimedAgent: p.claimedAgent, claimedOwner: p.claimedOwner, exp: p.exp }));
     }
@@ -217,8 +246,17 @@ export class MarkedPairingInviteFlow extends PairingInviteFlow {
    * invite's expiry. Empty when nothing waits, so a restart is never held for nothing.
    */
   restartHolds(): Array<{ name: string; until: number; reason: string }> {
-    return this.listPendingAccepts()
-      .map((p) => ({ name: `pairing-invite:${p.iid.slice(0, 8)}`, until: Date.parse(p.exp), reason: `a pairing invite from "${p.claimedAgent}" is waiting for the operator's approval` }))
-      .filter((h) => Number.isFinite(h.until));
+    const list = this.listPendingAccepts();
+    const live = new Set(list.map((p) => p.iid));
+    for (const iid of [...this.recordedAt.keys()]) if (!live.has(iid)) this.recordedAt.delete(iid);
+    return list
+      .map((p) => {
+        // Defence in depth beside the receipt check: a hold never outlives INVITE_MAX_TTL_MS from
+        // when this engine first saw the accept, whatever expiry the inviter wrote.
+        if (!this.recordedAt.has(p.iid)) this.recordedAt.set(p.iid, this.clock().getTime());
+        const cap = this.recordedAt.get(p.iid)! + INVITE_MAX_TTL_MS;
+        const exp = Date.parse(p.exp);
+        return { name: `pairing-invite:${p.iid.slice(0, 8)}`, until: Number.isFinite(exp) ? Math.min(exp, cap) : cap, reason: `a pairing invite from "${p.claimedAgent}" is waiting for the operator's approval` };
+      });
   }
 }

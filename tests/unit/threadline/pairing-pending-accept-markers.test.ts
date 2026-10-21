@@ -15,11 +15,11 @@ import { AgentTrustManager } from '../../../src/threadline/AgentTrustManager.js'
 import { PairingInviteStore } from '../../../src/threadline/PairingInviteStore.js';
 import { PairingInviteFlow } from '../../../src/threadline/PairingInviteFlow.js';
 import {
-  MarkedPairingInviteFlow, PairingPendingAcceptMarkers, PENDING_ACCEPT_MARKERS_FILE, markerIdFor,
+  MarkedPairingInviteFlow, PairingPendingAcceptMarkers, PENDING_ACCEPT_MARKERS_FILE, markerIdFor, EXP_TOO_FAR_REASON,
 } from '../../../src/threadline/PairingPendingAcceptMarkers.js';
 import { PairingInviteTelegram, restartNoticeText, formatExpiry } from '../../../src/threadline/PairingInviteTelegram.js';
 import { generateIdentityKeyPair } from '../../../src/threadline/ThreadlineCrypto.js';
-import { decodeInvite, findInviteToken, macKey } from '../../../src/threadline/PairingInvite.js';
+import { decodeInvite, findInviteToken, macKey, encodeInvite, INVITE_MAX_TTL_MS } from '../../../src/threadline/PairingInvite.js';
 
 const T0 = Date.parse('2026-10-20T20:00:00Z');
 
@@ -299,5 +299,58 @@ describe('restart notice text', () => {
     expect(formatExpiry(exp, 'Not/AZone')).toBe('Tue 21:00 UTC');
     expect(restartNoticeText({ claimedAgent: 'Scout', claimedOwner: '', exp }, undefined, Date.parse(exp) - 3 * 3_600_000))
       .toBe('An invite from "Scout" was waiting and was cleared by a restart. Forward or paste it again before Tue 21:00 UTC, about 3 h from now.');
+  });
+});
+
+/** The same invite with its expiry rewritten (checksum recomputed): what a hostile or broken inviter can send. */
+function withExp(message: string, exp: string): string {
+  const d = decodeInvite(findInviteToken(message)!);
+  if (!d.ok) throw new Error('fixture invite did not decode');
+  return encodeInvite({ ...d.invite, exp });
+}
+
+describe('an invite\'s expiry is checked on receipt (Echo\'s review)', () => {
+  it('an invite expiring in 2099 is refused with the named reason: no pending accept, no marker, no hold', async () => {
+    const { flow, inv, markerFile } = setup();
+    const far = withExp(inv.message, '2099-01-01T00:00:00.000Z');
+    expect(decodeInvite(findInviteToken(far)!).ok).toBe(true); // control: core itself accepts it
+    const r = await flow.receiveInvite(`Fwd: ${far}`);
+    expect(r).toEqual({ ok: false, reason: EXP_TOO_FAR_REASON });
+    expect(EXP_TOO_FAR_REASON).toMatch(/longer than 24 hours/);
+    expect(flow.listPendingAccepts()).toEqual([]);
+    expect(readFile(markerFile)).toBeNull();
+    expect(flow.restartHolds()).toEqual([]);
+  });
+
+  it('a valid 24 h invite still works, and its hold ends at its expiry', async () => {
+    const { flow, inv } = setup(24 * 60);
+    expect(await flow.receiveInvite(inv.message)).toMatchObject({ ok: true });
+    expect(flow.restartHolds()[0].until).toBe(T0 + INVITE_MAX_TTL_MS);
+  });
+
+  it('clock skew: 24 h + 4 min ahead is accepted, 24 h + 6 min is refused', async () => {
+    const a = setup();
+    expect(await a.flow.receiveInvite(withExp(a.inv.message, new Date(T0 + INVITE_MAX_TTL_MS + 4 * 60_000).toISOString()))).toMatchObject({ ok: true });
+    const b = setup();
+    expect(await b.flow.receiveInvite(withExp(b.inv.message, new Date(T0 + INVITE_MAX_TTL_MS + 6 * 60_000).toISOString()))).toEqual({ ok: false, reason: EXP_TOO_FAR_REASON });
+  });
+
+  it('defence in depth: a far-future pending accept that got in anyway holds for at most 24 h from when it was first seen', async () => {
+    const { flow, inv, clock } = setup();
+    // Bypass the receipt check (as an older engine or a future code path might).
+    const r = await PairingInviteFlow.prototype.receiveInvite.call(flow, withExp(inv.message, '2099-01-01T00:00:00.000Z'));
+    expect(r.ok).toBe(true);
+    expect(flow.restartHolds()[0].until).toBe(T0 + INVITE_MAX_TTL_MS);
+    clock.t = T0 + 60 * 60_000; // later listings keep the first-seen clamp
+    expect(flow.restartHolds()[0].until).toBe(T0 + INVITE_MAX_TTL_MS);
+  });
+
+  it('the clamp is from when the accept was recorded, also through the normal path', async () => {
+    const { flow, inv, clock } = setup(24 * 60);
+    clock.t = T0 + 10 * 60_000;
+    expect(await flow.receiveInvite(inv.message)).toMatchObject({ ok: true });
+    clock.t = T0 + 20 * 60_000;
+    // exp (T0 + 24 h) is sooner than recordedAt + 24 h, so exp wins
+    expect(flow.restartHolds()[0].until).toBe(T0 + INVITE_MAX_TTL_MS);
   });
 });

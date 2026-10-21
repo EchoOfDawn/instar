@@ -30,7 +30,7 @@ Two smaller changes:
 
 **The secret still never touches the disk.** The note holds no secret, no invite text and not even the invite id, and a test reads the note file and checks for each of them, including in other encodings.
 
-**A restart cannot be held forever.** Every hold ends at its invite's expiry. A hold that has passed its end time is ignored even if something still reports it, and a broken hold source holds nothing.
+**A restart cannot be held forever.** The expiry inside an invite is written by whoever made it, so the agent does not just trust it: an invite claiming to last more than 24 hours (plus 5 minutes for clocks that disagree) is refused when it arrives, because no real invite lasts that long. On top of that, a hold never lasts more than 24 hours from when the invite arrived, and never longer than the 4 hours the updater already allows for waiting on anything. Every hold also ends at its invite's expiry. A hold that has passed its end time is ignored even if something still reports it, and a broken hold source holds nothing.
 
 **The Telegram message is not repeated.** It is marked as sent once delivered, and two deliveries running at the same moment cannot both send it.
 
