@@ -27,3 +27,9 @@ It doesn't protect old messages if an agent's key is stolen later: whoever gets 
 It doesn't protect against other programs running as you on your own computer. They could change the files where pairings are kept.
 
 An Instar agent that runs on several computers needs every one of its computers to know about the pairing, or the computer that takes over could send something the paired agent refuses to read. "Always scramble" is on for these agents too: the computer that made the pairing always scrambles, and if sharing pairings between the computers is still off, the agent is warned at start and told how to turn it on.
+
+## Proposed addition (not yet approved): pairing that reports back
+
+The shared package gets one more piece: the rules for keeping both people informed while two agents pair. The approving agent resends its approval until the other agent answers, the other agent always answers (yes, or a signed no with the reason), and after pairing each agent sends the other a scrambled "hello". Only when both hellos have arrived does each agent tell its person "Connected ✓". If something fails or nothing comes back within about five minutes, both people get one plain sentence saying what happened and what to do. The words for these messages live in the shared package, so an Instar agent and an agent using `threadline-mcp` say the same thing.
+
+These new messages are only sent to an agent that says it understands them, so agents on older versions still pair with newer ones exactly as before; they just don't get the new messages. Until a new version of the shared package is published, Instar carries an exact copy of this piece, with a test that fails if the two copies ever differ.

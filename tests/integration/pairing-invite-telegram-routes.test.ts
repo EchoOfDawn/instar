@@ -72,7 +72,7 @@ function makeContext(stateDir: string, fx: Effects, extra: Record<string, unknow
       getChatId: () => '-100',
       getLifelineTopicId: () => 3,
     } as never,
-    pairingInvites: { flow, store: {} as never, events: new EventEmitter() } as never,
+    pairingInvites: { flow, handshake: flow, store: {} as never, events: new EventEmitter() } as never,
     topicOperatorStore: b.operators ?? null,
     relationships: null, feedback: null, dispatches: null, updateChecker: null, autoUpdater: null,
     autoDispatcher: null, quotaTracker: null, publisher: null, viewer: null, tunnel: null,

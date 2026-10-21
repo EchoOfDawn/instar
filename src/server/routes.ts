@@ -217,6 +217,7 @@ import type { WriteOperation, WriteToken } from '../core/StateWriteAuthority.js'
 import { writeLifelineRestartSignal } from '../core/version-skew.js';
 import { LifelineIngressGuard } from './LifelineIngressGuard.js';
 import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX, resolveApprovalOwner } from '../threadline/PairingInviteTelegram.js';
+import { PairingTopicStore } from '../threadline/PairingTopicStore.js';
 import { ConnectEnableController, readConnectEnableStatus } from '../threadline/connectEnable.js';
 import { shouldOwnTelegramPoll } from '../lifeline/telegramPollOwnership.js';
 import { sharedLifelineIngressSecretHolder } from '../core/LifelineIngressSecret.js';
@@ -3387,10 +3388,33 @@ export function createRoutes(ctx: RouteContext): Router {
   // Pairing by invite, Telegram surface (docs/specs/a2a-pairing-invite-link.md §6.1). Buttons
   // are offered only when the lifeline is this agent's Telegram ingress AND its guard enforces;
   // otherwise every prompt points at the dashboard (PIN) instead.
+  let pairingTopicStore: PairingTopicStore | null = null;
+  if (ctx.pairingInvites && ctx.telegram) {
+    pairingTopicStore = new PairingTopicStore(ctx.config.stateDir, undefined, (problem) => DegradationReporter.getInstance().report({
+      feature: 'Threadline.pairingTopics',
+      primary: 'remember which Telegram topic each pairing invite belongs to (threadline/pairing-topics.json)',
+      fallback: 'pairing notices go to the Lifeline topic instead',
+      reason: problem,
+      impact: 'pairing messages may appear in the Lifeline topic rather than where the invite was made',
+    }));
+  }
   const pairingInviteTelegram = ctx.pairingInvites && ctx.telegram
     ? new PairingInviteTelegram({
-      flow: ctx.pairingInvites.flow,
+      // Operator acts go through the handshake (spec §11): both sides are told how a pairing ended.
+      flow: ctx.pairingInvites.handshake,
       events: ctx.pairingInvites.events,
+      topics: pairingTopicStore ?? undefined,
+      ownOpenInvite: (iid) => {
+        const inv = ctx.pairingInvites!.store.getInternal(iid);
+        return inv && inv.state === 'open' ? { exp: inv.exp } : null;
+      },
+      reportUndelivered: (what, reason) => DegradationReporter.getInstance().report({
+        feature: 'Threadline.pairingNotices',
+        primary: 'tell the operator, in the topic where the invite was made or forwarded, how a pairing is going',
+        fallback: 'the message was not shown; the pairing state itself is recorded and unaffected',
+        reason: `${what}: ${reason}`,
+        impact: 'the operator may not know that a pairing finished, failed or timed out until they check the dashboard Threadline tab',
+      }),
       send: async (topicId, text, buttons) => {
         if (buttons && buttons.length) {
           if (await ctx.telegram!.sendPairingPrompt(topicId, text, buttons) !== null) return;
@@ -18387,6 +18411,10 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
           /* @silent-fallback-ok — §2.4(5) acked-audit is observe-only; never affects delivery */
         }
       }
+      // Pairing (docs/specs/a2a-pairing-invite-link.md §11.8): an invite the agent just posted here
+      // belongs to this topic, so its pairing notices come back here, and the owner is offered
+      // "It's one of my agents" (§11.6). After the send, never blocking or changing it.
+      if (pairingInviteTelegram && PairingInviteTelegram.carriesInvite(text)) void pairingInviteTelegram.noteOutboundInvite(text, topicId);
       res.json({ ok: true, topicId, messageId: sendResult?.messageId, destinationStoreConfirmed });
     } catch (err) {
       // The send failed → release the in-flight reservation so the legitimate
@@ -19210,7 +19238,19 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         return;
       }
     }
-    sendFlowResult(res, pi.flow.createInvite({ ttlMs, bindFp }), 503);
+    // Optional: the Telegram topic this invite belongs to, so its pairing messages go there
+    // (spec §11.8). Posting the invite in a topic records it too.
+    let topicId: number | undefined;
+    if (body.topicId !== undefined && body.topicId !== null && body.topicId !== '') {
+      topicId = Number(body.topicId);
+      if (!Number.isSafeInteger(topicId) || topicId <= 0) {
+        res.status(400).json({ error: 'topicId must be a positive Telegram topic id' });
+        return;
+      }
+    }
+    const made = pi.handshake.createInvite({ ttlMs, bindFp });
+    if (made.ok && topicId !== undefined) pairingInviteTelegram?.noteInviteTopic(String(made.iid), topicId, String(made.exp));
+    sendFlowResult(res, made, 503);
   });
 
   // This agent's invites (never their secrets) and the invites waiting for this operator's approval.
@@ -19230,7 +19270,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     // secret was in memory only, so they are gone). Secret-free: a hash id, claimed names, expiry.
     let restartNotices: unknown[] = [];
     try { restartNotices = (pi.markers?.notices() ?? []).map(({ id, claimedAgent, claimedOwner, exp }) => ({ id, claimedAgent, claimedOwner, exp })); } catch { restartNotices = []; }
-    res.json({ invites: pi.store.list(), pendingAccepts: pi.flow.listPendingAccepts(), knownPeers, restartNotices });
+    res.json({ invites: pi.store.list(), pendingAccepts: pi.flow.listPendingAccepts(), knownPeers, restartNotices, handshake: pi.handshake.sessions() });
   });
 
   // Dismiss a restart notice. Bearer: dismissing a reminder grants nothing.
@@ -19272,7 +19312,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(400).json({ error: 'send invite: the message or code you were sent' });
       return;
     }
-    sendFlowResult(res, await pi.flow.receiveInvite(text), 400);
+    sendFlowResult(res, await pi.handshake.receiveInvite(text), 400);
   });
 
   // Recipient's operator approves (PIN). Pins the inviter (not yet credential-eligible) and sends the accept.
@@ -19282,7 +19322,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!checkMandatePin(req, res)) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.approveAccept(iid));
+    sendFlowResult(res, pi.handshake.approveAccept(iid));
   });
 
   // Recipient declines. Bearer: declining only removes an option.
@@ -19291,7 +19331,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!pi) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.declineAccept(iid), 404);
+    sendFlowResult(res, pi.handshake.declineAccept(iid), 404);
   });
 
   // Inviter's operator finishes (PIN): pins the acceptor as verified and sends the signed finish.
@@ -19301,7 +19341,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!checkMandatePin(req, res)) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.approveFinish(iid));
+    sendFlowResult(res, pi.handshake.approveFinish(iid));
   });
 
   // Inviter's operator says the acceptor is not who they meant (PIN). Nothing is pinned; the invite stays used.
@@ -19311,7 +19351,18 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!checkMandatePin(req, res)) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.rejectFinish(iid));
+    sendFlowResult(res, pi.handshake.rejectFinish(iid));
+  });
+
+  // Inviter's operator says this OPEN invite is for one of their own agents (PIN): when it is
+  // accepted, the agent finishes by itself (spec §11.6). An operator act, like Finish.
+  router.post('/threadline/pairing/invites/:iid/own-agent', (req, res) => {
+    const pi = invitesOrRefuse(req, res);
+    if (!pi) return;
+    if (!checkMandatePin(req, res)) return;
+    const iid = iidParam(req, res);
+    if (!iid) return;
+    sendFlowResult(res, pi.handshake.preauthorizeFinish(iid));
   });
 
   // List all pairings (read-only, no SAS words ever). 503 when the feature is off.

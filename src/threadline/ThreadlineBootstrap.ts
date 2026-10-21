@@ -31,7 +31,10 @@ import { attachRelayObservability, type RelayConnectionEvent } from './relayConn
 import { AgentTrustManager } from './AgentTrustManager.js';
 import { EventEmitter } from 'node:events';
 import { PairingInviteStore } from './PairingInviteStore.js';
-import { PairingInviteFlow, INVITE_OPS, type InviteEvent } from './PairingInviteFlow.js';
+import { PairingInviteFlow, type InviteEvent } from './PairingInviteFlow.js';
+import { PairingHandshake, ALL_PAIRING_OPS, type HandshakeTimings, type PairingNotice } from './pairingHandshake.js';
+import { sign as edSign, verify as edVerify } from '@sagemindai/threadline-core';
+import nodeCrypto from 'node:crypto';
 import { MarkedPairingInviteFlow, PairingPendingAcceptMarkers } from './PairingPendingAcceptMarkers.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
@@ -148,6 +151,11 @@ export interface ThreadlineBootstrapConfig {
    * the shipped default, watch: marks are recorded and would-refuse plaintext is counted.
    */
   getRefuseDowngradeMode?: () => RefuseDowngradeMode;
+  /**
+   * Test hook: shorter pairing-handshake timers (docs/specs/a2a-pairing-invite-link.md §11.7). Never
+   * set in production; the defaults are the spec's.
+   */
+  pairingHandshakeTimings?: Partial<HandshakeTimings>;
 }
 
 export interface ThreadlineBootstrapResult {
@@ -169,7 +177,13 @@ export interface ThreadlineBootstrapResult {
    */
   pairingInvites?: {
     flow: PairingInviteFlow;
+    /**
+     * The pairing handshake (spec §11): operator acts and inbound invite control go through it, so
+     * both sides are told how a pairing ended. Its notices are emitted on `events` as 'notice'.
+     */
+    handshake: PairingHandshake;
     store: PairingInviteStore;
+    /** 'event': the engine's InviteEvent (prompts, alarms). 'notice': a PairingNotice (spec §11.7). */
     events: EventEmitter;
     /**
      * Secret-free markers of invites waiting for this operator, so a restart that drops one (the
@@ -562,28 +576,64 @@ export async function bootstrapThreadline(
       } catch (err) {
         console.warn(`[pairing-invite] could not read pending-accept markers: ${err instanceof Error ? err.message : String(err)}`);
       }
-      const flow = new MarkedPairingInviteFlow({
+      const ownIdentity = () => {
+        const id = routingIdentityManager.get();
+        return id ? { fp: String(id.fingerprint).toLowerCase(), publicKeyHex: id.publicKey.toString('hex'), privateKey: id.privateKey } : null;
+      };
+      // The pairing handshake (spec §11) sits between the engine and the transport: it resends the
+      // accept until answered, answers accepts with signed receipts or refusals, runs the hello, and
+      // turns every outcome into an operator notice. The relay's verdict on every invite control
+      // message is logged (§11.8).
+      const handshake = new PairingHandshake({
         store: invStore,
         trust: trustManager!,
         identity: () => {
-          const id = routingIdentityManager.get();
-          return id ? { fp: String(id.fingerprint).toLowerCase(), publicKeyHex: id.publicKey.toString('hex'), privateKey: id.privateKey } : null;
+          const id = ownIdentity();
+          return id ? { fp: id.fp, publicKeyHex: id.publicKeyHex } : null;
         },
+        signHex: (m) => {
+          const id = ownIdentity();
+          if (!id) throw new Error('this machine does not hold the Threadline identity');
+          return edSign(id.privateKey, Buffer.from(m)).toString('hex');
+        },
+        verifyHex: (keyHex, m, sigHex) => {
+          try { return edVerify(Buffer.from(keyHex, 'hex'), Buffer.from(m), Buffer.from(sigHex, 'hex')); } catch { return false; }
+        },
+        randomHex: (n) => nodeCrypto.randomBytes(n).toString('hex'),
+        sendPlaintext: (to, op, payload) => client.sendInviteControlPlaintext(to, op, payload),
+        sendToKey: (to, key, op, payload) => client.sendInviteControlToKey(to, key, op, payload),
+        awaitDelivery: async (messageId) => {
+          const v = await client.awaitRelayAck(messageId, 15_000);
+          return v ? { status: v.status, ...(v.reason ? { reason: v.reason } : v.reasonCode ? { reason: v.reasonCode } : {}) } : null;
+        },
+        notice: (n: PairingNotice) => {
+          console.log(`[pairing-invite] notice ${n.kind} ${JSON.stringify(n)}`);
+          invEvents.emit('notice', n);
+        },
+        forward: (e) => {
+          console.log(`[pairing-invite] ${e.kind} ${JSON.stringify(e)}`);
+          invEvents.emit('event', e);
+        },
+        log: (line) => console.log(line),
+        timings: config.pairingHandshakeTimings,
+      });
+      const flow = new MarkedPairingInviteFlow({
+        store: invStore,
+        trust: trustManager!,
+        identity: ownIdentity,
         relayKeyFor: async (fp) => {
           const known = client.getKnownAgents().find((a) => a.agentId === fp);
           if (known?.publicKey) return Buffer.from(known.publicKey).toString('hex');
           const fetched = await client.fetchPeerIdentityKey(fp).catch(() => null);
           return fetched ? fetched.toString('hex') : null;
         },
-        sendPlaintext: (to, op, payload) => { client.sendInviteControlPlaintext(to, op, payload); },
-        sendToKey: (to, key, op, payload) => { client.sendInviteControlToKey(to, key, op, payload); },
-        notify: (e: InviteEvent) => {
-          console.log(`[pairing-invite] ${e.kind} ${JSON.stringify(e)}`);
-          invEvents.emit('event', e);
-        },
+        sendPlaintext: handshake.flowSendPlaintext,
+        sendToKey: handshake.flowSendToKey,
+        notify: (e: InviteEvent) => handshake.flowNotify(e as unknown as { kind: string; iid?: string }),
         ownName: () => ({ owner: config.ownerName ?? '', agent: config.agentName }),
       }, markers);
-      pairingInvites = { flow, store: invStore, events: invEvents, markers };
+      handshake.attach(flow);
+      pairingInvites = { flow, handshake, store: invStore, events: invEvents, markers };
     } catch (err) {
       // Reported, not just logged: "invite pairing is off" shows in /health and the degradation
       // digest until the store file is readable again.
@@ -607,7 +657,10 @@ export async function bootstrapThreadline(
       // Live verified-pairing config reader (spec §3.10) — supplied by server.ts.
       getVerifiedPairingConfig: config.getVerifiedPairingConfig,
       onInviteControl: (op, fromFp, payload) => {
-        void pairingInvites?.flow.handleControl(op, fromFp, payload).then((r) => {
+        // Through the handshake (spec §11): it answers accepts, verifies receipts, refusals and
+        // hellos, and reports outcomes to the operator. A refusal here is logged with its reason;
+        // the handshake decides whether the sender is told (§11.5).
+        void pairingInvites?.handshake.handleControl(op, fromFp, payload).then((r) => {
           if (!r.ok) console.warn(`[pairing-invite] ${op} from ${fromFp.slice(0, 12)} refused: ${(r as { reason: string }).reason}`);
         });
       },
@@ -677,7 +730,7 @@ export async function bootstrapThreadline(
       // (docs/specs/a2a-pairing-invite-link.md §4.3). It is a CONTROL message for the gate, never
       // conversation text, so it must not reach the unknown-sender router (which would treat it
       // as an ordinary message and could spawn a session).
-      if (msgType && INVITE_OPS.has(msgType)) {
+      if (msgType && ALL_PAIRING_OPS.has(msgType)) {
         void inboundGate.evaluate(received);
         return;
       }
@@ -896,6 +949,7 @@ export async function bootstrapThreadline(
     },
     shutdown: async () => {
       stopHeartbeat();
+      pairingInvites?.handshake.dispose();
       if (relayOwnerTimer) {
         clearInterval(relayOwnerTimer);
         relayOwnerTimer = null;
