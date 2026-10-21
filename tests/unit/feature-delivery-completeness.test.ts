@@ -271,6 +271,7 @@ describe('Feature Delivery Completeness', () => {
       ['Queued-message review pacing:', 'telegramOriginRecoveryAwareness'],
       ['Telegram send deadlines:', 'telegramOriginTransportAwareness'],
       ['Telegram capacity checks:', 'telegramOriginCapacityAwareness'],
+      ['/telegram/system-topics', 'telegramSystemTopicsAwareness'],
       ['Origin worker health:', 'telegramOriginWorkerAwareness'],
       ['Dashboard edit rejection:', 'telegramDashboardEditAwareness'],
     ];
