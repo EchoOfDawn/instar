@@ -178,3 +178,9 @@ Clear to ship.
 ## Class-Closure Declaration (display-only mirror)
 
 No agent-authored-artifact defect — not applicable. It adds no self-triggered controller. The owner-side start fires once per operator create, and the bounded wait is a single 60-step loop per forwarded message.
+
+## Follow-up after rebase onto main (2026-10-20)
+
+- Four catch blocks this change adds (the mesh probe in `src/commands/server.ts`, the probe and the pin write in `src/server/routes.ts`, the pin call in `src/core/dashboardMachineChoice.ts`) gain `@silent-fallback-ok`. None was silent: each turns into a 502 `machine-unreachable` reply or the `machine-pin-not-written` notice. Behaviour unchanged.
+- `DELETE /threadline/pairing/restart-notices/:id` reached main with no write-domain classification, so the write-domain ratchet failed on main itself. It is classified `cluster-shared`, the same as its sibling invite routes. This only changes how the write-admission layer (dry-run on dev, dark on the fleet) labels the route.
+- Evidence: full local suite before the fix, 52,165 passed and only these two ratchets failed; both pass after it.

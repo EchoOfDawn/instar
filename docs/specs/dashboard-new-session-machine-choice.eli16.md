@@ -70,3 +70,7 @@ Nothing is open. One honest limit: the check that the machine is online happens 
 tap Create. If that machine goes offline later, the conversation is handled like any
 other conversation whose machine went dark (the existing failover and "machine is
 restarting" notices), not by this feature.
+
+## A small follow-up before merging
+
+Two automatic code checks failed after this change was brought up to date with the latest code. Four error handlers lacked the marker that says "this error is reported, not hidden", and one unrelated new route had no record of which machine may write to it. Both are fixed. Nothing the user sees changes.

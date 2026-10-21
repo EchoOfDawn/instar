@@ -25562,6 +25562,7 @@ export async function startServer(options: StartOptions): Promise<void> {
                 const res = await meshClient.send({ machineId, url }, { type: 'session-status' }, 0, { timeoutMs: 5000 });
                 return !!res.ok;
               } catch {
+                // @silent-fallback-ok: unreachable ⇒ the route answers 502 machine-unreachable to the operator
                 return false;
               }
             };

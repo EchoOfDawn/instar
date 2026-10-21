@@ -209,7 +209,7 @@ export async function startTopicOnMachine(
   const activeHere = claimed.ok || now?.status === 'active';
   const settled = activeHere;
   if (outcome.kind !== 'rejected') {
-    try { await pin?.(); } catch { /* the caller's pin reports its own failure */ }
+    try { await pin?.(); } catch { /* @silent-fallback-ok: the caller's pin reports its own failure (machine-pin-not-written notice) */ }
   }
   if (outcome.kind === 'accepted') return { ok: true, epoch: claimed.ok ? claimed.epoch : placed.epoch, settled };
   if (outcome.kind === 'unknown') return { ok: false, code: 'start-unknown', error: outcome.detail, settled };

@@ -12151,7 +12151,7 @@ export function createRoutes(ctx: RouteContext): Router {
           // but not over the mesh is refused here, never pinned in `unknown`.
           if (tp.probeMachineReachable) {
             let reachable = false;
-            try { reachable = await tp.probeMachineReachable(choice.machineId); } catch { reachable = false; }
+            try { reachable = await tp.probeMachineReachable(choice.machineId); } catch { /* @silent-fallback-ok: refused below with 502 machine-unreachable */ reachable = false; }
             if (!reachable) {
               res.status(502).json({ ok: false, code: 'machine-unreachable', reason: 'mesh', step: 'validate-on-target', error: `Couldn't reach ${choice.nickname} over the machine-to-machine link (the one the start uses), so the topic was not created. Check its tunnel or local-network link, then try again.` });
               return;
@@ -12299,6 +12299,7 @@ export function createRoutes(ctx: RouteContext): Router {
             );
             return true;
           } catch {
+            // @silent-fallback-ok: surfaced to the operator as the machine-pin-not-written notice
             machineNotices.push('machine-pin-not-written');
             return false;
           }
