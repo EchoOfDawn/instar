@@ -2328,6 +2328,10 @@ export interface MachineCapacity {
     /** This machine can durably RECEIVE forwarded inbound messages (the
      *  'deliverMessage' receiver handler + live durable queue). */
     ws11DeliverReceive?: boolean;
+    /** dashboard-new-session-machine-choice §3.4 — this machine can run the
+     *  owner-side dashboard-create start (pool not dark, Telegram configured,
+     *  topic-profile context wired). */
+    dashboardCreateReceive?: boolean;
     /** WS1.2: this machine can execute the owner-side `drain` verb (bounded
      *  turn-boundary drain + claim handoff for an active-topic transfer).
      *  ABSENT/false → the transfer sender degrades to today's pin-and-
