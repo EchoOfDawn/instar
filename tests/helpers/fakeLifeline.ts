@@ -7,6 +7,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { processStartMs } from '../../src/core/processIdentity.js';
 
 export interface FakeLifeline { pid: number; stop(): void }
 
@@ -17,7 +18,8 @@ export async function startFakeLifeline(stateDir: string): Promise<FakeLifeline>
   ], { stdio: 'ignore' });
   if (!child.pid) throw new Error('fake lifeline did not start');
   await new Promise((r) => setTimeout(r, 150)); // let ps see the final argv
-  fs.writeFileSync(path.join(stateDir, 'lifeline.lock'), JSON.stringify({ pid: child.pid, startedAt: new Date().toISOString() }));
+  // The shape the real lifeline writes (lifelineLock.ts): pid, startedAt, procStart.
+  fs.writeFileSync(path.join(stateDir, 'lifeline.lock'), JSON.stringify({ pid: child.pid, startedAt: new Date().toISOString(), procStart: processStartMs(child.pid) }));
   return { pid: child.pid, stop: () => { try { child.kill(); } catch { /* already gone */ } } };
 }
 

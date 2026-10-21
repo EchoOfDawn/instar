@@ -32,6 +32,7 @@ import { TreeTraversal } from '../../src/knowledge/TreeTraversal.js';
 import { ProbeRegistry } from '../../src/knowledge/ProbeRegistry.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 import { startFakeLifeline, startUnrelatedProcess, type FakeLifeline } from '../helpers/fakeLifeline.js';
+import { processStartMs } from '../../src/core/processIdentity.js';
 
 const NOW = Date.parse('2026-10-20T21:00:00Z');
 const base: ConnectEnableInputs = {
@@ -115,11 +116,29 @@ describe('lifelineRunning — the lock\'s pid must really be an Instar lifeline'
   it('a REUSED pid running something else fails closed', () => {
     const other = startUnrelatedProcess();
     procs.push(other);
-    lock(other.pid);
+    fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid: other.pid, procStart: processStartMs(other.pid) }));
     expect(lifelineRunning(tmp)).toBe(false);
   });
-  it('the test runner itself (alive, not a lifeline) fails closed', () => {
-    lock(process.pid);
+  it('a pid reused by ANOTHER agent\'s lifeline (command line matches, start time does not) fails closed', async () => {
+    // A real lifeline-shaped process at the pid, but the lock records an earlier procStart:
+    // the process that wrote this lock is gone and a different lifeline got its pid.
+    const other = await startFakeLifeline(tmp);
+    procs.push(other);
+    const lockPath = path.join(tmp, 'lifeline.lock');
+    const rec = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+    expect(lifelineRunning(tmp)).toBe(true); // control: the matching lock passes
+    fs.writeFileSync(lockPath, JSON.stringify({ ...rec, procStart: rec.procStart - 60_000 }));
+    expect(lifelineRunning(tmp)).toBe(false);
+  });
+  it('an unreadable start time, or a lock without procStart, fails closed', async () => {
+    const lf = await startFakeLifeline(tmp);
+    procs.push(lf);
+    expect(lifelineRunning(tmp, undefined, () => null)).toBe(false);
+    fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid: lf.pid, startedAt: new Date().toISOString() }));
+    expect(lifelineRunning(tmp)).toBe(false);
+  });
+  it('the test runner itself (alive, start time matches, not a lifeline) fails closed', () => {
+    fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid: process.pid, procStart: processStartMs(process.pid) }));
     expect(lifelineRunning(tmp)).toBe(false);
   });
   it('no lock, a dead pid, garbage, or an unreadable command line fail closed', () => {
@@ -130,8 +149,8 @@ describe('lifelineRunning — the lock\'s pid must really be an Instar lifeline'
     expect(lifelineRunning(tmp)).toBe(false);
     fs.writeFileSync(path.join(tmp, 'lifeline.lock'), 'not json');
     expect(lifelineRunning(tmp)).toBe(false);
-    lock(4242);
-    expect(lifelineRunning(tmp, () => null)).toBe(false);
+    fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid: 4242, procStart: 1 }));
+    expect(lifelineRunning(tmp, () => null, () => 1)).toBe(false);
   });
   it('the command-line rule', () => {
     expect(isInstarLifelineCommand('/a/.instar/bin/node /a/.instar/instar-boot.cjs lifeline start --dir /a')).toBe(true);

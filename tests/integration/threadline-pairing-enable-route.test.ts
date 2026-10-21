@@ -18,6 +18,7 @@ import type { TempProject } from '../helpers/setup.js';
 import type { InstarConfig } from '../../src/core/types.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 import { startFakeLifeline, type FakeLifeline } from '../helpers/fakeLifeline.js';
+import { processStartMs } from '../../src/core/processIdentity.js';
 
 const AUTH = 'route-auth';
 
@@ -111,7 +112,7 @@ describe('POST /threadline/pairing/enable (route wiring)', () => {
 
   it('a lock whose pid now runs something else (the test runner) is not a lifeline: 503, no flag', async () => {
     const call = await boot([], []);
-    fs.writeFileSync(path.join(project!.stateDir, 'lifeline.lock'), JSON.stringify({ pid: process.pid }));
+    fs.writeFileSync(path.join(project!.stateDir, 'lifeline.lock'), JSON.stringify({ pid: process.pid, procStart: processStartMs(process.pid) }));
     const r = await call({ sessionId: 'sid-asker' });
     expect(r.status).toBe(503);
     expect(r.body.state).toBe('restart-unavailable');

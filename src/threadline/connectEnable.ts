@@ -35,7 +35,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
-import { processCommandLine } from '../core/processIdentity.js';
+import { processCommandLine, processStartMs } from '../core/processIdentity.js';
 
 /** How long after a restart for this we refuse to ask for another one. */
 export const CONNECT_ENABLE_RESTART_COOLDOWN_MS = 10 * 60_000;
@@ -220,19 +220,32 @@ export function isInstarLifelineCommand(command: string | null): boolean {
 }
 
 /**
- * A lifeline holds this agent's lock, and the process at the lock's pid really is an Instar
- * lifeline (its command line, from `ps -p <pid> -o command=`). A dead pid, a pid reused by
- * something else, or a command line that cannot be read all fail CLOSED: no restart, because
- * nothing would bring the server back.
+ * A lifeline holds this agent's lock, and the process at the lock's pid really is THAT
+ * lifeline:
+ *  - its command line (`ps -p <pid> -o command=`) is an Instar lifeline, and
+ *  - its start time equals the `procStart` the lifeline recorded in the lock
+ *    (`processStartMs`, 1 s resolution), so a pid since reused by a different process,
+ *    including ANOTHER agent's lifeline (whose command line would also match), is refused.
+ * A missing lock, a dead pid, a lock without a numeric `procStart` (legacy, or ps failed when
+ * it was written), an unreadable start time or command line all fail CLOSED: no restart,
+ * because nothing proven would bring the server back.
  */
-export function lifelineRunning(stateDir: string, commandOf: (pid: number) => string | null = processCommandLine): boolean {
-  let pid: unknown;
+export function lifelineRunning(
+  stateDir: string,
+  commandOf: (pid: number) => string | null = processCommandLine,
+  startOf: (pid: number) => number | null = processStartMs,
+): boolean {
+  let lock: { pid?: unknown; procStart?: unknown };
   try {
-    pid = (JSON.parse(fs.readFileSync(path.join(stateDir, 'lifeline.lock'), 'utf-8')) as { pid?: unknown }).pid;
+    lock = JSON.parse(fs.readFileSync(path.join(stateDir, 'lifeline.lock'), 'utf-8')) as { pid?: unknown; procStart?: unknown };
   } catch {
     return false; // @silent-fallback-ok — no readable lock means no lifeline
   }
+  const pid = lock?.pid;
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+  if (typeof lock.procStart !== 'number' || !Number.isFinite(lock.procStart)) return false;
+  const liveStart = startOf(pid);
+  if (liveStart === null || liveStart !== lock.procStart) return false;
   return isInstarLifelineCommand(commandOf(pid));
 }
 
