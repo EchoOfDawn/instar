@@ -47,6 +47,7 @@ import { buildStallAlertDecisionContext } from './shared/StallAlertDecisionConte
 import { DP_TELEGRAM_STALL_CONFIRM } from '../data/provenanceCoverage.js';
 import { AspAuthorshipJoin, type MessageAuthorship } from '../core/AspAuthorshipJoin.js';
 import { INVITE_PREFIX } from '../threadline/PairingInvite.js';
+const PAIRING_DASHBOARD_FALLBACK = 'I got a pairing invite, but I can\'t take it from this chat. Open the Threadline tab on the dashboard and paste it there; you approve with your PIN.';
 /** What the direct-polling path hands a pairing invite or tap to (implemented by PairingInviteTelegram). */
 export interface PollingPairingHandler {
   onForwardedInvite(m: { text: string; topicId: number; fromUserId: number; chatId?: string; verified: boolean }): Promise<void>;
@@ -5020,19 +5021,23 @@ export class TelegramAdapter implements MessagingAdapter {
     if (!msg) return;
 
     // A pairing invite carries a one-time secret: it never reaches a session, the message log
-    // or any classifier (docs/specs/a2a-pairing-invite-link.md §6.1). Approving by Telegram needs
-    // the lifeline path (its secret proves the tap); this direct-polling path has none, so the
-    // owner is pointed at the dashboard. Unauthorized senders get nothing.
+    // or any classifier (docs/specs/a2a-pairing-invite-link.md §6.1). With a pairing handler
+    // wired, an invite read here (getUpdates) is authentic and goes to it; without one, the owner
+    // is pointed at the dashboard. Unauthorized senders get nothing.
     if (typeof msg.text === 'string' && msg.text.includes(INVITE_PREFIX)) {
       if (this.isAuthorized(msg.from.id) && this.pairingHandler) {
         await this.pairingHandler.onForwardedInvite({
           text: msg.text, topicId: msg.message_thread_id ?? GENERAL_TOPIC_ID, fromUserId: msg.from.id,
           chatId: String(msg.chat.id), verified: true, // read from Telegram's own getUpdates
-        }).catch((err: unknown) => console.warn(`[telegram] pairing invite handler failed: ${err instanceof Error ? err.message : String(err)}`));
+        }).catch((err: unknown) => {
+          // Never leave a forwarded invite unanswered (Echo's review): fall back to the dashboard line.
+          console.warn(`[telegram] pairing invite handler failed: ${err instanceof Error ? err.message : String(err)}`);
+          void this.sendToTopic(msg.message_thread_id ?? GENERAL_TOPIC_ID, PAIRING_DASHBOARD_FALLBACK).catch(() => {});
+        });
         return;
       }
       if (this.isAuthorized(msg.from.id)) {
-        void this.sendToTopic(msg.message_thread_id ?? GENERAL_TOPIC_ID, 'I got a pairing invite, but I can\'t take it from this chat. Open the Threadline tab on the dashboard and paste it there; you approve with your PIN.').catch(() => {});
+        void this.sendToTopic(msg.message_thread_id ?? GENERAL_TOPIC_ID, PAIRING_DASHBOARD_FALLBACK).catch(() => {});
       }
       return;
     }
@@ -5647,8 +5652,9 @@ export class TelegramAdapter implements MessagingAdapter {
       return;
     }
 
-    // ── Pairing-invite buttons: only honoured on the lifeline path (/internal/telegram-callback),
-    // which carries the proof this direct-polling path lacks (a2a-pairing-invite-link §6.1).
+    // ── Pairing-invite buttons. With a pairing handler wired, a tap read here (getUpdates) is
+    // authentic and goes to it, which checks owner, chat and token (a2a-pairing-invite-link §6.1
+    // r7); without one, the owner is pointed at the dashboard.
     if (query.data.startsWith('pi:')) {
       if (this.pairingHandler) {
         await this.pairingHandler.onCallback({

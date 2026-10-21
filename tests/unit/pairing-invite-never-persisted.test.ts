@@ -81,6 +81,18 @@ describe('pairing invites are never persisted', () => {
       await proc({ update_id: 3, callback_query: { id: 'cq-1', data: 'pi:abc', from: { id: 4242, first_name: 'Op' }, message: { message_id: 9, chat: { id: -1001, type: 'supergroup' } } } });
       expect(calls).toEqual([{ kind: 'tap', arg: { callbackQueryId: 'cq-1', data: 'pi:abc', fromUserId: 4242, chatId: '-1001', verified: true } }]);
     });
+    it('if the handler throws, the owner still gets a reply (the dashboard line), never silence', async () => {
+      const adapter = new TelegramAdapter({ token: '', chatId: '-1001', authorizedUserIds: [4242] } as never, dir);
+      const sent: Array<{ topicId: number; text: string }> = [];
+      (adapter as unknown as { sendToTopic: (t: number, x: string) => Promise<unknown> }).sendToTopic = async (topicId, text) => { sent.push({ topicId, text }); return {}; };
+      adapter.setPairingHandler({ onForwardedInvite: async () => { throw new Error('boom'); }, onCallback: async () => true });
+      const proc = (adapter as unknown as { processUpdate(u: unknown): Promise<void> }).processUpdate.bind(adapter);
+      await proc(msg(`Fwd: ${INVITE}`, 5));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({ topicId: 77 });
+      expect(sent[0].text).toMatch(/Threadline tab on the dashboard/);
+    });
     it('without a handler the old behaviour stands (the adapter is inert for pairing)', async () => {
       const adapter = new TelegramAdapter({ token: '', chatId: '-1001', authorizedUserIds: [4242] } as never, dir);
       expect(adapter.hasPairingHandler()).toBe(false);

@@ -3,7 +3,7 @@
 **Version / slug:** `pairing-polling-agents`
 **Date:** `2026-10-21`
 **Author:** `Dawn`
-**Second-pass reviewer:** `Echo, on the Studio, before push (pending at commit time)`
+**Second-pass reviewer:** `Echo, on the Studio, 2026-10-21: approved e0b2cd93e (read the diff, did not run tests) with two fixes, applied in the follow-up commit; no further round needed`
 **Spec:** `docs/specs/a2a-pairing-invite-link.md` §6.1 (r7, approved: false).
 
 ## Summary of the change
@@ -51,6 +51,10 @@ Machine-local: the adapter that polls is the machine's own.
 
 Remove the `setPairingHandler` call in routes; the adapter falls back to the old lines.
 
+## Echo's review
+
+Approved. It confirms §2, and that re-delivery is safe without the route's durable claim store, because tokens are one-time and their siblings are deleted on first use. Two fixes, both applied: (1) the adapter's comments described only the fallback, and now describe both paths; (2) if the invite handler throws, the owner now gets the dashboard line instead of silence (tested, mutation-checked). Echo's notes: with the guard bypassed, a polling agent loses its buttons (matches "bypass = old behaviour"), and tokens are machine-local in memory, as on the lifeline path.
+
 ## Evidence pointers
 
 - Unit: `tests/unit/pairing-invite-never-persisted.test.ts` (polling adapter + handler, 4 cases); `tests/unit/lifeline-ingress-guard.test.ts` › fresh polling agent (mutation-checked).
@@ -59,4 +63,4 @@ Remove the `setPairingHandler` call in routes; the adapter falls back to the old
 
 ## Class-Closure Declaration (display-only mirror)
 
-No agent-authored-artifact defect is fixed and no self-triggered sends are added.
+Class `unbounded-self-action`, closure **n/a**: one-shot user-driven action, not a self-triggered loop. When the pairing handler throws on a forwarded invite, the adapter sends one dashboard-line reply to that topic. It runs once per owner forward, has no retry, and nothing it sends can trigger it again. No agent-authored-artifact defect is fixed.
