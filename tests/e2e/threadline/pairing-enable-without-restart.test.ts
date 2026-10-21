@@ -25,6 +25,7 @@ import { createTempProject, createMockSessionManager } from '../../helpers/setup
 import type { TempProject } from '../../helpers/setup.js';
 import type { InstarConfig } from '../../../src/core/types.js';
 import { CONNECT_ENABLE_REQUESTED_BY } from '../../../src/threadline/connectEnable.js';
+import { startFakeLifeline, type FakeLifeline } from '../../helpers/fakeLifeline.js';
 
 const AUTH = 'pp-auth';
 
@@ -35,6 +36,7 @@ describe('pairing switched on without a person-performed restart (production pat
   let project: TempProject;
   let running: { server: AgentServer; shutdown: () => Promise<void>; url: string } | null = null;
   let watcher: ForegroundRestartWatcher | null = null;
+  let lifeline: FakeLifeline | null = null;
 
   // What boot does with the config on disk (server.ts): the relay follows threadline.relayEnabled,
   // and verifiedPairing.enabled rides the developmentAgent gate when omitted.
@@ -101,14 +103,16 @@ describe('pairing switched on without a person-performed restart (production pat
       messaging: [], monitoring: {}, updates: {}, users: [],
       threadline: { relayEnabled: false, visibility: 'unlisted' },
     }, null, 2));
-    // This agent is supervised: its lifeline holds the lock (the route refuses to restart a server
-    // nothing would bring back). The test plays the lifeline's part below.
-    fs.writeFileSync(path.join(project.stateDir, 'lifeline.lock'), JSON.stringify({ pid: process.pid }));
+    // This agent is supervised: a real process whose command line is an Instar lifeline holds the
+    // lock (the route refuses to restart a server nothing would bring back). The test plays the
+    // lifeline's restart part below.
+    lifeline = await startFakeLifeline(project.stateDir);
     running = await bootFromDisk();
   }, 60_000);
 
   afterAll(async () => {
     watcher?.stop();
+    lifeline?.stop();
     await running?.shutdown();
     project?.cleanup();
     await relay?.stop();

@@ -215,7 +215,7 @@ import type { WriteOperation, WriteToken } from '../core/StateWriteAuthority.js'
 import { writeLifelineRestartSignal } from '../core/version-skew.js';
 import { LifelineIngressGuard } from './LifelineIngressGuard.js';
 import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX, resolveApprovalOwner } from '../threadline/PairingInviteTelegram.js';
-import { ConnectEnableController } from '../threadline/connectEnable.js';
+import { ConnectEnableController, readConnectEnableStatus } from '../threadline/connectEnable.js';
 import { shouldOwnTelegramPoll } from '../lifeline/telegramPollOwnership.js';
 import { sharedLifelineIngressSecretHolder } from '../core/LifelineIngressSecret.js';
 import { TelegramCallbackDedupe } from './TelegramCallbackDedupe.js';
@@ -18801,6 +18801,12 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
   // session survives the restart and waits. Idempotent: call again to read the state; `ready` once
   // pairing works. Body: { sessionId?: string } (the asking session, excluded from the deferral check).
   let connectEnable: ConnectEnableController | null = null;
+  // Read-only: is a deferred request still waiting, and did one give up (with why)? Bearer.
+  router.get('/threadline/pairing/enable', (req, res) => {
+    if (!pairingRouteAuthorized(req, res)) return;
+    const ready = verifiedPairingRouteEnabled() && !!ctx.pairingInvites;
+    res.json({ ready, ...(connectEnable ? connectEnable.status() : { deferred: false, deferredSince: null, last: readConnectEnableStatus(ctx.config.stateDir) }) });
+  });
   router.post('/threadline/pairing/enable', (req, res) => {
     if (!pairingRouteAuthorized(req, res)) return;
     if (!connectEnable) {

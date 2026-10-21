@@ -15,7 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   decideConnectEnable, writeConnectConfig, writeConnectRestartRequest, restartRequestPending, lifelineRunning, CONNECT_ENABLE_DEFER_MAX_MS,
-  readConnectEnableRecord, ConnectEnableController, CONNECT_ENABLE_RESTART_COOLDOWN_MS,
+  readConnectEnableRecord, readConnectEnableStatus, isInstarLifelineCommand, ConnectEnableController, CONNECT_ENABLE_RESTART_COOLDOWN_MS,
   CONNECT_ENABLE_REQUESTED_BY, sayToPerson, type ConnectEnableInputs,
 } from '../../src/threadline/connectEnable.js';
 import { AutoUpdater } from '../../src/core/AutoUpdater.js';
@@ -31,6 +31,7 @@ import { TreeGenerator } from '../../src/knowledge/TreeGenerator.js';
 import { TreeTraversal } from '../../src/knowledge/TreeTraversal.js';
 import { ProbeRegistry } from '../../src/knowledge/ProbeRegistry.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { startFakeLifeline, startUnrelatedProcess, type FakeLifeline } from '../helpers/fakeLifeline.js';
 
 const NOW = Date.parse('2026-10-20T21:00:00Z');
 const base: ConnectEnableInputs = {
@@ -102,15 +103,63 @@ describe('writeConnectConfig', () => {
   });
 });
 
-describe('lifelineRunning', () => {
-  it('true only for a lock whose pid is alive', () => {
-    expect(lifelineRunning(tmp)).toBe(false);
-    fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid: process.pid }));
+describe('lifelineRunning — the lock\'s pid must really be an Instar lifeline', () => {
+  const procs: FakeLifeline[] = [];
+  afterEach(() => { for (const p of procs.splice(0)) p.stop(); });
+  const lock = (pid: unknown) => fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid }));
+
+  it('true for a live process running `instar … lifeline start`', async () => {
+    procs.push(await startFakeLifeline(tmp));
     expect(lifelineRunning(tmp)).toBe(true);
-    fs.writeFileSync(path.join(tmp, 'lifeline.lock'), JSON.stringify({ pid: 2_147_483_000 }));
+  });
+  it('a REUSED pid running something else fails closed', () => {
+    const other = startUnrelatedProcess();
+    procs.push(other);
+    lock(other.pid);
+    expect(lifelineRunning(tmp)).toBe(false);
+  });
+  it('the test runner itself (alive, not a lifeline) fails closed', () => {
+    lock(process.pid);
+    expect(lifelineRunning(tmp)).toBe(false);
+  });
+  it('no lock, a dead pid, garbage, or an unreadable command line fail closed', () => {
+    expect(lifelineRunning(tmp)).toBe(false);
+    lock(2_147_483_000);
+    expect(lifelineRunning(tmp)).toBe(false);
+    lock('12');
     expect(lifelineRunning(tmp)).toBe(false);
     fs.writeFileSync(path.join(tmp, 'lifeline.lock'), 'not json');
     expect(lifelineRunning(tmp)).toBe(false);
+    lock(4242);
+    expect(lifelineRunning(tmp, () => null)).toBe(false);
+  });
+  it('the command-line rule', () => {
+    expect(isInstarLifelineCommand('/a/.instar/bin/node /a/.instar/instar-boot.cjs lifeline start --dir /a')).toBe(true);
+    expect(isInstarLifelineCommand('node /usr/lib/node_modules/instar/dist/cli.js lifeline start')).toBe(true);
+    expect(isInstarLifelineCommand('instar server start')).toBe(false);
+    expect(isInstarLifelineCommand('sleep 600')).toBe(false);
+    expect(isInstarLifelineCommand('node other-tool lifeline start')).toBe(false);
+  });
+});
+
+describe('writeConnectConfig — never overwrites a concurrent edit', () => {
+  it('a change made by another writer between read and commit is kept, and both keys still land', () => {
+    const p = path.join(tmp, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({ port: 1 }));
+    let fired = 0;
+    writeConnectConfig(tmp, { beforeCommit: () => {
+      if (fired++ === 0) fs.writeFileSync(p, JSON.stringify({ port: 1, updates: { autoApply: false } }));
+    } });
+    expect(fired).toBe(2); // first attempt saw the change and started again
+    expect(JSON.parse(fs.readFileSync(p, 'utf-8'))).toEqual({ port: 1, updates: { autoApply: false }, threadline: { relayEnabled: true, verifiedPairing: { enabled: true } } });
+    expect(fs.readdirSync(tmp).filter((f) => f.includes('.tmp'))).toEqual([]);
+  });
+  it('a file that never stops changing is not written at all (no stale overwrite)', () => {
+    const p = path.join(tmp, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({ n: 0 }));
+    let n = 0;
+    expect(() => writeConnectConfig(tmp, { beforeCommit: () => fs.writeFileSync(p, JSON.stringify({ n: ++n })) })).toThrow(/kept changing/);
+    expect(JSON.parse(fs.readFileSync(p, 'utf-8'))).toEqual({ n: 5 });
   });
 });
 
@@ -206,9 +255,42 @@ describe('ConnectEnableController', () => {
     expect(c.request([]).state).toBe('deferred');
     now = NOW + CONNECT_ENABLE_DEFER_MAX_MS + 1;
     blockers = [];
-    c.retryTick();
+    blockers = ['still-busy'];
+    expect(c.retryTick()).toBe('gave-up');
     expect(c.isDeferred()).toBe(false);
     expect(fs.existsSync(flag())).toBe(false);
+    // Recorded explicitly, not left looking "deferred".
+    expect(readConnectEnableStatus(tmp)).toMatchObject({ state: 'gave-up', configWritten: true, restartPending: true });
+    expect(readConnectEnableStatus(tmp)!.reason).toContain('still-busy');
+    expect(c.status()).toMatchObject({ deferred: false, last: { state: 'gave-up' } });
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, 'config.json'), 'utf-8')).threadline).toMatchObject({ relayEnabled: true, verifiedPairing: { enabled: true } });
+    // A fresh request from the agent supersedes the give-up.
+    blockers = [];
+    expect(c.request([]).state).toBe('restarting');
+    expect(readConnectEnableStatus(tmp)).toBeNull();
+  });
+
+  it('#2242 restart holds (a pairing invite awaiting approval): the enable restart waits on the hold, and the 5-minute give-up still ends the wait', () => {
+    // A real AutoUpdater with a hold provider shaped like the pairing-invite one, wired the way the route wires it.
+    fs.mkdirSync(path.join(tmp, 'state'), { recursive: true });
+    const u = new AutoUpdater(
+      { getInstalledVersion: () => '1.0.0', getLastCheck: () => null } as unknown as UpdateChecker,
+      { get: () => undefined, set: () => {} } as unknown as StateManager,
+      tmp, { restartImmediately: true }, // even an always-latest agent honours holds
+    );
+    let now = NOW;
+    u.setRestartHold('pairing-invite', () => [{ name: 'pairing-invite:abcd1234', until: Date.now() + 60 * 60_000, reason: 'a pairing invite from "echo" is waiting for the operator\'s approval' }]);
+    const c = ctl({ now: () => now, blockers: (ex) => u.getRestartBlockers((n) => ex.includes(n)) });
+    const r = c.request(['me']);
+    expect(r).toMatchObject({ state: 'deferred', blockingSessions: ['hold:pairing-invite:abcd1234'] });
+    // Its own config change creates no hold and does not block it: only the invite does.
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, 'config.json'), 'utf-8')).threadline.relayEnabled).toBe(true);
+    now = NOW + 60_000;
+    expect(c.retryTick()).toBe('deferred');
+    now = NOW + CONNECT_ENABLE_DEFER_MAX_MS + 1;
+    expect(c.retryTick()).toBe('gave-up');
+    expect(fs.existsSync(flag())).toBe(false);
+    expect(readConnectEnableStatus(tmp)!.reason).toContain('hold:pairing-invite:abcd1234');
   });
 
   it('without a lifeline: config written, no flag, and the reason says why', () => {
@@ -250,6 +332,16 @@ describe('AutoUpdater.getRestartBlockers — the same gate an update restart use
   });
   it('none under updates.restartImmediately', () => {
     expect(updater(true).getRestartBlockers()).toEqual([]);
+  });
+  it('active restart holds are listed (even under restartImmediately); an ended hold is not', () => {
+    for (const ri of [false, true]) {
+      const u = updater(ri);
+      u.setRestartHold('pairing-invite', () => [
+        { name: 'pairing-invite:aaaa', until: Date.now() + 60_000, reason: 'pending' },
+        { name: 'pairing-invite:old', until: Date.now() - 1, reason: 'expired' },
+      ]);
+      expect(u.getRestartBlockers((n) => n === 'asker')).toEqual(ri ? ['hold:pairing-invite:aaaa'] : ['busy', 'hold:pairing-invite:aaaa']);
+    }
   });
   it('does not start the update deferral clock', () => {
     const u = updater();

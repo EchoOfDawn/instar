@@ -35,6 +35,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
+import { processCommandLine } from '../core/processIdentity.js';
 
 /** How long after a restart for this we refuse to ask for another one. */
 export const CONNECT_ENABLE_RESTART_COOLDOWN_MS = 10 * 60_000;
@@ -57,7 +58,9 @@ export type ConnectEnableState =
   | 'deferred'
   | 'unavailable-here'
   | 'not-ready-after-restart'
-  | 'restart-unavailable';
+  | 'restart-unavailable'
+  /** A deferred request waited CONNECT_ENABLE_DEFER_MAX_MS and stopped: config written, restart still pending. */
+  | 'gave-up';
 
 export interface ConnectEnableInputs {
   /** The pairing routes answer here right now (gate on AND an invite engine exists). */
@@ -137,7 +140,7 @@ export function decideConnectEnable(i: ConnectEnableInputs): ConnectEnableDecisi
   if (i.blockers.length > 0) {
     return {
       state: 'deferred', writeConfig: true, requestRestart: false,
-      reason: `waiting for ${i.blockers.length} other active session(s) to settle: ${i.blockers.join(', ')}`,
+      reason: `waiting for other work to settle (active sessions, or holds on in-flight work such as a pending pairing invite): ${i.blockers.join(', ')}`,
     };
   }
   return { state: 'restarting', writeConfig: true, requestRestart: true, reason: 'restarting the server so the change takes effect' };
@@ -156,50 +159,112 @@ export function sayToPerson(state: ConnectEnableState): string {
       return `My connection to other agents runs on another of my machines, so I'll make the invite from there.`;
     case 'not-ready-after-restart':
     case 'restart-unavailable':
+    case 'gave-up':
       return `I couldn't switch on my connection to other agents by myself this time.`;
   }
 }
 
-/** Set the two keys in `<stateDir>/config.json`, leaving everything else as it is. */
-export function writeConnectConfig(stateDir: string): void {
+/**
+ * Set the two keys in `<stateDir>/config.json`, leaving everything else as it is.
+ *
+ * There is no shared config writer or lock to join: PATCH /config, PATCH /updates/config, the
+ * Threadline MCP server and the CLI each do a plain read-modify-write. Inside this server
+ * process no writer can interleave with this one (every step here is synchronous, one
+ * event-loop turn). Another PROCESS can (the MCP server, the CLI, a session editing the file),
+ * so this is a compare-and-swap: just before the rename it re-reads the file, and if it changed
+ * since it was read, it starts again from the new content (up to 5 tries), so a concurrent
+ * edit is never overwritten with stale content. What remains is the gap between that re-read
+ * and the rename, which no unlocked writer here closes.
+ */
+export function writeConnectConfig(stateDir: string, hooks: { beforeCommit?: () => void } = {}): void {
   const configPath = path.join(stateDir, 'config.json');
-  const raw = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown> : {};
-  const tl = (raw.threadline && typeof raw.threadline === 'object' ? raw.threadline : {}) as Record<string, unknown>;
-  const vp = (tl.verifiedPairing && typeof tl.verifiedPairing === 'object' ? tl.verifiedPairing : {}) as Record<string, unknown>;
-  if (tl.relayEnabled === true && vp.enabled === true) return;
-  tl.relayEnabled = true;
-  vp.enabled = true;
-  tl.verifiedPairing = vp;
-  raw.threadline = tl;
-  // config.json holds the auth token and is written 0600 at init: keep its mode.
-  let mode = 0o600;
-  try { mode = fs.statSync(configPath).mode & 0o777; } catch { /* @silent-fallback-ok — new file: 0600 */ }
-  const tmp = `${configPath}.${process.pid}.connect.tmp`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode });
-    fs.chmodSync(tmp, mode); // writeFileSync's mode is masked by the umask
-    fs.renameSync(tmp, configPath);
-  } catch (err) {
-    try { SafeFsExecutor.safeUnlinkSync(tmp, { operation: 'src/threadline/connectEnable.ts:config-tmp-cleanup' }); } catch { /* @silent-fallback-ok — nothing to clean */ }
-    throw err;
+  const readText = (): string | null => (fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : null);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const before = readText();
+    const raw = before !== null ? JSON.parse(before) as Record<string, unknown> : {};
+    const tl = (raw.threadline && typeof raw.threadline === 'object' ? raw.threadline : {}) as Record<string, unknown>;
+    const vp = (tl.verifiedPairing && typeof tl.verifiedPairing === 'object' ? tl.verifiedPairing : {}) as Record<string, unknown>;
+    if (tl.relayEnabled === true && vp.enabled === true) return;
+    tl.relayEnabled = true;
+    vp.enabled = true;
+    tl.verifiedPairing = vp;
+    raw.threadline = tl;
+    // config.json holds the auth token and is written 0600 at init: keep its mode.
+    let mode = 0o600;
+    try { mode = fs.statSync(configPath).mode & 0o777; } catch { /* @silent-fallback-ok — new file: 0600 */ }
+    const tmp = `${configPath}.${process.pid}.connect.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode });
+      fs.chmodSync(tmp, mode); // writeFileSync's mode is masked by the umask
+      hooks.beforeCommit?.();
+      if (readText() !== before) {
+        // Someone else wrote config.json since we read it: redo from their content.
+        SafeFsExecutor.safeUnlinkSync(tmp, { operation: 'src/threadline/connectEnable.ts:config-cas-retry' });
+        console.warn('[connect-enable] config.json changed while being updated; re-reading');
+        continue;
+      }
+      fs.renameSync(tmp, configPath);
+      return;
+    } catch (err) {
+      try { SafeFsExecutor.safeUnlinkSync(tmp, { operation: 'src/threadline/connectEnable.ts:config-tmp-cleanup' }); } catch { /* @silent-fallback-ok — nothing to clean */ }
+      throw err;
+    }
   }
+  throw new Error('config.json kept changing while it was being updated; not written');
 }
 
-/** A lifeline holds this agent's lock and its process is alive. */
-export function lifelineRunning(stateDir: string): boolean {
+/** True when a command line is an Instar lifeline (`… instar … lifeline start …`). */
+export function isInstarLifelineCommand(command: string | null): boolean {
+  if (!command) return false;
+  return /\blifeline\s+start\b/.test(command) && /instar/i.test(command);
+}
+
+/**
+ * A lifeline holds this agent's lock, and the process at the lock's pid really is an Instar
+ * lifeline (its command line, from `ps -p <pid> -o command=`). A dead pid, a pid reused by
+ * something else, or a command line that cannot be read all fail CLOSED: no restart, because
+ * nothing would bring the server back.
+ */
+export function lifelineRunning(stateDir: string, commandOf: (pid: number) => string | null = processCommandLine): boolean {
+  let pid: unknown;
   try {
-    const lock = JSON.parse(fs.readFileSync(path.join(stateDir, 'lifeline.lock'), 'utf-8')) as { pid?: unknown };
-    if (typeof lock.pid !== 'number' || lock.pid <= 0) return false;
-    process.kill(lock.pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM: alive but owned by another user — still a running lifeline.
-    return (err as NodeJS.ErrnoException)?.code === 'EPERM'; // @silent-fallback-ok — no lock / dead pid → not supervised
+    pid = (JSON.parse(fs.readFileSync(path.join(stateDir, 'lifeline.lock'), 'utf-8')) as { pid?: unknown }).pid;
+  } catch {
+    return false; // @silent-fallback-ok — no readable lock means no lifeline
   }
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+  return isInstarLifelineCommand(commandOf(pid));
 }
 
 const flagPathFor = (stateDir: string) => path.join(stateDir, 'state', 'restart-requested.json');
 const recordPathFor = (stateDir: string) => path.join(stateDir, 'state', 'threadline-connect-enable.json');
+const statusPathFor = (stateDir: string) => path.join(stateDir, 'state', 'threadline-connect-enable-status.json');
+
+/** The last outcome the server reached by itself (a give-up), readable by GET /threadline/pairing/enable. */
+export interface ConnectEnableStatus {
+  state: ConnectEnableState;
+  at: string;
+  reason: string;
+  configWritten: boolean;
+  restartPending: boolean;
+}
+
+export function readConnectEnableStatus(stateDir: string): ConnectEnableStatus | null {
+  try {
+    return JSON.parse(fs.readFileSync(statusPathFor(stateDir), 'utf-8')) as ConnectEnableStatus;
+  } catch {
+    return null; // @silent-fallback-ok — nothing recorded
+  }
+}
+
+function writeConnectEnableStatus(stateDir: string, status: ConnectEnableStatus): void {
+  try {
+    fs.mkdirSync(path.dirname(statusPathFor(stateDir)), { recursive: true });
+    fs.writeFileSync(statusPathFor(stateDir), JSON.stringify(status, null, 2));
+  } catch (err) {
+    console.error(`[connect-enable] could not record status: ${String(err)}`);
+  }
+}
 
 /** A restart request (from anyone) is waiting and has not expired. */
 export function restartRequestPending(stateDir: string, now = Date.now()): boolean {
@@ -320,6 +385,10 @@ export class ConnectEnableController {
   /** Handle a request. `excludeSessionNames` is the asking session (it is the one waiting). */
   request(excludeSessionNames: string[]): ConnectEnableResult {
     const i = this.inputs(excludeSessionNames);
+    if (!this.retryTimer) {
+      // A fresh request (not a retry tick) supersedes an earlier give-up.
+      try { SafeFsExecutor.safeUnlinkSync(statusPathFor(this.d.stateDir), { operation: 'src/threadline/connectEnable.ts:status-clear' }); } catch { /* @silent-fallback-ok — none */ }
+    }
     const decision = decideConnectEnable(i);
     if (decision.writeConfig) writeConnectConfig(this.d.stateDir);
     let state = decision.state;
@@ -345,12 +414,25 @@ export class ConnectEnableController {
     const now = this.d.now?.() ?? Date.now();
     if (now - this.deferredSince > CONNECT_ENABLE_DEFER_MAX_MS) {
       // The agent has told its person by now that it could not switch this on; never
-      // restart after that. The config stays written for the next restart.
-      console.log('[connect-enable] deferred restart given up: other work did not settle in time');
+      // restart after that. The config stays written, so the next restart (an update, or
+      // the agent asking again) applies it.
+      const blockers = this.d.blockers(this.deferredExclude);
+      const reason = `waited ${Math.round(CONNECT_ENABLE_DEFER_MAX_MS / 60_000)} minutes and ${blockers.length ? `still held by: ${blockers.join(', ')}` : 'gave up'}; config is written, the restart is still pending and applies at the next restart`;
+      console.log(`[connect-enable] gave-up: ${reason}`);
+      writeConnectEnableStatus(this.d.stateDir, { state: 'gave-up', at: new Date(now).toISOString(), reason, configWritten: true, restartPending: true });
       this.disarm();
-      return 'deferred';
+      return 'gave-up';
     }
     return this.request(this.deferredExclude).state; // request() disarms on any non-deferred answer
+  }
+
+  /** What a caller polling GET /threadline/pairing/enable sees. */
+  status(): { deferred: boolean; deferredSince: string | null; last: ConnectEnableStatus | null } {
+    return {
+      deferred: this.retryTimer !== null,
+      deferredSince: this.retryTimer ? new Date(this.deferredSince).toISOString() : null,
+      last: readConnectEnableStatus(this.d.stateDir),
+    };
   }
 
   isDeferred(): boolean {

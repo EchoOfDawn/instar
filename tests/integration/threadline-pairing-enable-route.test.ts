@@ -17,13 +17,15 @@ import { createTempProject, createMockSessionManager } from '../helpers/setup.js
 import type { TempProject } from '../helpers/setup.js';
 import type { InstarConfig } from '../../src/core/types.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { startFakeLifeline, type FakeLifeline } from '../helpers/fakeLifeline.js';
 
 const AUTH = 'route-auth';
 
 describe('POST /threadline/pairing/enable (route wiring)', () => {
   let project: TempProject | null = null;
   let server: AgentServer | null = null;
-  afterEach(async () => { await server?.stop(); project?.cleanup(); server = null; project = null; });
+  let lifeline: FakeLifeline | null = null;
+  afterEach(async () => { lifeline?.stop(); lifeline = null; await server?.stop(); project?.cleanup(); server = null; project = null; });
 
   async function boot(blockersSeen: string[][], activeOthers: string[], extraConfig: Partial<InstarConfig> = {}) {
     project = createTempProject();
@@ -37,8 +39,9 @@ describe('POST /threadline/pairing/enable (route wiring)', () => {
       ...extraConfig,
     } as InstarConfig;
     fs.writeFileSync(path.join(project.stateDir, 'config.json'), JSON.stringify(config));
-    // The lifeline that brings the server back after a restart (lifelineRunning reads its lock).
-    fs.writeFileSync(path.join(project.stateDir, 'lifeline.lock'), JSON.stringify({ pid: process.pid }));
+    // The lifeline that brings the server back after a restart: a real process whose command line is
+    // an Instar lifeline (lifelineRunning checks the lock's pid really runs one).
+    lifeline = await startFakeLifeline(project.stateDir);
     const sessionManager = createMockSessionManager() as unknown as Record<string, unknown>;
     sessionManager.listRunningSessions = () => [{ id: 'sid-asker', name: 'PP topic', tmuxSession: 'pp-topic' }];
     // The update restart gate as AutoUpdater exposes it: healthy sessions, minus the excluded.
@@ -82,7 +85,12 @@ describe('POST /threadline/pairing/enable (route wiring)', () => {
     expect(r.body).toMatchObject({ state: 'deferred', blockingSessions: ['job-digest'], backInSeconds: 60 });
     expect(flagExists()).toBe(false);
     const disk = JSON.parse(fs.readFileSync(path.join(project!.stateDir, 'config.json'), 'utf-8'));
-    expect(disk.threadline).toMatchObject({ relayEnabled: true, verifiedPairing: { enabled: true } });
+    expect(disk.threadline).toMatchObject({ relayEnabled: true, verifiedPairing: { enabled: true } });    // GET reports the waiting request (Bearer only).
+    const port = (server as unknown as { server: { address(): { port: number } } }).server.address().port;
+    const get = async (bearer: boolean) => fetch(`http://127.0.0.1:${port}/threadline/pairing/enable`, { headers: { Connection: 'close', ...(bearer ? { Authorization: `Bearer ${AUTH}` } : {}) } });
+    expect((await get(false)).status).toBe(401);
+    const st = await (await get(true)).json() as Record<string, unknown>;
+    expect(st).toMatchObject({ ready: false, deferred: true, last: null });
   });
 
   it('without the session id the asker counts against itself (and the response names it)', async () => {
@@ -98,6 +106,15 @@ describe('POST /threadline/pairing/enable (route wiring)', () => {
     expect(r.status).toBe(503);
     expect(r.body.state).toBe('restart-unavailable');
     expect(String(r.body.reason)).toContain('no lifeline');
+    expect(flagExists()).toBe(false);
+  });
+
+  it('a lock whose pid now runs something else (the test runner) is not a lifeline: 503, no flag', async () => {
+    const call = await boot([], []);
+    fs.writeFileSync(path.join(project!.stateDir, 'lifeline.lock'), JSON.stringify({ pid: process.pid }));
+    const r = await call({ sessionId: 'sid-asker' });
+    expect(r.status).toBe(503);
+    expect(r.body.state).toBe('restart-unavailable');
     expect(flagExists()).toBe(false);
   });
 
