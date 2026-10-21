@@ -40,7 +40,7 @@ interface Effects {
   flow: string[];
 }
 
-interface Boot { owner?: number | undefined; operators?: TopicOperatorStore | null }
+interface Boot { owner?: number | undefined; operators?: TopicOperatorStore | null; polling?: boolean }
 
 function makeContext(stateDir: string, fx: Effects, extra: Record<string, unknown>, b: Boot = {}): RouteContext {
   const owner = 'owner' in b ? b.owner : OWNER;
@@ -60,7 +60,7 @@ function makeContext(stateDir: string, fx: Effects, extra: Record<string, unknow
     state: { getJobState: () => null, getSession: () => null, queryEvents: () => [] } as never,
     scheduler: null,
     telegram: {
-      isPolling: false,
+      isPolling: b.polling === true,
       onTopicMessage: (m: { content: string }) => { fx.topicMessages.push(m.content); },
       logInboundMessage: () => { fx.inboundLogged++; },
       dispatchAgentMessageHook: async () => false,
@@ -316,6 +316,18 @@ describe('invite pairing — Telegram routes', () => {
       // ...and says WHY, with the version, so the owner never has to ask someone to read /health.
       expect(fx.sent.at(-1)?.text).toMatch(/because its Telegram listener has not yet proven itself/);
       expect(fx.sent.at(-1)?.text).toMatch(/\(Instar [^)]+\)/);
+    });
+    it('the cause goes ONLY to the owner: anyone else who pastes an invite gets the generic line (no version, no setup)', async () => {
+      const app = boot();
+      await forward(app, INVITE, { from: 555 });
+      const text = fx.sent.at(-1)?.text ?? '';
+      expect(text).toMatch(/until its listener protection is fully on/);
+      expect(text).not.toMatch(/Instar|because/);
+    });
+    it('a server that polls Telegram itself says so (owner)', async () => {
+      const app = boot({}, { polling: true });
+      await forward(app, INVITE, { secret: secret() });
+      expect(fx.sent.at(-1)?.text).toMatch(/because this agent reads Telegram directly, not through its listener \(Instar [^)]+\)/);
     });
   });
 });

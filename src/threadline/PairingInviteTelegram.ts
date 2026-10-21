@@ -247,16 +247,18 @@ export class PairingInviteTelegram {
   }
 
   /** "Approving in Telegram is off" with its cause when known. Never throws. */
-  private offLine(): string {
+  private offLine(withCause = true): string {
     let why: string | null = null;
-    try { why = this.deps.whyNoButtons?.() ?? null; } catch { /* @silent-fallback-ok — the generic line still tells the owner where to go */ }
+    if (withCause) try { why = this.deps.whyNoButtons?.() ?? null; } catch { /* @silent-fallback-ok — the generic line still tells the owner where to go */ }
     return why
       ? `Approving in Telegram is off on this agent because ${why}.`
       : 'Approving in Telegram is off on this agent until its listener protection is fully on.';
   }
 
   private operatorTap(fromUserId: unknown, chatId: unknown, verified: boolean): string | null {
-    if (!this.deps.enforcing()) return this.offLine();
+    // The cause (version, protection setup) only for the owner: a forwarded-invite refusal is posted
+    // into the topic, and in a forum group other members would see it (Echo's review, 2026-10-21).
+    if (!this.deps.enforcing()) return this.offLine(Number(fromUserId) === this.deps.ownerUserId());
     if (!verified) return 'This tap did not come through the agent\'s own Telegram listener.';
     const owner = this.deps.ownerUserId();
     if (owner === undefined) return NO_OWNER_REFUSAL;

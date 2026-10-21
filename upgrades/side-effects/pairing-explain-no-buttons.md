@@ -3,7 +3,7 @@
 **Version / slug:** `pairing-explain-no-buttons`
 **Date:** `2026-10-21`
 **Author:** `Dawn`
-**Second-pass reviewer:** `Echo, on the Studio, before push (pending at commit time)`
+**Second-pass reviewer:** `Echo, on the Studio, 2026-10-21: approved c061cbf91 with one suggestion, applied in the follow-up commit`
 **Spec:** `docs/specs/a2a-pairing-invite-link.md` §6.1 (r6, approved: false).
 
 ## Summary of the change
@@ -36,7 +36,9 @@ The same messages are still sent; they get longer by one clause. No other caller
 
 ## 6. External surfaces
 
-Telegram text only. The reason includes the Instar version and a config state (watch-only / bypass), and nothing secret. It goes to the owner's own chat, where the dashboard pointer already went.
+Telegram text only. The reason includes the Instar version and a config state (watch-only / bypass), and nothing secret.
+
+**Who sees it (Echo's review).** A forwarded-invite refusal is posted into the topic, and in a forum group every member sees it. So "version + protection bypassed" would be told to anyone who pasted an invite code, which is exactly what a prober wants. The follow-up gives the cause only when the sender is the owner (`fromUserId === ownerUserId()`); everyone else gets the old generic line. A tap refusal is answered only to the tapper, and the same owner rule applies. The finish prompt keeps the cause: only the owner's own invite triggers it, so nobody else can call it up on demand.
 
 ## 7. Multi-machine posture
 
@@ -49,7 +51,7 @@ Remove the `whyNoButtons` wiring; the generic line returns.
 ## Evidence pointers
 
 - Unit: `tests/unit/lifeline-ingress-guard.test.ts` › tapsUnprovableReason.
-- Integration (real routes): `tests/integration/pairing-invite-telegram-routes.test.ts` › never proven (mutation-checked: wiring returning null fails it).
+- Integration (real routes): `tests/integration/pairing-invite-telegram-routes.test.ts` › never proven (mutation-checked: wiring returning null fails it); a non-owner gets the generic line with no version (mutation-checked: giving everyone the cause fails it); a polling server says so.
 - E2E: `tests/e2e/threadline/pairing-handshake-production-path.test.ts` › "a new agent whose listener never proved itself…" (mutation-checked).
 
 ## Class-Closure Declaration (display-only mirror)
