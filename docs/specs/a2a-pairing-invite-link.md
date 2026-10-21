@@ -3,7 +3,7 @@ title: "Verified pairing by invite link (replaces the 12-word confirmation)"
 slug: "a2a-pairing-invite-link"
 author: "dawn"
 parent-principle: "Know Your Principal — An Unverified Identity Is a Guess"
-status: "approved r3; r4 amendment (§11) approved 2026-10-21"
+status: "approved r3; r4 amendment (§11) approved 2026-10-21; r5 (§6.1 taps in armed observe) proposed 2026-10-21, approved: false"
 owners: "Dawn (author), Echo (review)"
 supersedes-ux-of: "docs/specs/secure-a2a-verified-pairing.md (§3.2 human comparison, §3.6 panel)"
 eli16-overview: "a2a-pairing-invite-link.eli16.md"
@@ -151,8 +151,13 @@ approves, accepts or finishes.
 
 **6.1 Telegram (primary).** A Telegram approval counts only when ALL hold:
 - the update reached the server through the lifeline's ingress, carrying the **lifeline-only secret**
-  (instar #2181, `LifelineIngressGuard`), with the guard in **enforce** mode. In observe mode, Telegram
-  approval is off and the agent offers path P instead;
+  (instar #2181, `LifelineIngressGuard`), and the guard can prove taps (`tapsProvable()`): enforce
+  mode, **or** default observe once the lifeline has armed the guard with its secret. Armed observe
+  already refuses every tap without the secret, so a verified tap means the same in both modes. Held
+  observe (explicit `enforce: false`), bypass, no secret held, or no lifeline ingress: Telegram approval
+  is off and the agent offers path P instead. *(r5, 2026-10-21: was "enforce mode" only. A new agent
+  spends its first day or more in observe, which is exactly when its owner pairs it; Justin's PP test
+  got "go to the dashboard" for that reason, topic 61599.)*
 - the callback's `from.id` is the agent's configured operator user id, **and** the chat is the
   operator's chat or topic. In a forum group, other members see the buttons, so the handler checks
   both;
@@ -226,7 +231,8 @@ pairings are untouched.
 - B1 → 4.3.5: the accept is signed by idB over the transcript, and A verifies both the tag and the
   signature.
 - B2 → 6.1: Telegram authority requires #2181's lifeline secret in enforce mode, plus `from.id` and chat
-  checks and a one-time token. Off in observe mode. The boundary is stated as cooperative.
+  checks and a one-time token. Off in observe mode. *(r5 narrows "off" to an observe guard that cannot
+  prove a tap; see 6.1.)* The boundary is stated as cooperative.
 - B3 → 4.1 `bind` (default for a known peer), 4.4.2 second-accept response (an alarm, a demotion of
   the first acceptor whatever the timing, and a signed notice to the late acceptor), names labelled
   claimed, an optional check code, and a non-secret `iid`.

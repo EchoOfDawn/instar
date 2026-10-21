@@ -3436,7 +3436,9 @@ export function createRoutes(ctx: RouteContext): Router {
       ),
       chatId: () => ctx.telegram!.getChatId(),
       operatorTopicId: () => ctx.telegram!.getLifelineTopicId(),
-      enforcing: () => lifelineIngressGuard.mode() === 'enforce'
+      // Buttons whenever a tap can be proven, not only in enforce: a new agent is in observe
+      // for its first day or more, and that is when its owner pairs it (spec §6.1, r5).
+      enforcing: () => lifelineIngressGuard.tapsProvable()
         && (ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true,
       // Invites that were waiting for approval when the server restarted: told once each (spec §8).
       restartNotices: ctx.pairingInvites.markers
