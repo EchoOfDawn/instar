@@ -17,15 +17,16 @@
 
 import crypto from 'node:crypto';
 import type { EventEmitter } from 'node:events';
-import { findInviteToken } from './PairingInvite.js';
+import { findInviteToken, decodeInvite } from './PairingInvite.js';
 import type { InviteEvent, Result } from './PairingInviteFlow.js';
+import { pairingNoticeText, type PairingNotice } from './pairingHandshake.js';
 import { isVerifiedTopicOperatorBinding } from '../users/TopicOperatorStore.js';
 import type { RestartNotice } from './PairingPendingAcceptMarkers.js';
 
 export const CALLBACK_PREFIX = 'pi:';
 const TOKEN_TTL_MS = 24 * 60 * 60_000; // a button outlives no invite (24 h max)
 
-type Step = 'approve' | 'decline' | 'finish' | 'not-them';
+type Step = 'approve' | 'decline' | 'finish' | 'not-them' | 'own-agent';
 interface Pending { iid: string; step: Step; exp: number; siblings: string[] }
 
 export interface InviteTelegramDeps {
@@ -35,7 +36,11 @@ export interface InviteTelegramDeps {
     declineAccept(iid: string): Result;
     approveFinish(iid: string): Result;
     rejectFinish(iid: string): Result;
+    /** The owner says this open invite is for one of their own agents (spec §11.6). */
+    preauthorizeFinish?(iid: string): Result;
+    listPendingAccepts?(): Array<{ iid: string; exp: string }>;
   };
+  /** 'event': the engine's InviteEvent. 'notice': a PairingNotice from the handshake (spec §11.7). */
   events: EventEmitter;
   /** Post to a topic, optionally with one row of buttons. */
   send: (topicId: number, text: string, buttons?: Array<{ text: string; data: string }>) => Promise<void>;
@@ -48,8 +53,20 @@ export interface InviteTelegramDeps {
    */
   ownerUserId: () => number | undefined;
   chatId: () => number | string | undefined;
-  /** Where prompts that are not replies go (finish prompts, alarms): the operator's topic. */
+  /** The fallback for prompts and notices whose invite has no topic of its own: the Lifeline topic. */
   operatorTopicId: () => number | undefined;
+  /**
+   * The topic each invite belongs to (spec §11.8): where it was made (inviter) or forwarded
+   * (recipient). Notices go there first, then to `operatorTopicId`.
+   */
+  topics?: { get(iid: string): number | undefined; set(iid: string, topicId: number, role: 'inviter' | 'recipient', exp: string): void };
+  /** This agent's own invite while it is still open, or null (for recognising an invite the agent posted). */
+  ownOpenInvite?: (iid: string) => { exp: string } | null;
+  /**
+   * A pairing notice that could not reach the operator (no topic at all, or the send failed). Wired
+   * to DegradationReporter: never a silent return or an empty catch (spec §11.8).
+   */
+  reportUndelivered?: (what: string, reason: string) => void;
   /** The lifeline ingress guard is in enforce mode (spec §6.1: observe mode turns Telegram approval off). */
   enforcing: () => boolean;
   now?: () => number;
@@ -108,6 +125,10 @@ export interface InviteCallback {
 const DASHBOARD_HINT = 'Open the Threadline tab on the dashboard to do this with your PIN.';
 export const NOT_OWNER_REFUSAL = 'Only the agent\'s owner can do this.';
 export const NO_OWNER_REFUSAL = 'I can\'t approve this here because this agent hasn\'t been told who its owner is.';
+/** Offered next to an invite the agent posted, when Telegram approval is on (spec §11.6). */
+export const OWN_AGENT_PROMPT = 'If this invite is for another of your own agents, tap below. When that agent accepts, I\'ll finish the pairing by myself, so the only tap left is Approve on your other agent. Only tap it if you will forward the invite to your own agent.';
+export const OWN_AGENT_BUTTON = 'It\'s one of my agents';
+export const OWN_AGENT_DONE = 'Got it: when your other agent accepts this invite, I\'ll finish the pairing by myself and tell you here.';
 
 /**
  * Who may approve a pairing in Telegram (spec §6.1 "the agent's configured operator user id").
@@ -159,12 +180,14 @@ export function resolveApprovalOwner(
 
 export class PairingInviteTelegram {
   private readonly tokens = new Map<string, Pending>();
+  private readonly ownAgentOffered = new Set<string>();
   private readonly now: () => number;
   private deliveringRestartNotices = false;
 
   constructor(private readonly deps: InviteTelegramDeps) {
     this.now = deps.now ?? (() => Date.now());
     deps.events.on('event', (e: InviteEvent) => { void this.onEvent(e); });
+    deps.events.on('notice', (n: PairingNotice) => { void this.onNotice(n); });
     if (deps.restartNotices) void this.deliverRestartNotices();
   }
 
@@ -252,6 +275,8 @@ export class PairingInviteTelegram {
       return;
     }
     const agent = String(r.claimedAgent ?? ''), owner = String(r.claimedOwner ?? '');
+    const exp = this.deps.flow.listPendingAccepts?.().find((x) => x.iid === String(r.iid))?.exp ?? '';
+    try { this.deps.topics?.set(String(r.iid), m.topicId, 'recipient', exp); } catch { /* @silent-fallback-ok — notices fall back to the Lifeline topic */ }
     const t = this.mint(String(r.iid), ['approve', 'decline']);
     await this.deps.send(
       m.topicId,
@@ -281,39 +306,108 @@ export class PairingInviteTelegram {
     const r = p.step === 'approve' ? this.deps.flow.approveAccept(p.iid)
       : p.step === 'decline' ? this.deps.flow.declineAccept(p.iid)
       : p.step === 'finish' ? this.deps.flow.approveFinish(p.iid)
+      : p.step === 'own-agent' ? (this.deps.flow.preauthorizeFinish?.(p.iid) ?? { ok: false as const, reason: 'finishing by myself is not available on this agent' })
       : this.deps.flow.rejectFinish(p.iid);
+    // The toast is the instant answer; the handshake's notices (spec §11.7) post the fuller line in
+    // the invite's topic at the same moment ("Approved — finishing the connection with …").
     const done: Record<Step, string> = {
-      approve: 'Approved. Waiting for the other side to finish.',
+      approve: 'Approved. Finishing the connection and checking we can talk…',
       decline: 'Declined. Nothing was paired.',
-      finish: 'Finished. You are paired.',
+      finish: 'Finishing. Checking we can talk…',
       'not-them': 'Not paired. That invite is used up; make a new one if you still want to pair.',
+      'own-agent': OWN_AGENT_DONE,
     };
     await this.deps.answer(c.callbackQueryId, r.ok ? done[p.step] : `That didn't work: ${r.reason}.`);
+    if (r.ok && p.step === 'own-agent') await this.post(p.iid, OWN_AGENT_DONE, 'own-agent confirmation');
+    if (!r.ok && (p.step === 'approve' || p.step === 'finish')) await this.post(p.iid, `That didn't work: ${r.reason}.`, `${p.step} failure`);
     return true;
   }
 
-  private async onEvent(e: InviteEvent): Promise<void> {
-    const topic = this.deps.operatorTopicId();
-    if (topic === undefined) return;
+  /** The topic an invite's messages go to: its own (spec §11.8), else the Lifeline topic. */
+  topicFor(iid: string | undefined): number | undefined {
+    let own: number | undefined;
+    try { own = iid ? this.deps.topics?.get(iid) : undefined; } catch { own = undefined; }
+    return own ?? this.deps.operatorTopicId();
+  }
+
+  /** Post a pairing message for `iid`. A message that cannot be delivered is reported, never dropped silently. */
+  private async post(iid: string | undefined, text: string, what: string, buttons?: Array<{ text: string; data: string }>): Promise<boolean> {
+    const topic = this.topicFor(iid);
+    if (topic === undefined) {
+      this.reportUndelivered(what, 'this invite has no topic and the agent has no Lifeline topic to fall back to');
+      return false;
+    }
     try {
-      if (e.kind === 'finish-prompt') {
-        const owner = e.claimedOwner ? `, which says it belongs to ${e.claimedOwner}` : '';
-        const text = `The agent that calls itself "${e.claimedAgent}"${owner} accepted your pairing invite. `
-          + `Finish only if that is who you sent it to. Check code (optional): ${e.checkCode}`;
-        if (this.deps.enforcing()) {
-          const t = this.mint(e.iid, ['finish', 'not-them']);
-          await this.deps.send(topic, text, [{ text: 'Finish', data: t.finish }, { text: 'Not them', data: t['not-them'] }]);
-        } else {
-          await this.deps.send(topic, `${text} ${DASHBOARD_HINT}`);
-        }
-      } else if (e.kind === 'second-accept-alarm') {
-        await this.deps.send(topic, `Warning: two agents used the same pairing invite, so it got out. The second one calls itself "${e.lateClaimedAgent}". `
-          + 'I paused the first one: it cannot receive anything secret. Make a new invite and send it privately.');
-      } else if (e.kind === 'invite-used-elsewhere') {
-        await this.deps.send(topic, 'The pairing invite you accepted had already been used by another agent, so nothing was paired. Ask the sender for a new invite and tell them theirs got out.');
-      } else if (e.kind === 'paired' && e.role === 'recipient') {
-        await this.deps.send(topic, `Paired with "${e.claimedAgent}".`);
+      await this.deps.send(topic, text, buttons);
+      return true;
+    } catch (err) {
+      this.reportUndelivered(what, `sending to topic ${topic} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  private reportUndelivered(what: string, reason: string): void {
+    try {
+      if (this.deps.reportUndelivered) this.deps.reportUndelivered(what, reason);
+      else console.warn(`[pairing-invite] ${what} not delivered: ${reason}`);
+    } catch { /* @silent-fallback-ok — the reporter itself failed; the pairing state is already recorded */ }
+  }
+
+  /**
+   * The agent posted a message in a topic. If it carries one of this agent's own OPEN invites, remember
+   * that topic for the invite (spec §11.8) and, when Telegram approval is on, offer the owner the
+   * "It's one of my agents" button there (spec §11.6). Never changes or blocks the message itself.
+   */
+  async noteOutboundInvite(text: unknown, topicId: number): Promise<void> {
+    try {
+      if (typeof text !== 'string' || !Number.isSafeInteger(topicId)) return;
+      const token = findInviteToken(text);
+      if (!token) return;
+      const d = decodeInvite(token);
+      if (!d.ok) return;
+      const iid = d.invite.iid;
+      const own = this.deps.ownOpenInvite?.(iid);
+      if (!own) return;
+      this.deps.topics?.set(iid, topicId, 'inviter', own.exp);
+      if (!this.deps.flow.preauthorizeFinish || !this.deps.enforcing() || this.ownAgentOffered.has(iid)) return;
+      this.ownAgentOffered.add(iid);
+      const t = this.mint(iid, ['own-agent']);
+      await this.post(iid, OWN_AGENT_PROMPT, 'own-agent offer', [{ text: OWN_AGENT_BUTTON, data: t['own-agent'] }]);
+    } catch (err) {
+      this.reportUndelivered('invite topic record', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** The invite route was told which topic an invite belongs to (spec §11.8). */
+  noteInviteTopic(iid: string, topicId: number, exp: string): void {
+    try { this.deps.topics?.set(iid, topicId, 'inviter', exp); } catch (err) {
+      this.reportUndelivered('invite topic record', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async onNotice(n: PairingNotice): Promise<void> {
+    await this.post(n.iid, pairingNoticeText(n), `pairing notice ${n.kind}`);
+  }
+
+  private async onEvent(e: InviteEvent): Promise<void> {
+    const iid = 'iid' in e ? e.iid : undefined;
+    if (e.kind === 'finish-prompt') {
+      const owner = e.claimedOwner ? `, which says it belongs to ${e.claimedOwner}` : '';
+      const text = `The agent that calls itself "${e.claimedAgent}"${owner} accepted your pairing invite. `
+        + `Finish only if that is who you sent it to. Check code (optional): ${e.checkCode}`;
+      if (this.deps.enforcing()) {
+        const t = this.mint(e.iid, ['finish', 'not-them']);
+        await this.post(iid, text, 'finish prompt', [{ text: 'Finish', data: t.finish }, { text: 'Not them', data: t['not-them'] }]);
+      } else {
+        await this.post(iid, `${text} ${DASHBOARD_HINT}`, 'finish prompt');
       }
-    } catch { /* a failed notice never breaks the pairing state, which is already recorded */ }
+    } else if (e.kind === 'second-accept-alarm') {
+      await this.post(iid, `Warning: two agents used the same pairing invite, so it got out. The second one calls itself "${e.lateClaimedAgent}". `
+        + 'I paused the first one: it cannot receive anything secret. Make a new invite and send it privately.', 'second-accept alarm');
+    } else if (e.kind === 'invite-used-elsewhere') {
+      await this.post(iid, 'The pairing invite you accepted had already been used by another agent, so nothing was paired. Ask the sender for a new invite and tell them theirs got out.', 'invite-used-elsewhere notice');
+    }
+    // 'paired' from the engine means the key is pinned; the handshake's 'paired' notice (after the
+    // hello, spec §11.4) is what the operator is told, on BOTH sides.
   }
 }

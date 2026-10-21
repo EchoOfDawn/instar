@@ -174,6 +174,23 @@ describe('pairing card — controller', () => {
   });
 });
 
+describe('pairing card — "It\'s one of my agents" (spec a2a-pairing-invite-link §11.6)', () => {
+  it('an open invite offers it; it is an operator act: the PIN row appears with nothing else waiting, and the PIN is sent', async () => {
+    expect(renderOpenInvites([openInvite], NOW)).toContain(`data-own-agent="${IID}"`);
+    const server = { ...empty(), invites: [openInvite] };
+    const { els, c, calls } = setup(server);
+    await c.load();
+    expect(els.pinRow.style.display).toBe('none');
+    await click(c, els.open.querySelector('[data-own-agent]'));
+    expect(els.pinRow.style.display).toBe('');
+    expect(calls.some((x) => x.url.endsWith('/own-agent'))).toBe(false); // no PIN yet: nothing sent
+    els.pin.value = '135790';
+    await click(c, els.open.querySelector('[data-own-agent]'));
+    const sent = calls.find((x) => x.url === `/threadline/pairing/invites/${IID}/own-agent`)!;
+    expect(JSON.parse(sent.opts.body)).toEqual({ pin: '135790' });
+  });
+});
+
 describe('pairing card — inviting a known agent binds the invite to it (spec §4.1)', () => {
   it('lists known agents, keeps the choice across refreshes, and sends bindFp for a known agent only', async () => {
     const server = { ...empty(), knownPeers: [{ fp: FP, name: 'carl', pairingState: null }] };

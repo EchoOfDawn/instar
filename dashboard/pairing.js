@@ -103,6 +103,7 @@ export function renderOpenInvites(invites, now = Date.now()) {
   if (open.length === 0) return '';
   return '<div class="pair-step-title">Invites not used yet</div>' + open.map((i) => `<div class="pair-row" data-open-invite="${esc(i.iid)}">
     <span>Invite ${esc(i.iid.slice(0, 6))} · ${esc(timeLeft(i.exp, now))}</span>
+    <button class="mnd-btn mnd-btn-quiet" data-own-agent="${esc(i.iid)}" title="When your own agent accepts it, finish by myself (spec a2a-pairing-invite-link §11.6). Needs your PIN.">It's one of my agents</button>
     <button class="mnd-btn mnd-btn-quiet" data-revoke="${esc(i.iid)}">Cancel it</button></div>`).join('');
 }
 
@@ -124,6 +125,7 @@ export function renderPairings(list) {
 export function createController({ doc, els, fetchImpl, now = () => Date.now() }) {
   let timer = null;
   let heldPin = '';           // §8.2: asked once per page, memory only
+  let pinWanted = false;      // the PIN row was asked for by an action with no decision waiting (own-agent)
   let data = { invites: [], pendingAccepts: [], pairings: [], restartNotices: [] };
   let connectionError = null;  // the text of a shown "could not reach" error, cleared on the next good refresh
   const lastHtml = new Map();  // section → last rendered HTML (§8.1: re-render only on change)
@@ -166,7 +168,7 @@ export function createController({ doc, els, fetchImpl, now = () => Date.now() }
   // The PIN field sits right above the decisions and shows only while one waits and no PIN is
   // held: a person meets it before the button that needs it, and never otherwise.
   function showPinRow() {
-    if (els.pinRow) els.pinRow.style.display = !heldPin && pendingCount(data) > 0 ? '' : 'none';
+    if (els.pinRow) els.pinRow.style.display = !heldPin && (pendingCount(data) > 0 || pinWanted) ? '' : 'none';
   }
 
   function render() {
@@ -301,8 +303,14 @@ export function createController({ doc, els, fetchImpl, now = () => Date.now() }
       else if (d.copyInvite !== undefined) await copyInvite();
       else if (d.closeInvite !== undefined) els.inviteOut.innerHTML = '';
       else if (d.inspectInvite !== undefined) await inspect();
-      else if (d.approve) await pinned(`/threadline/pairing/invites/${d.approve}/approve`, 'Approved. Waiting for the other side to finish.');
-      else if (d.finish) await pinned(`/threadline/pairing/invites/${d.finish}/finish`, 'Finished. You are paired.');
+      else if (d.approve) await pinned(`/threadline/pairing/invites/${d.approve}/approve`, 'Approved. Finishing the connection and checking we can talk…');
+      else if (d.finish) await pinned(`/threadline/pairing/invites/${d.finish}/finish`, 'Finishing. Checking we can talk…');
+      else if (d.ownAgent) {
+        // An operator act (PIN): the PIN row is shown for it even with no decision waiting.
+        pinWanted = true;
+        showPinRow();
+        await pinned(`/threadline/pairing/invites/${d.ownAgent}/own-agent`, 'Got it: when your other agent accepts this invite, I will finish the pairing by myself.');
+      }
       else if (d.notThem) await pinned(`/threadline/pairing/invites/${d.notThem}/not-them`, 'Not paired. That invite is used up.');
       else if (d.decline) {
         const { status, body } = await post(`/threadline/pairing/invites/${d.decline}/decline`, {});
