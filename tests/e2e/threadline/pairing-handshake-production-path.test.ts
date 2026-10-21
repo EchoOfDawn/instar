@@ -23,6 +23,8 @@ import { HandshakeManager } from '../../../src/threadline/HandshakeManager.js';
 import { AgentServer } from '../../../src/server/AgentServer.js';
 import { PairingInviteTelegram, OWN_AGENT_PROMPT } from '../../../src/threadline/PairingInviteTelegram.js';
 import { PairingTopicStore } from '../../../src/threadline/PairingTopicStore.js';
+import { LifelineIngressGuard } from '../../../src/server/LifelineIngressGuard.js';
+import { ensureLifelineIngressSecret, LIFELINE_SECRET_HEADER } from '../../../src/core/LifelineIngressSecret.js';
 import { createTempProject, createMockSessionManager } from '../../helpers/setup.js';
 import type { TempProject } from '../../helpers/setup.js';
 import type { InstarConfig } from '../../../src/core/types.js';
@@ -67,7 +69,7 @@ describe('pairing handshake — production path', () => {
   let relayUrl: string;
   const sides: Side[] = [];
 
-  async function bootSide(name: string, port: number, timings: typeof FAST = CALM): Promise<Side> {
+  async function bootSide(name: string, port: number, timings: typeof FAST = CALM, enforcing: () => boolean = () => true): Promise<Side> {
     const project = createTempProject();
     const auth = `${name}-auth`;
     const boot = await bootstrapThreadline({
@@ -96,7 +98,7 @@ describe('pairing handshake — production path', () => {
       ownerUserId: () => OWNER,
       chatId: () => '-100',
       operatorTopicId: () => 1, // the Lifeline topic
-      enforcing: () => true,
+      enforcing,
       topics: new PairingTopicStore(project.stateDir),
       ownOpenInvite: (iid) => { const inv = pi.store.getInternal(iid); return inv && inv.state === 'open' ? { exp: inv.exp } : null; },
       reportUndelivered: (what, reason) => { undelivered.push(`${what}: ${reason}`); },
@@ -150,6 +152,41 @@ describe('pairing handshake — production path', () => {
     await relay?.stop();
     relayData?.cleanup();
   });
+
+  it('a NEW agent (fleet, guard still in observe) gets the Finish BUTTON once its lifeline has proven itself — never "go to the dashboard"', async () => {
+    // Justin's PP test, 2026-10-21: PP is a normal new agent, so its lifeline guard was in observe
+    // and its Finish prompt said "Open the Threadline tab on the dashboard". routes.ts now asks the
+    // guard tapsProvable(); this wires a REAL guard the same way.
+    const guardDir = createTempProject();
+    const guard = new LifelineIngressGuard({
+      stateDir: guardDir.stateDir, explicitEnforce: () => undefined, bypass: () => false,
+      raiseAttention: () => undefined, config: { developmentAgent: false }, lifelineIsIngress: () => true,
+      writeRestartSignal: () => true, reportDegradation: () => {}, log: () => {}, bootNudgeDelayMs: null,
+    });
+    guard.evaluate({ [LIFELINE_SECRET_HEADER]: ensureLifelineIngressSecret(guardDir.stateDir) }, 'lifeline-proof');
+    expect(guard.mode()).toBe('observe');
+    try {
+      const A = await bootSide('pp-new', 4103, CALM, () => guard.tapsProvable());
+      const B = await bootSide('echo-dev', 4104);
+      await inviteAndForward(A, B, 60, 70);
+      await tap(B, button(B, 'Approve').data);
+      await vi.waitFor(() => expect(texts(A, 60).some((t) => t.includes('accepted your pairing invite'))).toBe(true), { timeout: 30_000 });
+      expect(texts(A, 60).some((t) => t.includes('dashboard'))).toBe(false);
+      const fin = button(A, 'Finish');
+      // A tap that did not come through the lifeline is still refused, and changes nothing.
+      await A.tg.onCallback({ callbackQueryId: 'q-unproven', data: fin.data, fromUserId: OWNER, chatId: '-100', verified: false });
+      expect(A.toasts.at(-1)).toMatch(/did not come through/);
+      expect(A.boot.trustManager!.isCredentialShareAllowedByFingerprint(B.fp)).toBe(false);
+      await tap(A, fin.data);
+      await vi.waitFor(() => {
+        expect(texts(A, 60)).toContain('Connected ✓ "echo-dev" and I are paired, and we\'ve each checked we can message the other privately.');
+        expect(texts(B, 70)).toContain('Connected ✓ "pp-new" and I are paired, and we\'ve each checked we can message the other privately.');
+      }, { timeout: 30_000 });
+    } finally {
+      guard.flush();
+      guardDir.cleanup();
+    }
+  }, 120_000);
 
   it('Approve → an immediate "finishing" message → Finish → both sides "Connected ✓" only after the hello', async () => {
     const A = await bootSide('pp', 4091);

@@ -362,6 +362,29 @@ export class LifelineIngressGuard {
     return this.state.graduatedAt ? 'enforce' : 'observe';
   }
 
+  /**
+   * Can a button tap on this agent be PROVEN to come through the lifeline?
+   * True in enforce, and also in default observe once the lifeline has armed
+   * the guard with its secret: from then on observe already refuses any tap
+   * without the secret (see `refusingTaps`), so a verified tap means the same
+   * in both modes. False when bypassed, when no secret is held, and where the
+   * lifeline is not the Telegram ingress (nothing can carry the secret).
+   * Also false when observe is HELD by config (`enforce: false`). That is a
+   * choice to respect the owner's dry run, NOT a safety requirement: an armed
+   * held-observe guard refuses unproven taps too (Echo's review, 2026-10-21).
+   * Don't "fix" it without asking the owner what held observe should mean.
+   * E2E-PAIRING: EXEMPT — this comment block only; the behaviour's e2e is in 6879b7d1a.
+   * Pairing uses this, not `mode()`, to decide whether to offer buttons: a new
+   * agent spends its first day or more in observe, which is exactly when its
+   * owner pairs it (Justin, topic 61599, 2026-10-21).
+   */
+  tapsProvable(): boolean {
+    if (this.bypassed()) return false;
+    if (this.mode() === 'enforce') return true;
+    if (this.opts.explicitEnforce() === false) return false;
+    return this.state.armedBy === 'lifeline-proof' && this.holder.held;
+  }
+
   /** Is the full rollback (`bypass: true`) set? */
   bypassed(): boolean {
     try {

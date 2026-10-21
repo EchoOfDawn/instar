@@ -5,7 +5,8 @@
  * - A forwarded message carrying an invite never reaches a session or the inbound log.
  * - Enforce + lifeline secret + owner: an Approve prompt; the tap approves through the engine,
  *   never through the adapter's generic callback path.
- * - Observe mode, or no secret, or not the owner: no prompt, a pointer to the dashboard.
+ * - Observe once the lifeline has proven itself: the same prompt (a tap still needs the secret).
+ * - A lifeline that never proved itself, or not the owner: no prompt, a pointer to the dashboard.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import express from 'express';
@@ -287,10 +288,26 @@ describe('invite pairing — Telegram routes', () => {
     });
   });
 
-  describe('observe (fleet default)', () => {
-    it('an invite is consumed but opens no prompt: Telegram approval is off', async () => {
+  describe('observe (fleet default — every new agent, for its first day or more)', () => {
+    // Justin's PP test, 2026-10-21: PP was in observe and got "go to the dashboard". Once the lifeline
+    // has proven itself, observe already refuses any tap without the secret, so the buttons are offered.
+    it('lifeline proven: an Approve prompt; a tap without the secret is refused; the owner\'s proven tap approves', async () => {
       const app = boot();
       const res = await forward(app, INVITE, { secret: secret() });
+      expect(res.status).toBe(200);
+      expect(fx.topicMessages).toEqual([]);
+      expect(fx.inboundLogged).toBe(0);
+      const prompt = fx.sent.at(-1)!;
+      expect(prompt.buttons?.map((b) => b.text)).toEqual(['Approve', 'Decline']);
+      expect(prompt.text).not.toMatch(/dashboard/);
+      expect((await callback(app, prompt.buttons![0].data, { id: 'cbq-forged' })).status).toBe(401);
+      expect(fx.flow).toEqual(['receive']);
+      expect((await callback(app, prompt.buttons![0].data, { secret: secret(), id: 'cbq-ok' })).status).toBe(200);
+      expect(fx.flow).toEqual(['receive', `approve:${IID}`]);
+    });
+    it('lifeline never proven (no secret on any request): consumed, no prompt, the dashboard pointer', async () => {
+      const app = boot();
+      const res = await forward(app, INVITE);
       expect(res.status).toBe(200);
       expect(fx.flow).toEqual([]);
       expect(fx.topicMessages).toEqual([]);

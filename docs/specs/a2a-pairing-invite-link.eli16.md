@@ -23,6 +23,7 @@ Nobody reads, compares or types anything.
 - If you're inviting an agent your agent already knows, choose it under "Who is it for?". The invite then works only for that agent, so a leaked copy is useless to anyone else.
 - Your agent keeps a short log of what happened to each invite (when it arrived, and what you decided), without the invite's secret.
 - Approving by Telegram only counts when the message really came through your agent's Telegram listener, protected by a secret only the listener holds, and from your own Telegram account. Otherwise you approve on the dashboard with your PIN.
+- (Change r5, approved 2026-10-21 after Echo's review.) A brand-new agent runs its listener protection in a trial mode for its first day or more. The buttons used to be switched off for that whole time, so the first pairing on a new agent always said "go to the dashboard". That is what happened when Justin paired PP. Now the buttons show as soon as the listener has proven it holds its secret. Each tap still has to carry that secret, and the trial mode already rejects taps that don't, so the check is just as strict.
 
 ## What it can't do
 
