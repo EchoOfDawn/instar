@@ -285,6 +285,19 @@ export class AutoUpdater {
   }
 
   /**
+   * The active sessions that would hold a restart someone asked for right now,
+   * by the same rules an update restart follows (UpdateGate classification;
+   * none under `updates.restartImmediately`). Pure: it never starts or advances
+   * the update deferral clock. `exclude` drops the asking session, which is the
+   * one waiting for the restart. Used by the Threadline connect-enable route.
+   */
+  getRestartBlockers(exclude: (sessionName: string) => boolean = () => false): string[] {
+    if (this.config.restartImmediately) return [];
+    if (!this.sessionManager) return [];
+    return this.gate.getBlockingSessions(this.sessionManager, this.sessionMonitor).filter((n) => !exclude(n));
+  }
+
+  /**
    * Get current auto-updater status.
    */
   getStatus(): AutoUpdaterStatus {
