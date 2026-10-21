@@ -3,7 +3,7 @@ title: "Verified pairing by invite link (replaces the 12-word confirmation)"
 slug: "a2a-pairing-invite-link"
 author: "dawn"
 parent-principle: "Know Your Principal — An Unverified Identity Is a Guess"
-status: "approved r3; r4 amendment (§11) proposed, not yet approved"
+status: "approved r3; r4 amendment (§11) approved 2026-10-21"
 owners: "Dawn (author), Echo (review)"
 supersedes-ux-of: "docs/specs/secure-a2a-verified-pairing.md (§3.2 human comparison, §3.6 panel)"
 eli16-overview: "a2a-pairing-invite-link.eli16.md"
@@ -13,7 +13,7 @@ review-completed-at: "2026-10-14T14:44:29Z"
 review-notes: "Echo reviewed r1 (4 blockers), r2 (second-accept race) and approved r3 (21d5fcd1) on PR #2180"
 approved: true
 approved-by: "Echo (EchoOfDawn, GitHub approval of r3 21d5fcd1, PR #2180, 2026-10-14T14:44:29Z) for the spec; Justin (topic 61599, 2026-10-13T01:40Z, 'Yes, perfect') for the direction: invite link, built into Instar, no central service"
-amendment-r4: "§11, 2026-10-20, from Justin's live PP ↔ Echo test (topic 61599). PROPOSED: not reviewed and not approved. The approved: true tag in this frontmatter covers r3 only; §11 carries its own approved: false until Echo reviews it and Justin approves it."
+amendment-r4: "§11, 2026-10-20, from Justin's live PP ↔ Echo test (topic 61599). APPROVED 2026-10-21: Echo checked the implementation at f208df2c6 on the Studio (17/17 invite e2e, 138/138 touched test files, restart case checked:true on both sides); Justin chose the one-tap same-owner flow (11.6, Q1) in topic 61599 at 2026-10-21 08:05 PDT ('Yes please proceed'). Shipped in PR #2270, merge 72d7d31eb."
 approved-basis: "Justin approved the design direction after rejecting the 12-word flow; he has not read the spec text. Echo approved the spec text after three review rounds. The feature ships dark behind threadline.verifiedPairing, and Justin's own end-to-end walkthrough is a completion criterion (§8.5)."
 ---
 
@@ -238,9 +238,9 @@ pairings are untouched.
 
 ## 11. Amendment r4: both sides hear the result (2026-10-20)
 
-> **Status of this section: `approved: false`.** Proposed by Dawn on 2026-10-20 from Justin's live test.
-> Not yet reviewed by Echo and not yet approved by Justin. §1–§10 (r3) stay approved and unchanged
-> except where this section says so.
+> **Status of this section: `approved: true` (2026-10-21).** Proposed by Dawn on 2026-10-20 from Justin's live test.
+> Echo checked the implementation (PR #2270 at f208df2c6) and Justin chose the one-tap same-owner flow
+> (11.10 Q1). §1–§10 (r3) stay approved and unchanged except where this section says so.
 
 ### 11.1 Why
 
@@ -448,8 +448,8 @@ alarms and pauses the impostor) or the owner unpairs it after reading the `auto-
 names the claimed agent. Without the tap, nothing changes: the Finish prompt stays.
 
 This keeps one tap **after** the invite reaches B (Approve), and moves the inviter's decision to the
-moment the owner is already looking at the invite. Whether that is acceptable as the same-owner flow
-until D14's deep link exists is open question 11.10 Q1.
+moment the owner is already looking at the invite. Justin accepted this as the same-owner flow until
+D14's deep link exists (11.10 Q1, answered 2026-10-21).
 
 ### 11.7 Events and the words the operator sees
 
@@ -534,6 +534,7 @@ Instar's pin moves to it, the copy and its parity test are deleted (standalone �
    seeing the acceptor's claimed name. The alternative that matches "no second tap" literally is to
    finish without asking on a claim that both agents share an owner, which this amendment rejects
    because nothing can verify that claim.
+   **Answered 2026-10-21 (Justin, topic 61599): yes.** The one-tap version ships.
 2. **Credentials before the hello.** Should the credential gate also require that the peer's hello has
    arrived? This amendment leaves the gate as it is, because the hello tests exactly what the gate
    already requires (the pinned key and encryption to it) and a missing hello is usually a peer that is

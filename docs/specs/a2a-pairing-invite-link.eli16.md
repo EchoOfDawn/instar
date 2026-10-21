@@ -28,7 +28,9 @@ Nobody reads, compares or types anything.
 
 It can't stop you from approving an agent you don't know. That's why the screen always says the names are "claimed", not checked.
 
-## Proposed change (r4, not yet approved): both people hear how it ended
+## Change r4 (approved 2026-10-21): both people hear how it ended
+
+Echo tested this change on the Studio and Justin chose the "It's one of my agents" button described below. It shipped in PR #2270.
 
 On 2026-10-20 Justin paired two of his own agents. He tapped Approve on one, it said "waiting for the other side", and then nothing happened anywhere. Nobody was told whether it worked, failed or was still going. The agents had several places where a problem was written to a log file and nowhere else, and the approval was sent once with nobody checking it arrived.
 
