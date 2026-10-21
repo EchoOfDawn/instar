@@ -313,6 +313,9 @@ describe('invite pairing — Telegram routes', () => {
       expect(fx.topicMessages).toEqual([]);
       expect(fx.inboundLogged).toBe(0);
       expect(fx.sent.at(-1)?.text).toMatch(/dashboard/);
+      // ...and says WHY, with the version, so the owner never has to ask someone to read /health.
+      expect(fx.sent.at(-1)?.text).toMatch(/because its Telegram listener has not yet proven itself/);
+      expect(fx.sent.at(-1)?.text).toMatch(/\(Instar [^)]+\)/);
     });
   });
 });

@@ -3443,6 +3443,12 @@ export function createRoutes(ctx: RouteContext): Router {
       // for its first day or more, and that is when its owner pairs it (spec §6.1, r5).
       enforcing: () => lifelineIngressGuard.tapsProvable()
         && (ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true,
+      whyNoButtons: () => {
+        const why = (ctx.telegram as unknown as { isPolling?: boolean }).isPolling === true
+          ? 'this agent reads Telegram directly, not through its listener'
+          : lifelineIngressGuard.tapsUnprovableReason();
+        return why ? `${why} (Instar ${ctx.config.version || 'unknown version'})` : null;
+      },
       // Invites that were waiting for approval when the server restarted: told once each (spec §8).
       restartNotices: ctx.pairingInvites.markers
         ? { list: () => ctx.pairingInvites!.markers!.notices(), markNotified: (id: string) => ctx.pairingInvites!.markers!.markTelegramNotified(id) }

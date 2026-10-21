@@ -256,6 +256,28 @@ describe('LifelineIngressGuard', () => {
     });
   });
 
+  describe('tapsUnprovableReason (the cause shown to the owner when there are no buttons)', () => {
+    it('null whenever taps are provable', () => {
+      const g = make(false);
+      g.evaluate(good(), 'lifeline-proof');
+      expect(g.tapsUnprovableReason()).toBeNull();
+      expect(make(true).tapsUnprovableReason()).toBeNull();
+    });
+    it('a new agent whose lifeline never proved itself: says so', () => {
+      expect(make(false).tapsUnprovableReason()).toMatch(/has not yet proven itself/);
+    });
+    it('held observe: names the config setting', () => {
+      explicit = false;
+      const g = make(false);
+      g.evaluate(good(), 'lifeline-proof');
+      expect(g.tapsUnprovableReason()).toMatch(/watch-only in its config/);
+    });
+    it('bypass: names the bypass', () => {
+      bypass = true;
+      expect(make(false).tapsUnprovableReason()).toMatch(/switched off in its config/);
+    });
+  });
+
   describe('enforce is armed only by proof', () => {
     it('does NOT refuse before the lifeline has ever sent the valid secret', () => {
       const g = make(true);

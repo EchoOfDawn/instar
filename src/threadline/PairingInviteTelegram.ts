@@ -69,6 +69,11 @@ export interface InviteTelegramDeps {
   reportUndelivered?: (what: string, reason: string) => void;
   /** The lifeline ingress guard is in enforce mode (spec §6.1: observe mode turns Telegram approval off). */
   enforcing: () => boolean;
+  /**
+   * Why `enforcing()` is false, in plain words, or null. Put into every "use the dashboard"
+   * message so the owner sees the cause (topic 61599, 2026-10-21: PP's owner could not tell).
+   */
+  whyNoButtons?: () => string | null;
   now?: () => number;
   /**
    * Invites that were waiting for approval when the server restarted (the engine keeps them in
@@ -241,8 +246,17 @@ export class PairingInviteTelegram {
     return text.replace(/tlinv1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, 'tlinv1:[removed]');
   }
 
+  /** "Approving in Telegram is off" with its cause when known. Never throws. */
+  private offLine(): string {
+    let why: string | null = null;
+    try { why = this.deps.whyNoButtons?.() ?? null; } catch { /* @silent-fallback-ok — the generic line still tells the owner where to go */ }
+    return why
+      ? `Approving in Telegram is off on this agent because ${why}.`
+      : 'Approving in Telegram is off on this agent until its listener protection is fully on.';
+  }
+
   private operatorTap(fromUserId: unknown, chatId: unknown, verified: boolean): string | null {
-    if (!this.deps.enforcing()) return 'Approving in Telegram is off on this agent until its listener protection is fully on.';
+    if (!this.deps.enforcing()) return this.offLine();
     if (!verified) return 'This tap did not come through the agent\'s own Telegram listener.';
     const owner = this.deps.ownerUserId();
     if (owner === undefined) return NO_OWNER_REFUSAL;
@@ -399,7 +413,7 @@ export class PairingInviteTelegram {
         const t = this.mint(e.iid, ['finish', 'not-them']);
         await this.post(iid, text, 'finish prompt', [{ text: 'Finish', data: t.finish }, { text: 'Not them', data: t['not-them'] }]);
       } else {
-        await this.post(iid, `${text} ${DASHBOARD_HINT}`, 'finish prompt');
+        await this.post(iid, `${text} ${this.offLine()} ${DASHBOARD_HINT}`, 'finish prompt');
       }
     } else if (e.kind === 'second-accept-alarm') {
       await this.post(iid, `Warning: two agents used the same pairing invite, so it got out. The second one calls itself "${e.lateClaimedAgent}". `

@@ -69,7 +69,7 @@ describe('pairing handshake — production path', () => {
   let relayUrl: string;
   const sides: Side[] = [];
 
-  async function bootSide(name: string, port: number, timings: typeof FAST = CALM, enforcing: () => boolean = () => true): Promise<Side> {
+  async function bootSide(name: string, port: number, timings: typeof FAST = CALM, enforcing: () => boolean = () => true, whyNoButtons?: () => string | null): Promise<Side> {
     const project = createTempProject();
     const auth = `${name}-auth`;
     const boot = await bootstrapThreadline({
@@ -99,6 +99,7 @@ describe('pairing handshake — production path', () => {
       chatId: () => '-100',
       operatorTopicId: () => 1, // the Lifeline topic
       enforcing,
+      whyNoButtons,
       topics: new PairingTopicStore(project.stateDir),
       ownOpenInvite: (iid) => { const inv = pi.store.getInternal(iid); return inv && inv.state === 'open' ? { exp: inv.exp } : null; },
       reportUndelivered: (what, reason) => { undelivered.push(`${what}: ${reason}`); },
@@ -152,6 +153,32 @@ describe('pairing handshake — production path', () => {
     await relay?.stop();
     relayData?.cleanup();
   });
+
+  it('a new agent whose listener never proved itself: the Finish prompt says WHY there is no button, with its version', async () => {
+    // Justin's second PP test, 2026-10-21 12:57 PDT: still "go to the dashboard", and nobody could
+    // tell which cause without access to PP's machine. The prompt now names the cause.
+    const guardDir = createTempProject();
+    const guard = new LifelineIngressGuard({
+      stateDir: guardDir.stateDir, explicitEnforce: () => undefined, bypass: () => false,
+      raiseAttention: () => undefined, config: { developmentAgent: false }, lifelineIsIngress: () => true,
+      writeRestartSignal: () => true, reportDegradation: () => {}, log: () => {}, bootNudgeDelayMs: null,
+    });
+    try {
+      const A = await bootSide('pp-unproven', 4105, CALM, () => guard.tapsProvable(),
+        () => { const w = guard.tapsUnprovableReason(); return w ? `${w} (Instar 9.9.9)` : null; });
+      const B = await bootSide('echo-dev2', 4106);
+      await inviteAndForward(A, B, 80, 90);
+      await tap(B, button(B, 'Approve').data);
+      await vi.waitFor(() => expect(texts(A, 80).some((t) => t.includes('accepted your pairing invite'))).toBe(true), { timeout: 30_000 });
+      const prompt = texts(A, 80).find((t) => t.includes('accepted your pairing invite'))!;
+      expect(prompt).toMatch(/because its Telegram listener has not yet proven itself/);
+      expect(prompt).toContain('(Instar 9.9.9)');
+      expect(A.posted.find((m) => m.text === prompt)?.buttons).toBeUndefined();
+    } finally {
+      guard.flush();
+      guardDir.cleanup();
+    }
+  }, 120_000);
 
   it('a NEW agent (fleet, guard still in observe) gets the Finish BUTTON once its lifeline has proven itself — never "go to the dashboard"', async () => {
     // Justin's PP test, 2026-10-21: PP is a normal new agent, so its lifeline guard was in observe
