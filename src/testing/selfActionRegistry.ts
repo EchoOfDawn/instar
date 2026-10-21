@@ -21,8 +21,11 @@
  * steady-state FREQUENCY under feedback).
  */
 
+import { decideConnectEnable, CONNECT_ENABLE_RESTART_COOLDOWN_MS, type ConnectEnableRequestRecord } from '../threadline/connectEnable.js';
 import { EMPTY_KILL_LEDGER, isBreakerTripped, recordKill } from '../monitoring/ExternalHogKillLedger.js';
 import { advanceBrowserRecovery, type BrowserRecoveryState } from '../messaging/telegram-origin/OriginBrowserRecovery.js';
+import { planAdoption, readSystemTopicIds, withAdoptionBrake, MAX_ADOPTS_PER_KIND_PER_BOOT, SYSTEM_TOPIC_ADOPTION_INTERVAL_MS } from '../messaging/SystemTopicAdoption.js';
+import { SYSTEM_TOPIC_STATE_KEYS } from '../core/StateManager.js';
 
 /** A deterministic virtual clock — no real time, no randomness (a fixed adversary). */
 export interface VirtualClock {
@@ -2053,7 +2056,106 @@ const lifelineSecretRefusalRedrive: SelfActionController = {
   },
 };
 
+/**
+ * Threadline connect-enable (upgrades/side-effects/threadline-enable-without-restart.md).
+ * POST /threadline/pairing/enable, and its own deferred retry, write the supervised-restart
+ * flag when pairing is off. The model drives the REAL `decideConnectEnable` under the worst
+ * case for this controller: the route is called every minute, pairing never comes up, no
+ * session is busy (busy only withholds), and the flag is consumed at once but the process
+ * keeps running (a wedged restart). Convergence shape: a PERSISTED request record (time +
+ * pid) gives a 10-minute floor between requests, whether or not the process restarts; a
+ * waiting flag adds no second request.
+ */
+const threadlineConnectEnableRestart: SelfActionController = {
+  id: 'threadline-connect-enable-restart',
+  actionVerb: 'restart-request-server',
+  models: 'src/threadline/connectEnable.ts (decideConnectEnable — persisted request record, CONNECT_ENABLE_RESTART_COOLDOWN_MS; ConnectEnableController deferred retry capped at CONNECT_ENABLE_DEFER_MAX_MS)',
+  modelsPath: 'src/threadline/connectEnable.ts',
+  delegatedGiveUp: 'the persisted 10-minute cooldown record; the deferred retry gives up after 5 minutes; every request is caller-driven (the agent, at its person\'s request)',
+  boundK: Number.POSITIVE_INFINITY, // exempt — bounded by the rate floor, not a total count
+  perTargetBoundK: Number.POSITIVE_INFINITY,
+  ticks: 2880, // the route called every minute for 48 h
+  tickMs: 60_000,
+  eternalSentinel: {
+    reason: 'the route answers a caller who may keep asking while pairing never comes up; only the persisted cooldown floors how often that becomes a restart request',
+    rateFloorMs: CONNECT_ENABLE_RESTART_COOLDOWN_MS,
+  },
+  restartPosture: {
+    pressureSurvives: true,
+    restartUnderPressure: (f, sink) => makeThreadlineConnectEnableRestart(f, sink),
+  },
+  makeUnderPressure: (f, sink) => makeThreadlineConnectEnableRestart(f, sink),
+};
+
+function makeThreadlineConnectEnableRestart(f: PressureFixture, sink: ActionSink): { tick(): void } {
+  const RECORD = 'connect-enable:record';
+  const PENDING = 'connect-enable:flag-pending';
+  const PIDS = 'connect-enable:pid-counter';
+  // A new instance is a new process (restartUnderPressure): a new pid, the same durable record.
+  const pid = ((f.durableState.get(PIDS) as number | undefined) ?? 1000) + 1;
+  f.durableState.set(PIDS, pid);
+  return {
+    tick() {
+      sink.considered += 1;
+      // The supervisor consumes a waiting flag before the next call (worst case: no restart follows).
+      f.durableState.set(PENDING, false);
+      const now = f.clock.nowMs();
+      const d = decideConnectEnable({
+        ready: false, // pairing never comes up
+        bootRelayEnabled: false, bootPairingEnabled: false, ownsRelayAfterRestart: true,
+        restartAlreadyPending: f.durableState.get(PENDING) === true,
+        lastRequest: (f.durableState.get(RECORD) as ConnectEnableRequestRecord | undefined) ?? null,
+        pid, now, blockers: [], supervised: true,
+      });
+      if (!d.requestRestart) return;
+      f.durableState.set(RECORD, { requestedAt: new Date(now).toISOString(), pid });
+      f.durableState.set(PENDING, true);
+      sink.emitTimesMs.push(now);
+      sink.emit({ verb: 'restart-request-server', target: 'server' });
+    },
+  };
+}
+
+/**
+ * system-topic-adoption — a standby copies the lease holder's Updates /
+ * Attention / Agent Health topic ids (src/messaging/SystemTopicAdoption.ts,
+ * 30-min cadence). Convergence shape: adoption is idempotent (unchanged id ⇒
+ * no write) and the per-kind per-boot cap (withAdoptionBrake) is the brake —
+ * under the pinned worst case, a holder whose record FLAPS (a new id for every
+ * kind on every pass), the loop adopts at most MAX_ADOPTS_PER_KIND_PER_BOOT
+ * per kind and then holds, never following the flap.
+ */
+const systemTopicAdoption: SelfActionController = {
+  id: 'system-topic-adoption',
+  actionVerb: 'refresh-system-topic', // 'refresh' detector token: the local record is refreshed from the holder
+  models: 'src/messaging/SystemTopicAdoption.ts (adoptHolderSystemTopics + withAdoptionBrake; startSystemTopicAdoptionLoop 30-min cadence)',
+  modelsPath: 'src/messaging/SystemTopicAdoption.ts',
+  restartPosture: { pressureSurvives: false, resetSafeReason: 'The per-boot cap re-arms on restart; restarts are operator/updater-driven and themselves dampened (restart cascade dampener), so a flapping holder costs at most MAX_ADOPTS_PER_KIND_PER_BOOT adopts per kind per restart.' },
+  boundK: 3 * MAX_ADOPTS_PER_KIND_PER_BOOT, // three kinds × the per-kind cap
+  perTargetBoundK: MAX_ADOPTS_PER_KIND_PER_BOOT,
+  ticks: 50,
+  tickMs: SYSTEM_TOPIC_ADOPTION_INTERVAL_MS,
+  makeUnderPressure(f, sink) {
+    const local = new Map<string, number>();
+    const adopt = withAdoptionBrake((key, topicId) => { local.set(key, topicId); sink.emit({ verb: 'refresh-system-topic', target: key }); });
+    let pass = 0;
+    return {
+      tick() {
+        sink.considered += 1;
+        pass += 1;
+        // The pinned worst case: the holder answers, but with a NEW id for every kind on every pass.
+        const holder = f.targetAlwaysRejects()
+          ? { updates: 1000 + pass, attention: 2000 + pass, agentHealth: 3000 + pass }
+          : { updates: 1000, attention: 2000, agentHealth: 3000 };
+        // The same pure core the async loop runs (planAdoption → braked adopt).
+        for (const { kind, topicId } of planAdoption(readSystemTopicIds(k => local.get(k)), holder)) adopt(SYSTEM_TOPIC_STATE_KEYS[kind], topicId);
+      },
+    };
+  },
+};
+
 export const SELF_ACTION_CONTROLLERS: SelfActionController[] = [
+  systemTopicAdoption,
   lifelineIngressRestartSignal,
   lifelineSecretRefusalRedrive,
   feedbackTriageTick,
@@ -2099,4 +2201,5 @@ export const SELF_ACTION_CONTROLLERS: SelfActionController[] = [
   agentIdentityAdoption,
   agentIdentityCoherenceDetector,
   a2aPeerDarkRaise,
+  threadlineConnectEnableRestart,
 ];

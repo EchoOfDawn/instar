@@ -114,7 +114,7 @@ import {
   LIFELINE_INGRESS_CALLER_SERVER_SELF,
 } from '../core/LifelineIngressSecret.js';
 import { configureSyncOpMarker, defaultInflightMarkerReader } from '../core/InFlightSyncOpMarker.js';
-import { StateManager } from '../core/StateManager.js';
+import { StateManager, SYSTEM_TOPIC_STATE_KEYS } from '../core/StateManager.js';
 import { StuckInputSentinel } from '../core/StuckInputSentinel.js';
 import { SessionRecoveryChannel } from '../core/SessionRecoveryChannel.js';
 import { JobScheduler } from '../scheduler/JobScheduler.js';
@@ -131,6 +131,7 @@ import { ClaudeCliIntelligenceProvider } from '../core/ClaudeCliIntelligenceProv
 import { wrapIntelligenceWithCircuitBreaker, getFeatureMetricsRecorder } from '../core/CircuitBreakingIntelligenceProvider.js';
 import { configureLlmCircuitBreaker, llmCircuitAvailable } from '../core/LlmCircuitBreaker.js';
 import { computeSelfQuotaState } from '../core/selfQuotaState.js';
+import { SessionStartFailureTracker } from '../core/startFailureTracker.js';
 import { isClaudeForbidden } from '../core/claudeForbiddenGuard.js';
 import { SUPPORTED_FRAMEWORKS } from '../core/TopicFrameworksStore.js';
 import type { IntelligenceFramework } from '../core/intelligenceProviderFactory.js';
@@ -3663,6 +3664,55 @@ function wireIMessageRouting(
  * Ensure the Agent Attention topic exists — the agent's direct line to the user.
  * Created once on first server start, persisted in state.
  */
+let _systemTopicAdoptionStarted = false;
+/**
+ * A standby converges its system topic ids onto the lease holder's (read from the
+ * holder's GET /telegram/system-topics with the shared bearer token) instead of
+ * minting its own. A no-op while this machine holds the lease, and on a single machine.
+ */
+async function wireSystemTopicAdoption(input: {
+  state: StateManager;
+  leaseHolder: () => string | null;
+  selfMachineId: string | null;
+  peerUrl: (machineId: string) => string | null;
+  authToken: string | undefined;
+  ensureOwn: () => Promise<void>;
+}): Promise<void> {
+  if (_systemTopicAdoptionStarted || !input.selfMachineId) return;
+  _systemTopicAdoptionStarted = true;
+  const { startSystemTopicAdoptionLoop } = await import('../messaging/SystemTopicAdoption.js');
+  startSystemTopicAdoptionLoop({
+    holdsLease: () => !input.state.readOnly,
+    leaseHolder: input.leaseHolder,
+    selfMachineId: input.selfMachineId,
+    fetchHolder: async (holder) => {
+      const url = input.peerUrl(holder);
+      if (!url) throw new Error(`no reachable address for ${holder.slice(0, 12)}`);
+      const res = await fetch(`${url.replace(/\/$/, '')}/telegram/system-topics`, {
+        headers: input.authToken ? { Authorization: `Bearer ${input.authToken}` } : {},
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    },
+    get: (key) => input.state.get(key),
+    adopt: (key, topicId) => input.state.adoptSystemTopicId(key, topicId),
+    ensureOwn: input.ensureOwn,
+    log: (line) => console.log(line),
+  });
+}
+
+function systemTopicsHooks(state: StateManager) {
+  return {
+    // A read-only StateManager is the standby signal (MultiMachineCoordinator sets it
+    // from the lease before Telegram boots); a single machine is never read-only.
+    canCreate: () => !state.readOnly,
+    getAgentHealthTopicId: () => state.get<number>(SYSTEM_TOPIC_STATE_KEYS.agentHealth) ?? null,
+    recordAgentHealthTopicId: (topicId: number) => state.set(SYSTEM_TOPIC_STATE_KEYS.agentHealth, topicId),
+    recordAttentionHubTopicId: (topicId: number) => state.set(SYSTEM_TOPIC_STATE_KEYS.attention, topicId),
+  };
+}
+
 async function ensureAgentAttentionTopic(
   telegram: TelegramAdapter,
   state: StateManager,
@@ -3670,6 +3720,12 @@ async function ensureAgentAttentionTopic(
   const existingTopicId = state.get<number>('agent-attention-topic');
   if (existingTopicId) {
     console.log(`  Agent Attention topic: ${existingTopicId}`);
+    return;
+  }
+  if (state.readOnly) {
+    // Standby: never mint a system topic (it could not save the id and would mint
+    // another next boot). The id is adopted from the lease holder instead.
+    console.log('  Agent Attention topic: none recorded yet — waiting to adopt the lease holder\'s');
     return;
   }
 
@@ -3757,18 +3813,26 @@ async function ensureAgentUpdatesTopic(
     console.log(`  Agent Updates topic: ${existingTopicId}`);
     return;
   }
+  if (state.readOnly) {
+    // Standby: never mint a system topic (see ensureAgentAttentionTopic).
+    console.log('  Agent Updates topic: none recorded yet — waiting to adopt the lease holder\'s');
+    return;
+  }
 
   try {
-    const topic = await telegram.createForumTopic(
+    // find-or-create: reuse an existing "Updates" topic by name before minting one.
+    const topic = await telegram.findOrCreateForumTopic(
       `${TOPIC_STYLE.INFO.emoji} Updates`,
       TOPIC_STYLE.INFO.color, // Blue — informational
       { origin: 'system', bounded: true, label: 'boot-updates' }, // bounded create-once boot topic
     );
     state.set('agent-updates-topic', topic.topicId);
-    await telegram.sendToTopic(topic.topicId,
-      `This is where I'll post updates about new features, version changes, and improvements.\n\nNothing urgent — just keeping you in the loop about what's new.`
-    );
-    console.log(pc.green(`  Created Agent Updates topic: ${topic.topicId}`));
+    if (!topic.reused) {
+      await telegram.sendToTopic(topic.topicId,
+        `This is where I'll post updates about new features, version changes, and improvements.\n\nNothing urgent — just keeping you in the loop about what's new.`
+      );
+    }
+    console.log(pc.green(`  ${topic.reused ? 'Reusing' : 'Created'} Agent Updates topic: ${topic.topicId}`));
   } catch (err) {
     console.error(`  Failed to create Agent Updates topic: ${err}`);
   }
@@ -8076,6 +8140,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           // Single-alerts-topic routing: resolve the boot-created Attention hub
           // live from state so attention items land there (never per-item topics).
           getAttentionHubTopicId: () => state.get<number>('agent-attention-topic') ?? null,
+          // One agent-wide system-topic record: only the lease holder mints a system
+          // topic; a standby uses the ids it adopted from the holder.
+          systemTopics: systemTopicsHooks(state),
         },
         config.stateDir,
       );
@@ -8093,6 +8160,17 @@ export async function startServer(options: StartOptions): Promise<void> {
       ensureAgentUpdatesTopic(telegram, state).catch(err => {
         console.error(`[server] Failed to ensure Agent Updates topic: ${err}`);
       });
+      wireSystemTopicAdoption({
+        state,
+        leaseHolder: () => coordinator.getSyncStatus().leaseHolder ?? null,
+        selfMachineId: (() => { try { const m = coordinator.managers.identityManager; return m.hasIdentity() ? m.loadIdentity().machineId : null; } catch { return null; } })(), // @silent-fallback-ok — no identity ⇒ single machine, nothing to adopt
+        peerUrl: (machineId) => {
+          const entry = coordinator.managers.identityManager.getActiveMachines().find((m) => m.machineId === machineId)?.entry;
+          return entry ? resolveMeshPeerUrl(meshResolver, machineId, entry.endpoints, entry.lastKnownUrl) : null;
+        },
+        authToken: config.authToken,
+        ensureOwn: async () => { await ensureAgentAttentionTopic(telegram!, state); await ensureAgentUpdatesTopic(telegram!, state); },
+      }).catch(err => console.error(`[server] system topic adoption failed to start: ${err}`));
 
       // Wire Prompt Gate callbacks in send-only mode too — the lifeline forwards
       // callback queries via /internal/telegram-callback, and we need handlers for them
@@ -8171,6 +8249,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           // Single-alerts-topic routing: resolve the boot-created Attention hub
           // live from state so attention items land there (never per-item topics).
           getAttentionHubTopicId: () => state.get<number>('agent-attention-topic') ?? null,
+          // One agent-wide system-topic record: only the lease holder mints a system
+          // topic; a standby uses the ids it adopted from the holder.
+          systemTopics: systemTopicsHooks(state),
         },
         config.stateDir,
       );
@@ -8349,6 +8430,17 @@ export async function startServer(options: StartOptions): Promise<void> {
       ensureAgentUpdatesTopic(telegram, state).catch(err => {
         console.error(`[server] Failed to ensure Agent Updates topic: ${err}`);
       });
+      wireSystemTopicAdoption({
+        state,
+        leaseHolder: () => coordinator.getSyncStatus().leaseHolder ?? null,
+        selfMachineId: (() => { try { const m = coordinator.managers.identityManager; return m.hasIdentity() ? m.loadIdentity().machineId : null; } catch { return null; } })(), // @silent-fallback-ok — no identity ⇒ single machine, nothing to adopt
+        peerUrl: (machineId) => {
+          const entry = coordinator.managers.identityManager.getActiveMachines().find((m) => m.machineId === machineId)?.entry;
+          return entry ? resolveMeshPeerUrl(meshResolver, machineId, entry.endpoints, entry.lastKnownUrl) : null;
+        },
+        authToken: config.authToken,
+        ensureOwn: async () => { await ensureAgentAttentionTopic(telegram!, state); await ensureAgentUpdatesTopic(telegram!, state); },
+      }).catch(err => console.error(`[server] system topic adoption failed to start: ${err}`));
     }
 
     // Poll ownership changes only inbound getUpdates. Every constructed adapter
@@ -10037,6 +10129,35 @@ export async function startServer(options: StartOptions): Promise<void> {
               next_attempt_at: input.next_attempt_at,
             })
           : undefined,
+        // Last resort when there is no lifeline topic. The gateway already
+        // reaches whichever platform this agent actually uses, so a Slack-only
+        // agent stops dropping every unbound-session notice it produces
+        // (indra, 2026-10-20: repeated no-topic outcomes, nothing delivered).
+        // Reports whether a destination existed so the notifier can record the
+        // honest outcome instead of guessing.
+        fallbackNotify: (text) => {
+          const hasTelegramDest = Boolean(_notifyState?.get<number>('agent-attention-topic'));
+          const hasSlackDest = Boolean(_slackAdapter && _notifyState?.get<string>('slack-attention-channel'));
+          if (!hasTelegramDest && !hasSlackDest) return false;
+          notify('SUMMARY', 'session-reap', text, undefined, {
+            producerId: 'reap-notifier',
+            author: unknownAutomationAuthor('reap-reason-author-unavailable'),
+          });
+          return true;
+        },
+        raiseNoDestination: (detail) => {
+          try {
+            void telegram?.createAttentionItem({
+              id: 'reap-notice-no-destination',
+              title: 'Notices about interrupted work have nowhere to go',
+              summary: 'no lifeline topic and no fallback channel',
+              description: detail,
+              category: 'session',
+              priority: 'HIGH',
+              sourceContext: 'reap-notifier',
+            });
+          } catch { /* @silent-fallback-ok: reporting the gap must never throw */ }
+        },
         recordNotify: (e) => reapLog.recordNotify(e),
         quietHoursEndAt: (now) => notificationBatcher.quietHoursEndAt(now),
         summaryReleaseAt: (now) => notificationBatcher.nextSummaryReleaseAt(now),
@@ -10958,6 +11079,11 @@ export async function startServer(options: StartOptions): Promise<void> {
       }));
     }
 
+    // Consecutive session-startup deaths on THIS machine. Feeds the capacity
+    // heartbeat's placement-eligibility block, so a machine that cannot start
+    // work stops being handed conversations (spec: startFailureTracker.ts).
+    const startFailureTracker = new SessionStartFailureTracker();
+
     // A session whose process ended on its own (no reaper/operator/kill) lands in
     // the SAME reap-log as every other session end — `type:'exited'` with uptime
     // and the last startup-window pane tail. Before this, a self-exit was a
@@ -10988,6 +11114,41 @@ export async function startServer(options: StartOptions): Promise<void> {
         // @silent-fallback-ok — an audit write must never disturb the monitor loop.
         console.warn('[reap-log] recordExited failed (non-fatal):', err);
       }
+      // Placement eligibility: a session that died inside its startup window
+      // means this machine could not start work. Count it; past the threshold
+      // the capacity heartbeat reports the machine unable to start, placement
+      // stops sending it new conversations, and the operator is told ONCE.
+      // Before this, a machine whose every session died on arrival kept being
+      // chosen (Mac Mini, 2026-10-20: three deaths in 35 minutes, the
+      // conversation never moved, nothing raised).
+      if (e.reason === 'process-exited-during-startup') {
+        try {
+          const before = startFailureTracker.state().blocked;
+          startFailureTracker.recordStartFailure();
+          const after = startFailureTracker.state();
+          if (!before && after.blocked) {
+            console.warn(`[start-failure] this machine has failed to start ${after.consecutive} sessions in a row — dropping it from placement until one starts`);
+            void telegram?.createAttentionItem({
+              id: 'machine-cannot-start-sessions',
+              title: 'This machine cannot start sessions',
+              summary: `${after.consecutive} sessions in a row died during startup`,
+              description:
+                `${after.consecutive} sessions in a row have died while starting up on this machine, `
+                + 'so new conversations are no longer being sent here. They will go to another machine '
+                + 'instead. This clears itself the moment a session starts successfully. The usual '
+                + "causes are a login that has never answered Claude Code's folder-trust question, an "
+                + 'expired sign-in, or a missing executable.',
+              category: 'session',
+              priority: 'HIGH',
+              sourceContext: 'session-start-failure',
+            });
+          }
+        } catch { /* a placement signal must never disturb the monitor loop */ }
+      }
+    });
+    // The clearing signal: one successful start re-admits the machine.
+    sessionManager.on('sessionStartSucceeded', () => {
+      try { startFailureTracker.recordStartSuccess(); } catch { /* never disturb a launch */ }
     });
     sessionManager.on('sessionReaped', (e: { session: import('../core/types.js').Session; reason: string; disposition?: 'terminal' | 'recovery-bounce'; origin?: 'operator' | 'autonomous'; authorityScope?: 'lease-holder' | 'local-age-limit' | 'local-post-transfer-closeout' | 'operator'; midWork?: boolean; workEvidence?: string[]; via?: string; seenWorkingPastAgeLimit?: boolean }) => {
       // ── F7: schedule a post-grace reachability verify for the affected topic. Both a
@@ -11390,6 +11551,45 @@ export async function startServer(options: StartOptions): Promise<void> {
       operatorStopEpoch: () => {
         try { return Math.floor(fs.statSync(path.join(config.projectDir, '.instar', 'autonomous-emergency-stop')).mtimeMs); }
         catch { return 0; }
+      },
+      // A wedge that recovery genuinely gave up on used to end as one row in
+      // stuck-input-events.jsonl and nothing else — so a message typed into a
+      // session could sit unsubmitted indefinitely with no alarm anywhere
+      // (indra, 2026-10-20: 28 minutes, and the degradation record claimed it
+      // had recovered). Raise it once per wedge, and tell the conversation
+      // itself when we can resolve one, because the person waiting for a reply
+      // is the one who needs to know their words never arrived.
+      onUndeliverable: (info) => {
+        try {
+          void telegram?.createAttentionItem({
+            id: `stuck-input-undelivered:${info.tmuxSession}`,
+            title: 'A message is stuck unsent in a session',
+            summary: info.reason,
+            description:
+              `Session ${info.tmuxSession} has text sitting at its prompt that was never submitted, `
+              + `and every recovery attempt failed (${info.reason}). It has been there for `
+              + `${Math.round(info.stuckSinceMs / 1000)}s. Whoever sent it has not been answered.`,
+            category: 'session',
+            priority: 'HIGH',
+            sourceContext: 'stuck-input-sentinel',
+          });
+        } catch { /* observability must never throw into the sentinel */ }
+        try {
+          // Deterministic send — never the LLM-gated reply path, which can fail
+          // closed under exactly the conditions that produce a wedge.
+          let topicId: number | null = null;
+          for (const [tid, sessionName] of telegram?.getAllTopicSessions() ?? []) {
+            if (sessionName === info.tmuxSession) { topicId = tid; break; }
+          }
+          if (telegram && typeof topicId === 'number' && topicId > 0) {
+            void telegram.sendToTopic(
+              topicId,
+              'Your last message never reached me — it ended up sitting unsent in my own input and '
+              + 'I could not clear it. Nothing you sent was answered. Please send it again; I am '
+              + 'restarting that conversation on my side so the next one lands.',
+            );
+          }
+        } catch { /* a failed notice must not take the sentinel down */ }
       },
     });
     stuckInputSentinel.start();
@@ -12644,8 +12844,12 @@ export async function startServer(options: StartOptions): Promise<void> {
           // default when Updates is unset, preserving prior behavior for
           // agents without an Updates topic.
           const updatesTopicId = state.get<number>('agent-updates-topic') || undefined;
+          // A version-less request (a setting switched on, e.g. Threadline connect-enable or the
+          // money-layer enable) is not an update: never tell the person "update to vundefined".
           notify('IMMEDIATE', 'system',
-            `Applying update to v${request.targetVersion} — restarting now. Active sessions will resume automatically.`,
+            request.targetVersion
+              ? `Applying update to v${request.targetVersion} — restarting now. Active sessions will resume automatically.`
+              : `Restarting now to apply a setting change. Active sessions will resume automatically.`,
             updatesTopicId,
           );
         } else {
@@ -15455,7 +15659,16 @@ export async function startServer(options: StartOptions): Promise<void> {
     }
 
     let presenceProxy: import('../monitoring/PresenceProxy.js').PresenceProxy | undefined;
-    if (sharedIntelligence && telegram) {
+    // The unanswered-message watcher (and everything wired alongside it) used to
+    // require a Telegram adapter to exist. Its Slack support is written and sits
+    // INSIDE this block, so a Slack-only agent got neither: the watcher was never
+    // constructed at all. The indra agent's log carries no "Presence Proxy wired
+    // to Slack" line in its entire history, which is why an operator message
+    // could sit unanswered for 28 minutes on 2026-10-20 with nothing raised.
+    // Every dep below already branches on the Slack synthetic-id map first and
+    // falls back to Telegram, so admitting a Slack-only agent is a gate change,
+    // not a redesign.
+    if (sharedIntelligence && (telegram || _slackAdapter)) {
       try {
         const { PresenceProxy, isBriefAck } = await import('../monitoring/PresenceProxy.js');
         const { execSync: shellExecSync } = await import('child_process');
@@ -15563,7 +15776,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             if (slackChId && _slackAdapter) {
               return _slackAdapter.getSessionForChannel(slackChId) ?? null;
             }
-            return telegram!.getSessionForTopic(topicId);
+            return telegram?.getSessionForTopic(topicId) ?? null;
           },
           isSessionAlive: (name) => sessionManager.isSessionAlive(name),
           sendMessage: async (topicId, text, metadata) => {
@@ -15660,7 +15873,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             const slackChId = slackProxyChannelMap.get(topicId);
             const sessionName = (slackChId && _slackAdapter)
               ? _slackAdapter.getSessionForChannel(slackChId)
-              : telegram!.getSessionForTopic(topicId);
+              : telegram?.getSessionForTopic(topicId) ?? null;
             return sessionName ? rateLimitSentinel.isRecoveryActive(sessionName) : false;
           },
           // Honest turn-receipts: when any recovery sentinel already owns this
@@ -15684,8 +15897,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         });
 
         // Hook into Telegram's onMessageLogged callback (always active, unlike EventBus which requires a feature flag)
-        const existingCallback = telegram.onMessageLogged;
-        telegram.onMessageLogged = (entry) => {
+        const existingCallback = telegram?.onMessageLogged;
+        if (telegram) telegram.onMessageLogged = (entry) => {
           // Call existing callback first (TopicMemory dual-write)
           if (existingCallback) {
             existingCallback(entry);
@@ -15707,8 +15920,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         // Human-as-Detector: observe inbound HUMAN messages for coherence-break
         // corrections — a correction the user had to make is evidence a guardian
         // failed. Chains the prior callback; best-effort (observe never throws).
-        const beforeHadCallback = telegram.onMessageLogged;
-        telegram.onMessageLogged = (entry) => {
+        const beforeHadCallback = telegram?.onMessageLogged;
+        if (telegram) telegram.onMessageLogged = (entry) => {
           if (beforeHadCallback) beforeHadCallback(entry);
           const missSignal = observeInboundMessage(humanAsDetectorLog, entry);
           // ── Usher precision, path (b): the user just had to correct me (a
@@ -15790,8 +16003,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               // Per-topic runaway guard beyond the pre-filter.
               rateCeiling: { maxPerWindow: 30, windowMs: 60_000 },
             });
-            const beforeCaptureCb = telegram.onMessageLogged;
-            telegram.onMessageLogged = (entry) => {
+            const beforeCaptureCb = telegram?.onMessageLogged;
+            if (telegram) telegram.onMessageLogged = (entry) => {
               if (beforeCaptureCb) beforeCaptureCb(entry);
               // Fire-and-forget — capture latency must never reach the delivery path.
               void captureLoop({
@@ -15831,8 +16044,8 @@ export async function startServer(options: StartOptions): Promise<void> {
                 },
                 rateCeiling: { maxPerWindow: 20, windowMs: 60_000 },
               });
-              const beforeUsherCb = telegram.onMessageLogged;
-              telegram.onMessageLogged = (entry) => {
+              const beforeUsherCb = telegram?.onMessageLogged;
+              if (telegram) telegram.onMessageLogged = (entry) => {
                 if (beforeUsherCb) beforeUsherCb(entry);
                 void usherLoop({
                   messageId: entry.messageId,
@@ -15983,8 +16196,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               const aspClassifier = buildAspInboundClassifier(config.stateDir, config.projectName);
               setAspClassifierRef(aspClassifier);
               if (aspClassifier) {
-                const beforeAspCb = telegram.onMessageLogged;
-                telegram.onMessageLogged = (entry) => {
+                const beforeAspCb = telegram?.onMessageLogged;
+                if (telegram) telegram.onMessageLogged = (entry) => {
                   if (beforeAspCb) beforeAspCb(entry);
                   aspClassifier.classify({
                     topicId: entry.topicId,
@@ -16005,8 +16218,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               console.warn('[instar] ASP inbound classifier not wired:', err);
             }
 
-            const beforeCorrectionCb = telegram.onMessageLogged;
-            telegram.onMessageLogged = (entry) => {
+            const beforeCorrectionCb = telegram?.onMessageLogged;
+            if (telegram) telegram.onMessageLogged = (entry) => {
               if (beforeCorrectionCb) beforeCorrectionCb(entry);
               // Layer 0 (SYNC, free) — classify on the seam. No signal → stop at
               // ~zero cost on the vast majority of messages.
@@ -16231,7 +16444,7 @@ export async function startServer(options: StartOptions): Promise<void> {
               });
             },
             captureSessionOutput: (name, lines) => sessionManager.captureOutput(name, lines),
-            getSessionForTopic: (topicId) => telegram!.getSessionForTopic(topicId),
+            getSessionForTopic: (topicId) => telegram?.getSessionForTopic(topicId) ?? null,
             isSessionAlive: (name) => sessionManager.isSessionAlive(name),
             // Double-spawn detector input (escalation §6): count live sessions
             // bound to a topic. Same resolution the ResumeQueue drainer uses.
@@ -16442,8 +16655,8 @@ export async function startServer(options: StartOptions): Promise<void> {
           // structurally-symmetric /resume endpoint. False-positive cost:
           // one extra heartbeat that re-pauses on next idle cycle.
           const KEEP_WATCHING_RE = /\bkeep[\s-]?watching\b/i;
-          const previousTelegramHook = telegram.onMessageLogged;
-          telegram.onMessageLogged = (entry) => {
+          const previousTelegramHook = telegram?.onMessageLogged;
+          if (telegram) telegram.onMessageLogged = (entry) => {
             if (previousTelegramHook) previousTelegramHook(entry);
             if (!entry.fromUser) return;
             if (!entry.topicId) return;
@@ -20585,6 +20798,23 @@ export async function startServer(options: StartOptions): Promise<void> {
             enabled: resolveDevAgentGate(proactiveCfg.loginLoss?.enabled, config),
             dryRun: proactiveCfg.loginLoss?.dryRun !== false,
           },
+          defaultSlotRepoint: {
+            enabled:
+              resolveDevAgentGate(proactiveCfg.defaultSlotRepoint?.enabled, config) &&
+              resolveDevAgentGate(config.subscriptionPool?.credentialRepointing?.enabled, config) &&
+              !credentialEnvTokenGate.evaluate().refused,
+            dryRun: proactiveCfg.defaultSlotRepoint?.dryRun !== false,
+            setDefaultAccount: async (accountId) => {
+              const { setDefaultCredentialAccount } = await import('../core/CredentialSetDefault.js');
+              const result = await setDefaultCredentialAccount(credentialRepointing, accountId, {
+                sourceContext: 'proactive-default-slot',
+              });
+              return result.ok
+                ? { ok: result.outcome === 'swapped' || result.outcome === 'dry-run' || result.outcome === 'noop', outcome: result.outcome, reason: result.reason }
+                : { ok: false, outcome: result.code, reason: result.reason };
+            },
+            audit: (record) => credentialAuditEmit.audit(record),
+          },
           // §4 — the in-flight work gate (proactive arm: defer, ceiling-drop).
           // The monitor owns the deferral lifecycle; the gate is stateless.
           workGate: _swapWorkGate
@@ -22094,7 +22324,11 @@ export async function startServer(options: StartOptions): Promise<void> {
               // avoid it. (Live-test 2026-06-16: the Mini's circuit was open while its quota poll
               // said blocked:false → placement misrouted a session onto it; it died on arrival.)
               // Spec: docs/specs/placement-llm-circuit-aware-quota.md.
-              return computeSelfQuotaState(quotaTracker?.getState(), llmCircuitAvailable());
+              // Third cause: this machine cannot start a session at all.
+              return computeSelfQuotaState(
+                quotaTracker?.getState(), llmCircuitAvailable(), Date.now(),
+                startFailureTracker.state(),
+              );
             } catch { return undefined; /* unknown ≠ blocked */ }
           };
           // Platform/workspace reachability block riding the capacity heartbeat
@@ -26808,6 +27042,9 @@ export async function startServer(options: StartOptions): Promise<void> {
               catch { /* @silent-fallback-ok — audit is observability only */ }
             };
             const heldCollapser = new originForwardMod.HeldForwardItemCollapser({ now: Date.now });
+            // One gate for BOTH held paths (forward + direct): only a held session
+            // reply may post the delayed notice, once per topic per hold episode.
+            const heldNoticeGate = new originForwardMod.HeldNoticeGate({ now: Date.now });
             const raiseHeldItem = async (input: { topicId: number; holder: string | null; operationId: string; lastAttempt: string; reason: string }) => {
               const verdict = heldCollapser.record(input.topicId);
               const holderName = input.holder ? holderNickname(input.holder) : 'no machine currently holds the serving lease';
@@ -26865,6 +27102,7 @@ export async function startServer(options: StartOptions): Promise<void> {
                   formatMode: tgConfig().formatMode, send: sendToHolder(holder, 5_000), executionOwnerMachineId: holder }));
                 return Number.isSafeInteger(r.messageId);
               },
+              noticeGate: heldNoticeGate,
               audit: heldAudit, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now,
             });
             if (telegramOriginBoot && hasUsableBotToken && meshSelfId) {
@@ -26914,15 +27152,20 @@ export async function startServer(options: StartOptions): Promise<void> {
               // holder when one is reachable, otherwise the collapsed attention item.
               runtime.options.onLeaseHoldObserved = async row => {
                 const topicId = Number(row.destination.topicId);
-                heldAudit({ phase: 'direct-hold-observed', topicId: row.destination.topicId, operationId: row.operationId });
+                heldAudit({ ts: Date.now(), phase: 'direct-hold-observed', topicId: row.destination.topicId, operationId: row.operationId, producerKind: row.producerKind ?? null });
                 if (!Number.isSafeInteger(topicId)) return;
                 const route = originForwardMod.classifyLeaseRoute(forwardLease);
+                const gate = heldNoticeGate.decide({ topicId, producerKind: row.producerKind });
                 let noticeDelivered = false;
-                if (route.kind === 'peer' && forwardSwitchOn()) {
+                if (gate.send && route.kind === 'peer' && forwardSwitchOn()) {
                   try { noticeDelivered = await forwardDeps(runtime).notify!(route.holder, topicId); } catch { noticeDelivered = false; } // @silent-fallback-ok — an undelivered notice falls through to the attention item below
+                  if (noticeDelivered) heldNoticeGate.recordSent(topicId);
                 }
-                heldAudit({ phase: noticeDelivered ? 'notice-sent' : 'notice-not-sent', topicId, operationId: row.operationId, holder: route.kind === 'peer' ? route.holder : null });
-                if (!noticeDelivered) await raiseHeldItem({ topicId, holder: route.kind === 'peer' ? route.holder : null, operationId: row.operationId, lastAttempt: 'refused', reason: 'lease-not-held (direct path)' });
+                const suppressed = gate.send ? null : gate.reason;
+                heldAudit({ ts: Date.now(), phase: noticeDelivered ? 'notice-sent' : suppressed ? 'notice-suppressed' : 'notice-not-sent', topicId, operationId: row.operationId,
+                  holder: route.kind === 'peer' ? route.holder : null, ...(suppressed ? { suppressed } : {}) });
+                // The topic was already told about this hold episode: no second item either.
+                if (!noticeDelivered && suppressed !== 'already-noticed') await raiseHeldItem({ topicId, holder: route.kind === 'peer' ? route.holder : null, operationId: row.operationId, lastAttempt: 'refused', reason: 'lease-not-held (direct path)' });
               };
               runtime.options.onHeldForwardExpired = async row => {
                 const topicId = Number(row.destination.topicId);
@@ -26944,7 +27187,7 @@ export async function startServer(options: StartOptions): Promise<void> {
                     { topicId, chatId: tg.chatId, text, silent: opts?.silent, formatMode: tg.formatMode, kindMetadata: opts?.kindMetadata });
                   if (outcome.kind === 'local') throw new OriginForwardSettledLocallyError();
                   if (outcome.kind === 'sent') return { messageId: outcome.messageId, topicId, destinationStoreConfirmed: true as const };
-                  if (!outcome.noticeDelivered) void raiseHeldItem({ topicId, holder: outcome.holder, operationId: outcome.operationId, lastAttempt: outcome.lastAttempt, reason: outcome.reason });
+                  if (!outcome.noticeDelivered && outcome.noticeSuppressed !== 'already-noticed') void raiseHeldItem({ topicId, holder: outcome.holder, operationId: outcome.operationId, lastAttempt: outcome.lastAttempt, reason: outcome.reason });
                   throw new TelegramOriginHoldError(originForwardMod.HOLD_REASON_LEASE_NOT_HELD, outcome.operationId, 'held');
                 }
                 const holder = coordinator.getSyncStatus().leaseHolder;

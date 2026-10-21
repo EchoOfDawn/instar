@@ -24,7 +24,7 @@ import { originToolGuardHook } from '../messaging/telegram-origin/OriginToolGuar
 import fs from 'node:fs';
 import { FEEDBACK_INBOX_TOKEN_SENTENCE, refreshFeedbackInboxTokenAwareness } from '../feedback-factory/inbox/inboxAwareness.js';
 import { JOB_DECLARED_FAILURE_AWARENESS } from '../scheduler/jobDeclaredFailure.js';
-import { telegramOriginAwareness, telegramOriginForwardAwareness, telegramOriginNoticeAwareness, telegramOriginCertificationAwareness, telegramOriginLeaseAwareness, telegramOriginDashboardAwareness, telegramOriginDetectorAwareness, telegramOriginRecoveryAwareness, telegramOriginTransportAwareness, telegramOriginCapacityAwareness, telegramOriginWorkerAwareness, telegramDashboardEditAwareness, refreshOriginCanaryStartupAwareness, refreshOriginCanaryCleanupAwareness, refreshOriginCapacityAwareness } from '../messaging/telegram-origin/OriginAwareness.js';
+import { refreshHeldNoticeAwareness, telegramSystemTopicsAwareness, telegramOriginAwareness, telegramOriginForwardAwareness, telegramOriginNoticeAwareness, telegramOriginCertificationAwareness, telegramOriginLeaseAwareness, telegramOriginDashboardAwareness, telegramOriginDetectorAwareness, telegramOriginRecoveryAwareness, telegramOriginTransportAwareness, telegramOriginCapacityAwareness, telegramOriginWorkerAwareness, telegramDashboardEditAwareness, refreshOriginCanaryStartupAwareness, refreshOriginCanaryCleanupAwareness, refreshOriginCapacityAwareness } from '../messaging/telegram-origin/OriginAwareness.js';
 import { migrateTelegramOriginDisplay } from '../messaging/telegram-origin/OriginConfig.js';
 import path from 'node:path';
 import { KEY_MATERIAL_GITIGNORE_PROJECT, KEY_MATERIAL_GITIGNORE_STATE } from './keyMaterialPaths.js';
@@ -38,7 +38,39 @@ import { resolveAgentHome as resolveAgentHomeForWorktree, ensureWorktreeSpotligh
 import { fileURLToPath } from 'node:url';
 import { TreeGenerator } from '../knowledge/TreeGenerator.js';
 import { HTTP_HOOK_TEMPLATES, buildHttpHookSettings } from '../data/http-hook-templates.js';
-import { jevJobCompletionAuditAwareness, jevMemoryPickerAwareness, jevSignalLiveAwareness, jevCorrectionShadowAwareness, JEV_CORRECTION_CARD_V1_MARKER, jevCirclesShadowAwareness, jevReviewFlagShadowAwareness, REAPER_BACKGROUND_WORK_MARKER, REAPER_BACKGROUND_WORK_BULLET, STANDING_SESSIONS_MARKER, STANDING_SESSIONS_BULLET, AGENT_CONNECT_HEADING, agentConnectSection, AGENT_CONNECT_HOWTO_MARKER, AGENT_CONNECT_HOWTO_BULLET, THREADLINE_PAIR_TOOL_MARKER, THREADLINE_PAIR_TOOL_BULLET } from '../scaffold/templates.js';
+// One symbol per line, sorted. This single import is the file's merge hot-spot: every change that
+// adds a CLAUDE.md awareness marker appends to it, so two branches adding different symbols always
+// collided on the same line (resolved by hand five times on 2026-10-21 alone). One line each means
+// two additions land in different places and git merges them without help. It reduces the collision
+// sharply rather than abolishing it: two symbols that sort adjacently can still touch.
+import {
+  AGENT_CONNECT_HEADING,
+  AGENT_CONNECT_HOWTO_BULLET,
+  AGENT_CONNECT_HOWTO_MARKER,
+  AGENT_CONNECT_LIVE_ENABLE_MARKER,
+  AGENT_CONNECT_STEP1_RESTART_ASK_MARKER,
+  agentConnectSection,
+  agentConnectStep1,
+  JEV_CORRECTION_CARD_V1_MARKER,
+  jevCirclesShadowAwareness,
+  jevCorrectionShadowAwareness,
+  jevJobCompletionAuditAwareness,
+  jevMemoryPickerAwareness,
+  jevReviewFlagShadowAwareness,
+  jevSignalLiveAwareness,
+  READINESS_PAUSE_ALARM_BULLET,
+  READINESS_PAUSE_ALARM_MARKER,
+  READINESS_STALL_NOTICE_BULLET,
+  READINESS_STALL_NOTICE_MARKER,
+  REAPER_BACKGROUND_WORK_BULLET,
+  REAPER_BACKGROUND_WORK_MARKER,
+  REROUTED_LOGIN_EXPIRED_BULLET,
+  REROUTED_LOGIN_EXPIRED_MARKER,
+  STANDING_SESSIONS_BULLET,
+  STANDING_SESSIONS_MARKER,
+  THREADLINE_PAIR_TOOL_BULLET,
+  THREADLINE_PAIR_TOOL_MARKER,
+} from '../scaffold/templates.js';
 import { getMigrationDefaults, applyDefaults } from '../config/ConfigDefaults.js';
 import { CANONICAL_FEEDBACK_URL, LEGACY_FEEDBACK_URLS } from './canonicalFeedback.js';
 import { installBuiltinSkills } from '../commands/init.js';
@@ -217,6 +249,17 @@ Before deferring work because the machine "looks loaded," RUN \`.instar/scripts/
 - **Scope honesty:** the verdict is CPU-capacity only — it does NOT assess memory/swap/thermal/disk-IO, so \`OK\` means "CPU has headroom," not "everything is fine."
 - **NEVER** judge load from \`uptime\` 1-min load average alone — quote the script's verdict + real idle%, never the load average. (This rule exists because that exact misread caused a false "heavy load" deferral on 2026-06-19.)
 - **When to use** (PROACTIVE — this is the trigger): the moment you catch yourself about to hold off on work, fan out parallel sub-agents, or report "the machine is loaded" → run \`load-assess.sh\` and act on its verdict, not on a load-average glance.\n`;
+}
+
+export function CODEX_CONNECT_CLAUDEMD_SECTION(): string {
+  return `
+
+### Hand-started Codex: \`instar codex connect <agent>\`
+
+The Codex CLI reads ONE shared user config (\`$CODEX_HOME/config.toml\`, default \`~/.codex/config.toml\`), so its \`[mcp_servers."threadline"]\` entry can point at ONE agent at a time. My server does NOT write that file at boot any more (it used to, and every boot — and every test run — overwrote whichever agent had it last). The Codex sessions Instar launches for me never needed it: each is started with its own \`-c mcp_servers.threadline.*\` override naming MY Threadline MCP server, so they are unaffected.
+- **When the operator starts a Codex by hand in a terminal and wants it to have my \`threadline_*\` tools** (PROACTIVE — this is the trigger), run \`instar codex connect <my agent name>\` (\`--dry-run\` prints the entry without writing; honors \`CODEX_HOME\`). It is the ONLY writer of the shared entry, it keeps the operator's other Codex settings, and re-running it is idempotent.
+- The entry names one agent: connecting a second agent replaces the first. If a hand-started Codex answers as the wrong agent, re-run connect for the agent you meant — never hand-edit the file.
+`;
 }
 
 export function SINGLE_MACHINE_FAILOVER_GAP_CLAUDEMD_SECTION(port: number): string {
@@ -3037,7 +3080,15 @@ export class PostUpdateMigrator {
         return;
       }
       for (const acct of claudeAccounts) {
-        const ready = ensureInteractiveReady(acct.configHome, { requireExistingHome: true });
+        // Migration parity: an agent already deployed only receives the
+        // folder-trust seed through this sweep. Without `projectDir` a home
+        // whose top-level flags are set reads as ready and still kills every
+        // session it launches at the trust dialog — the Mac Mini failure of
+        // 2026-10-20, which looked like an unresponsive agent for 35 minutes.
+        const ready = ensureInteractiveReady(acct.configHome, {
+          requireExistingHome: true,
+          projectDir: this.config.projectDir,
+        });
         if (ready.patched) {
           result.upgraded.push(
             `subscription-pool interactive-ready: ${acct.id} (${acct.configHome}) — ${ready.reason}`,
@@ -6699,6 +6750,22 @@ setTimeout(() => process.exit(0), 2000);
       result.upgraded.push('CLAUDE.md: added forward-to-holder reply hold awareness');
     }
 
+    // The delayed-notice row now says the notice is only for held session replies.
+    {
+      const refreshed = refreshHeldNoticeAwareness(content);
+      if (refreshed !== content) {
+        content = refreshed;
+        patched = true;
+        result.upgraded.push('CLAUDE.md: delayed-reply notice is session-reply-only');
+      }
+    }
+
+    if (!content.includes('/telegram/system-topics')) {
+      content += '\n' + telegramSystemTopicsAwareness();
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added agent-wide system topic record awareness');
+    }
+
     if (!content.includes('Message origins on your phone:')) {
       content += '\n' + telegramOriginDashboardAwareness();
       patched = true;
@@ -7184,6 +7251,17 @@ setTimeout(() => process.exit(0), 2000);
       content += MACHINE_LOAD_ASSESSMENT_CLAUDEMD_SECTION();
       patched = true;
       result.upgraded.push('CLAUDE.md: added Machine Load Assessment section');
+    }
+
+    // Hand-started Codex connect (ThreadlineBootstrap no longer writes the shared
+    // ~/.codex/config.toml at boot; `instar codex connect <agent>` is the explicit
+    // writer). Agent Awareness + Migration Parity: existing agents learn the
+    // command and the one-agent-at-a-time nature of the shared entry. Same text
+    // as generateClaudeMd. Content-sniff on the heading keeps it idempotent.
+    if (!content.includes('### Hand-started Codex: `instar codex connect <agent>`')) {
+      content += CODEX_CONNECT_CLAUDEMD_SECTION();
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added Hand-started Codex connect section');
     }
 
     // Dark monitoring-route awareness: these two signal-only guards already
@@ -7672,6 +7750,46 @@ setTimeout(() => process.exit(0), 2000);
       content = content.replace(readinessBrakeOld, '(spend cap, a different model or prompt answering, or three runs in a row with no usable answer: timeouts, provider errors, or answers that failed the checks; a single timeout or rejected answer is just retried, and a restart on the same machine keeps the approval); `pausedBecause` says why in plain words, and `GET /feedback-factory/drain/status` → `lastReadinessFailure` names the exact check that refused the most recent failed readiness call (`at` says when; it stays after later calls succeed);');
       patched = true;
       result.upgraded.push('CLAUDE.md: updated Feedback Readiness Authority brake wording');
+    }
+    // 2026-10-18: no run of invocation failures demotes any more (spec feedback-factory-operating-drain.md
+    // line 121 closes the demotion list); the status route exposes readinessProgress instead. Runs after
+    // the block above so an agent on the oldest wording is carried forward in one pass.
+    const readinessBrake1002 = '(spend cap, a different model or prompt answering, or three runs in a row with no usable answer: timeouts, provider errors, or answers that failed the checks; a single timeout or rejected answer is just retried, and a restart on the same machine keeps the approval);';
+    if (content.includes(readinessBrake1002)) {
+      content = content.replace(readinessBrake1002, '(the spend cap, or a different model or prompt answering; a timeout, a provider error, a rate limit or a rejected answer NEVER pauses it — that call is retried at the next run, a long run of them raises one notice instead, and a restart on the same machine keeps the approval);');
+      patched = true;
+      result.upgraded.push('CLAUDE.md: Feedback Readiness Authority brake wording — invocation failures never pause');
+    }
+    const readinessStatusOld = '(`at` says when; it stays after later calls succeed); `blockers` says';
+    if (content.includes(readinessStatusOld)) {
+      content = content.replace(readinessStatusOld, '(`at` says when; it stays after later calls succeed) while `readinessProgress` says how many runs in a row produced no usable answer, since when, and when one last succeeded; `blockers` says');
+      patched = true;
+      result.upgraded.push('CLAUDE.md: Feedback Readiness Authority status now names readinessProgress');
+    }
+    // Readiness pause alarm: one bullet under the Feedback Readiness Authority section (after its
+    // "When to use" line when present, else appended). Idempotent via its marker.
+    if (!content.includes(READINESS_PAUSE_ALARM_MARKER)) {
+      const whenToUse = "- **When to use** (PROACTIVE): a drain tick 403s, or the user asks why feedback isn't turning into work → read the proposal, then give the operator the dashboard tab + PIN path. Never ask them to curl the POST route.";
+      const at = content.indexOf(whenToUse);
+      content = at >= 0
+        ? content.slice(0, at + whenToUse.length) + '\n' + READINESS_PAUSE_ALARM_BULLET + content.slice(at + whenToUse.length)
+        : content + '\n' + READINESS_PAUSE_ALARM_BULLET + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added readiness pause-alarm bullet');
+    } else {
+      result.skipped.push('CLAUDE.md: readiness pause-alarm bullet already present');
+    }
+    // Readiness stall notice (2026-10-18): one bullet right after the pause-alarm bullet (which
+    // the block above guarantees is present). Idempotent via its marker.
+    if (!content.includes(READINESS_STALL_NOTICE_MARKER)) {
+      const pauseAt = content.indexOf(READINESS_PAUSE_ALARM_BULLET);
+      content = pauseAt >= 0
+        ? content.slice(0, pauseAt + READINESS_PAUSE_ALARM_BULLET.length) + '\n' + READINESS_STALL_NOTICE_BULLET + content.slice(pauseAt + READINESS_PAUSE_ALARM_BULLET.length)
+        : content + '\n' + READINESS_STALL_NOTICE_BULLET + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added readiness stall-notice bullet');
+    } else {
+      result.skipped.push('CLAUDE.md: readiness stall-notice bullet already present');
     }
 
     // Cross-Agent Communication Discipline (anti-confabulation) — codex-instar
@@ -8628,6 +8746,28 @@ Before I send another agent a credential, that peer must be **mutually verified*
       result.upgraded.push('CLAUDE.md: added "Connecting to another agent" (pairing by invite)');
     } else {
       result.skipped.push('CLAUDE.md: "Connecting to another agent" already present');
+    }
+
+    // Step 1 of that section as first shipped asked the person to send /lifeline restart after
+    // the agent switched its relay and pairing on. POST /threadline/pairing/enable now requests
+    // the server's supervised restart itself, so an agent that already has the section gets the
+    // new step 1 in place of the old one (upgrades/side-effects/threadline-enable-without-restart.md).
+    // Only the step-1 line inside this section is touched, and only while it still carries the
+    // old restart ask, so a re-run (or an agent that rewrote the line) is left alone.
+    {
+      const secAt = content.indexOf(AGENT_CONNECT_HEADING);
+      const stepAt = secAt >= 0 ? content.indexOf('\n1. **Make sure I can pair.**', secAt) : -1;
+      const nextHeading = secAt >= 0 ? content.indexOf('\n#', secAt + AGENT_CONNECT_HEADING.length) : -1;
+      const inSection = stepAt >= 0 && (nextHeading < 0 || stepAt < nextHeading);
+      const lineEnd = inSection ? content.indexOf('\n', stepAt + 1) : -1;
+      const line = inSection ? content.slice(stepAt + 1, lineEnd < 0 ? content.length : lineEnd) : '';
+      if (inSection && line.includes(AGENT_CONNECT_STEP1_RESTART_ASK_MARKER) && !line.includes(AGENT_CONNECT_LIVE_ENABLE_MARKER)) {
+        content = content.slice(0, stepAt + 1) + agentConnectStep1(port) + (lineEnd < 0 ? '' : content.slice(lineEnd));
+        patched = true;
+        result.upgraded.push('CLAUDE.md: "Connecting to another agent" step 1 no longer asks the person for a restart');
+      } else {
+        result.skipped.push('CLAUDE.md: "Connecting to another agent" step 1 already current');
+      }
     }
 
     // The two bullets that point at that section (Migration Parity with generateClaudeMd):
@@ -9972,6 +10112,19 @@ A silent **decision audit** records every keep/kill decision *change* (logged on
       result.upgraded.push('CLAUDE.md: added standing-sessions bullet');
     } else {
       result.skipped.push('CLAUDE.md: standing-sessions bullet already present');
+    }
+
+    // Rerouted-job expired-login bullet: placed right after the standing-sessions
+    // bullet when present, else appended. Idempotent via its marker.
+    if (!content.includes(REROUTED_LOGIN_EXPIRED_MARKER)) {
+      const stIdx = content.indexOf(STANDING_SESSIONS_BULLET);
+      content = stIdx >= 0
+        ? content.slice(0, stIdx + STANDING_SESSIONS_BULLET.length) + '\n' + REROUTED_LOGIN_EXPIRED_BULLET + content.slice(stIdx + STANDING_SESSIONS_BULLET.length)
+        : content + '\n' + REROUTED_LOGIN_EXPIRED_BULLET + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added rerouted-job expired-login bullet');
+    } else {
+      result.skipped.push('CLAUDE.md: rerouted-job expired-login bullet already present');
     }
 
     // Self-Heal: Update Restart Behavior — explains restart-cascade dampener
@@ -11406,6 +11559,11 @@ The worktree monitor announces unmerged, orphan and stale worktree branches only
       patched = true;
       result.upgraded.push('CLAUDE.md: added command-watchdog test-runner floor awareness');
     }
+    if (!content.includes('A test run that is still working is not interrupted at the hour mark:')) {
+      content += `\n- **A test run that is still working is not interrupted at the hour mark:** the test-runner floor above used to expire on elapsed time alone, so a suite that genuinely needed longer than an hour was interrupted at 61 minutes — and because the hard ceiling is already exceeded by then, every fallback path votes to interrupt, which makes the kill arithmetic rather than a judgement. Past the hour, protection is now held open while the run's own CPU time keeps advancing, measured across its whole process subtree (the \`npm test\` parent waits while its workers do the work, so the parent's own CPU time is not the signal), up to a hard three-hour bound. A run that is alive but burning no CPU is released to the judge exactly as before, and a machine whose \`ps\` gives no readable CPU column behaves exactly as it did. **An interrupted test run is also announced now** — one plain line saying how long it had been running and that nothing it finished was kept — because the old behaviour was a silent Ctrl+C while the harness that launched the run could still report a clean exit. Audit: \`.instar/watchdog-interventions.jsonl\` (the row carries \`stuckCommandKind\`).\n`;
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added test-runner progress-extension + interruption-notice awareness');
+    }
     if (!content.includes('Crash-safe inbound delivery:')) {
       content += `\n- **Crash-safe inbound delivery:** Normal tmux injection and Codex stranded-draft key attempts use FULL-durable armed/started/terminal phases. A crash-open mutation becomes \`effect-unknown\` and is never blindly repeated. Diagnose privacy-safe counts at \`GET /sessions/inbound-delivery-status\`; no message body is exposed. Command-watchdog continuation is owned by the canonical continuation/recovery funnel, never an independent watchdog prompt.\n`;
       patched = true;
@@ -11582,6 +11740,9 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
     // sections preserve narrative ordering in the shadow.
     const markers = [
       '### Telegram message origin',
+      // Hand-started Codex connect: the audience IS a Codex-framework operator, so
+      // the AGENTS.md shadow must carry the command and the shared-entry caveat.
+      '### Hand-started Codex: `instar codex connect <agent>`',
       // a2a-single-agent-identity: the agent identity + coherence check are server-side and
       // framework-agnostic (a Codex/Gemini agent runs on the same mesh and must explain the
       // not-provisioned posture and the adopt-from-a-sibling path honestly too).
@@ -11972,6 +12133,7 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
         ['Queued-message review pacing:', telegramOriginRecoveryAwareness],
         ['Telegram send deadlines:', telegramOriginTransportAwareness],
         ['Telegram capacity checks:', telegramOriginCapacityAwareness],
+        ['/telegram/system-topics', telegramSystemTopicsAwareness],
         ['Origin worker health:', telegramOriginWorkerAwareness],
         ['Dashboard edit rejection:', telegramDashboardEditAwareness],
         ['INSTAR_JOB_FAILURE_FILE', () => JOB_DECLARED_FAILURE_AWARENESS],

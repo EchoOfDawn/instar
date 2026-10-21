@@ -1,4 +1,5 @@
 import { mountOriginDisplayPreferences } from './originDisplayPreferences.js';
+import { readSystemTopicIds } from '../messaging/SystemTopicAdoption.js';
 import { withUnknownProducerOrigin } from '../messaging/telegram-origin/OriginDeterministicSend.js';
 /**
  * HTTP API routes — health, status, sessions, jobs, events.
@@ -217,6 +218,8 @@ import { writeLifelineRestartSignal } from '../core/version-skew.js';
 import { LifelineIngressGuard } from './LifelineIngressGuard.js';
 import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX, resolveApprovalOwner } from '../threadline/PairingInviteTelegram.js';
 import { PairingTopicStore } from '../threadline/PairingTopicStore.js';
+import { ConnectEnableController, readConnectEnableStatus } from '../threadline/connectEnable.js';
+import { shouldOwnTelegramPoll } from '../lifeline/telegramPollOwnership.js';
 import { sharedLifelineIngressSecretHolder } from '../core/LifelineIngressSecret.js';
 import { TelegramCallbackDedupe } from './TelegramCallbackDedupe.js';
 import { readSessionClocks } from '../core/SessionClockReader.js';
@@ -14460,6 +14463,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       } : null,
       // Why the last readiness call failed: the exact check, a scrubbed excerpt, the candidates.
       lastReadinessFailure: ctx.feedbackDrain.store.lastReadinessDiagnosis(),
+      // Progress age (spec line 270): failed ticks in a row, when that run started, last success.
+      readinessProgress: authority ? ctx.feedbackDrain.store.readinessProgress(authority.authorityId, authority.generation) : null,
       consumerPromotion: (() => {
         const promotion = ctx.feedbackDrain!.promotion.read();
         return promotion ? { live: ctx.feedbackDrain!.promotion.isLive(), approvedBatchBound: promotion.approvedBatchBound, approvedAt: promotion.approvedAt, revoked: promotion.revokedAt !== null } : null;
@@ -18612,6 +18617,14 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     });
   }
 
+  // GET /telegram/system-topics — this machine's record of the agent-wide system
+  // topics (📢 Updates, 🔔 Attention, 🩺 Agent Health). A standby reads the lease
+  // holder's record here and adopts it instead of minting its own topics
+  // (src/messaging/SystemTopicAdoption.ts). Read-only.
+  router.get('/telegram/system-topics', (_req, res) => {
+    res.json({ topics: readSystemTopicIds((key) => ctx.state.get(key)), holdsLease: !ctx.state.readOnly });
+  });
+
   // POST /telegram/post-update — route an update/announcement message to the
   // Agent Updates topic, deterministically.
   //
@@ -19154,6 +19167,54 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (r.ok) res.json(r);
     else res.status(failStatus).json({ error: r.reason });
   };
+
+  // Switch the agent network and pairing on, at the operator's request, with no restart asked of
+  // the operator (upgrades/side-effects/threadline-enable-without-restart.md). Bearer: it only opts
+  // THIS agent in, as the operator would by editing config. Writes threadline.relayEnabled and
+  // threadline.verifiedPairing.enabled, then requests the server's existing supervised restart (the
+  // flag the auto-updater writes) when one is needed, safe and allowed (connectEnable.ts). The asking
+  // session survives the restart and waits. Idempotent: call again to read the state; `ready` once
+  // pairing works. Body: { sessionId?: string } (the asking session, excluded from the deferral check).
+  let connectEnable: ConnectEnableController | null = null;
+  // Read-only: is a deferred request still waiting, and did one give up (with why)? Bearer.
+  router.get('/threadline/pairing/enable', (req, res) => {
+    if (!pairingRouteAuthorized(req, res)) return;
+    const ready = verifiedPairingRouteEnabled() && !!ctx.pairingInvites;
+    res.json({ ready, ...(connectEnable ? connectEnable.status() : { deferred: false, deferredSince: null, last: readConnectEnableStatus(ctx.config.stateDir) }) });
+  });
+  router.post('/threadline/pairing/enable', (req, res) => {
+    if (!pairingRouteAuthorized(req, res)) return;
+    if (!connectEnable) {
+      connectEnable = new ConnectEnableController({
+        stateDir: ctx.config.stateDir,
+        isReady: () => verifiedPairingRouteEnabled() && !!ctx.pairingInvites,
+        bootRelayEnabled: () => ctx.config.threadline?.relayEnabled === true,
+        bootPairingEnabled: () => verifiedPairingRouteEnabled(),
+        ownsRelayAfterRestart: () => shouldOwnTelegramPoll(ctx.config as never),
+        blockers: (exclude) => ctx.autoUpdater?.getRestartBlockers((n) => exclude.includes(n)) ?? [],
+      });
+    }
+    // A session id is a short token; anything longer is not one, and is ignored rather than cut.
+    const rawSid = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+    const sid = rawSid.length <= 200 ? rawSid : '';
+    const exclude: string[] = [];
+    if (sid) {
+      exclude.push(sid);
+      try {
+        for (const s of ctx.sessionManager.listRunningSessions()) {
+          if (s.id === sid || s.name === sid || s.tmuxSession === sid) exclude.push(s.name, s.tmuxSession);
+        }
+      } catch { /* @silent-fallback-ok — no session list: only the given id is excluded */ }
+    }
+    try {
+      const r = connectEnable.request(exclude);
+      console.log(`[connect-enable] ${r.state}: ${r.reason}`);
+      res.status(r.state === 'unavailable-here' || r.state === 'not-ready-after-restart' ? 409
+        : r.state === 'restart-unavailable' ? 503 : r.state === 'ready' ? 200 : 202).json(r);
+    } catch (err) {
+      res.status(500).json({ error: `could not switch pairing on: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  });
 
   // Make an invite. Body: { ttlMinutes?: number (max 1440), bindFp?: string }.
   router.post('/threadline/pairing/invites', (req, res) => {
@@ -35979,46 +36040,19 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       credSend(res, 400, { error: 'accountId (string) is required' });
       return;
     }
-    const assignments = cr.ledger.getAssignments();
-    const sourceSlot = assignments.find((a) => a.accountId === accountId)?.slot;
-    if (!sourceSlot) {
-      credSend(res, 400, { error: `unknown account — ${accountId} is not a known ledger tenant`, knownAccounts: assignments.filter((a) => a.accountId).map((a) => a.accountId) });
-      return;
-    }
-    // Resolve the canonical default slot from the ledger (the assignment whose slot is ~/.claude).
-    const { credentialSlotKey } = await import('../core/OAuthRefresher.js');
-    const defaultKey = credentialSlotKey('~/.claude');
-    const defaultSlot = assignments.find((a) => credentialSlotKey(a.slot) === defaultKey)?.slot;
-    if (!defaultSlot) {
-      credSend(res, 400, { error: 'no default (~/.claude) slot is in the ledger — cannot set-default' });
-      return;
-    }
-    if (sourceSlot === defaultSlot) {
-      credSend(res, 200, { enabled: true, outcome: 'noop', reason: `${accountId} is already the default-slot tenant` });
-      return;
-    }
-    const verdict = cr.levers.evaluateSwap(sourceSlot, defaultSlot, force === true);
-    if (!verdict.allowed) {
-      cr.audit.audit({ event: 'set-default-refused', accountId, code: verdict.code, reason: verdict.reason });
-      credSend(res, 429, { error: verdict.reason, code: verdict.code });
-      return;
-    }
-    cr.audit.audit({ event: 'set-default-invoked', accountId, sourceSlot, defaultSlot, forced: verdict.forced });
     try {
-      const result = await cr.swapExecutor.swap(sourceSlot, defaultSlot);
-      if (result.outcome === 'swapped') cr.levers.recordSwap(sourceSlot, defaultSlot, verdict.forced);
-      void cr.audit.attention({
-        id: `credential-set-default:${accountId}`,
-        title: 'The default credential account was flipped',
-        summary: `set-default → ${accountId} into ~/.claude: ${result.outcome}${verdict.forced ? ' (FORCED)' : ''}. ${result.reason}`,
-        category: 'credential-repointing',
-        priority: 'NORMAL',
-        sourceContext: 'credential-set-default',
-      });
-      cr.audit.audit({ event: 'set-default-result', accountId, outcome: result.outcome });
-      credSend(res, 200, { enabled: true, accountId, forced: verdict.forced, ...result });
+      const { setDefaultCredentialAccount } = await import('../core/CredentialSetDefault.js');
+      const result = await setDefaultCredentialAccount(cr, accountId, { force, sourceContext: 'credential-set-default' });
+      if (!result.ok) {
+        const knownAccounts = result.code === 'unknown-account'
+          ? cr.ledger.getAssignments().filter((a) => a.accountId).map((a) => a.accountId)
+          : undefined;
+        credSend(res, result.status, { error: result.reason, code: result.code, ...(knownAccounts ? { knownAccounts } : {}) });
+        return;
+      }
+      const { ok: _ok, ...body } = result;
+      credSend(res, 200, { enabled: true, ...body });
     } catch (err) {
-      cr.audit.audit({ event: 'set-default-error', accountId, error: err instanceof Error ? err.message : 'unknown' });
       credSend(res, 500, { error: err instanceof Error ? err.message : 'set-default failed' });
     }
   });

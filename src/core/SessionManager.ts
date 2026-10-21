@@ -72,6 +72,7 @@ import { DegradationReporter } from '../monitoring/DegradationReporter.js';
 import { hostFreeMemPct, type MemReadDeps } from '../monitoring/hostMemoryPressure.js';
 import { detectRateLimited, nextIdleThrottleAction, RATE_LIMIT_SETTLED_CAPTURE_LINES, type ThrottleSettleState } from '../monitoring/rateLimitDetection.js';
 import { classifyIdleError } from './IdleErrorClassifier.js';
+import { classifyLoginExpired } from './LoginExpiredSignature.js';
 import { InputGuard, type TopicBinding } from './InputGuard.js';
 import type { InputDetector } from '../monitoring/PromptGate.js';
 import { toPaneTailLines, type PermissionPromptAutoResolver } from '../monitoring/PermissionPromptAutoResolver.js';
@@ -335,6 +336,9 @@ export function deriveTargetKey(sessionId: string): DerivedTarget {
 /** Sessions younger than this get their pane tail sampled each monitor tick
  *  so a self-exit during startup leaves evidence (see `startupTails`). */
 const STARTUP_TAIL_WINDOW_MS = 120_000;
+/** How long a rerouted session must keep showing the expired-login frame before
+ *  the monitor ends it (one frame alone never ends a session). */
+const LOGIN_EXPIRED_DWELL_MS = 60_000;
 /** Prepended to a topic bootstrap when its earlier conversation could not be reopened (spec §3.1, P24 in-band disclosure). */
 export const RESUME_REOPEN_FAILED_NOTE =
   'Note: your earlier conversation in this topic could not be reopened, so you only have the recent topic messages below.';
@@ -1026,6 +1030,14 @@ export class SessionManager extends EventEmitter {
    * dozen lines. Memory-only; never written anywhere except the redacted row.
    */
   private readonly startupTails = new Map<string, { tail: string; at: number }>();
+  /**
+   * First time each rerouted (completionMode 'pattern') session's live tail
+   * showed Claude Code's "Login expired · Please run /login" frame. A session
+   * still showing it LOGIN_EXPIRED_DWELL_MS later is ended (see the rerouted
+   * branch of the monitor tick). Evicted with the startup tails for sessions no
+   * longer running, and whenever the frame is no longer the live tail.
+   */
+  private readonly loginExpiredFirstSeen = new Map<string, number>();
   /** Terminal child status sampled from a tmux pane retained by
    * `remain-on-exit failed`; consumed by the self-exit transition. */
   private readonly terminalExitCodes = new Map<string, number>();
@@ -1552,8 +1564,19 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * the util's contract); failures are logged, not fatal, because the worst
    * case is the pre-fix behavior, not a dead spawn path.
    */
+  /** The agent directory sessions launch in. Exposed because the folder-trust
+   *  acknowledgement a config home needs is keyed on this exact path, and the
+   *  callers that seed a swap target's home (SessionRefresh) only hold a
+   *  SessionManager. */
+  agentProjectDir(): string {
+    return this.config.projectDir;
+  }
+
   private ensurePinnedHomeInteractiveReady(configHome: string, lane: string): void {
-    const ready = ensureInteractiveReady(configHome);
+    // projectDir is what makes the folder-trust acknowledgement specific to the
+    // directory this session will actually launch in — without it the home can
+    // read as ready and still die at "Do you trust the files in this folder?".
+    const ready = ensureInteractiveReady(configHome, { projectDir: this.config.projectDir });
     if (ready.patched) {
       console.log(`[SessionManager] ${lane}: made ${configHome} interactive-ready (${ready.reason})`);
     } else if (ready.reason !== 'already interactive-ready') {
@@ -1936,6 +1959,55 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * @returns `{ terminated: true }` on a kill performed by THIS call, or
    *          `{ terminated: false, skipped }` describing why it was a no-op.
    */
+  /**
+   * Rerouted-branch helper: if the session's live tail has shown Claude Code's
+   * dead-login frame for at least LOGIN_EXPIRED_DWELL_MS, terminate it (recorded
+   * as killed, so its job reruns on its next trigger, where placement can pick a
+   * signed-in account) and report a degradation naming the login folder.
+   * Returns true when the session was ended. Never throws into the tick.
+   */
+  private async endIfLoginExpired(session: Session): Promise<boolean> {
+    let pane = '';
+    try {
+      pane = (await this.captureOutputMaybeAsync(session.tmuxSession, 40)) || '';
+    } catch { /* @silent-fallback-ok — an unreadable pane is re-checked next tick */
+      return false;
+    }
+    const verdict = classifyLoginExpired(pane);
+    if (!verdict.loginExpired) {
+      this.loginExpiredFirstSeen.delete(session.tmuxSession);
+      return false;
+    }
+    const now = Date.now();
+    const firstSeen = this.loginExpiredFirstSeen.get(session.tmuxSession);
+    if (firstSeen === undefined) {
+      this.loginExpiredFirstSeen.set(session.tmuxSession, now);
+      return false;
+    }
+    if (now - firstSeen < LOGIN_EXPIRED_DWELL_MS) return false;
+    const configHome = this.configHomeForSession(session.tmuxSession) ?? 'the default login';
+    console.warn(`[SessionManager] Rerouted session "${session.name}" is stuck at an expired login (${configHome}): "${verdict.matchedLine}". Ending it so its slot is freed.`);
+    // workEvidence: [] — the killer proved the session idle (a REPL at the login screen can do
+    // nothing), so a live MCP child must not stamp it mid-work and queue a revival back onto
+    // the same dead login.
+    const killed = await this.terminateSession(session.id, 'rerouted-login-expired', {
+      finalStatus: 'killed',
+      disposition: 'terminal',
+      workEvidence: [],
+    });
+    this.loginExpiredFirstSeen.delete(session.tmuxSession);
+    if (killed.terminated) {
+      DegradationReporter.getInstance().report({
+        feature: 'SessionManager.monitorTick.reroutedLoginExpired',
+        primary: 'rerouted-interactive session runs under a signed-in login and completes via its sentinel',
+        fallback: 'ended as soon as its live tail showed an expired login, instead of holding its slot to the lifetime cap',
+        reason: `Session "${session.name}" launched under ${configHome}, which reports "${verdict.matchedLine}"`,
+        impact: 'That run did no work; its job reruns on its next trigger. The login itself needs a fresh sign-in.',
+      });
+    }
+    return killed.terminated;
+  }
+
   async terminateSession(
     sessionId: string,
     reason: string,
@@ -2557,6 +2629,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
           if (!live.has(key)) this.startupTails.delete(key);
         }
       }
+      if (this.loginExpiredFirstSeen.size > 0) {
+        const live = new Set(running.map(s => s.tmuxSession));
+        for (const key of this.loginExpiredFirstSeen.keys()) {
+          if (!live.has(key)) this.loginExpiredFirstSeen.delete(key);
+        }
+      }
       // Drop age-gate work memory for sessions that are no longer running
       // (bounded map — any exit path, not only an age kill).
       if (this.ageGateLastWorkingAt.size > 0 || this.ageGateConfirmedWorkPastLimit.size > 0) {
@@ -2711,6 +2789,17 @@ rm()  { "${shimRunner}" rm  "$@"; }
               }
               continue;
             }
+          }
+          // (c) Dead login → end it now instead of at the lifetime cap. A
+          // rerouted session launched under a login whose interactive sign-in
+          // has expired prints "Login expired · Please run /login" and can never
+          // make progress; left alone it holds its scheduler slot until (b)
+          // fires 480 min later (2026-10-18: two such sessions stalled every job
+          // on the machine for a day). Signal-only classifier + a dwell so a
+          // single frame never ends a session; never touches pool status.
+          if (!this.config.protectedSessions.includes(session.tmuxSession) &&
+              !this.isStandingSession(session.tmuxSession)) {
+            if (await this.endIfLoginExpired(session)) continue;
           }
           // Still running, no sentinel, under lifetime — leave it; re-check next
           // tick. Skip the rest of the loop body (the default exit/idle paths
@@ -8094,8 +8183,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Polling schedule in ms from injection. Each entry is the absolute
     // time-from-injection at which that attempt fires. Stops on success
     // (marker no longer at ❯) or after the last entry.
-    const markerCheckSchedule = [500, 1500, 3500, 6500];
+    // The last entry is a VERIFY-ONLY pass: it presses nothing and exists so a
+    // run that fired its whole ladder still reads the pane one last time and
+    // reports what actually happened. Without it the ladder's final keypress
+    // outcome was never observed, so "recovered" was an assumption.
+    const markerCheckSchedule = [500, 1500, 3500, 6500, 9000];
+    const verifyOnlyIdx = markerCheckSchedule.length - 1;
     let recoveryFiredOnce = false;
+    let recoveryRefusedOnce = false;
 
     const runCheck = (attempt: number): void => {
       try {
@@ -8128,8 +8223,53 @@ rm()  { "${shimRunner}" rm  "$@"; }
           return;
         }
 
-        // Still stuck. Fire escalating recovery action.
-        this.fireStuckInputRecovery(tmuxSession, attempt);
+        // Final pass: the ladder is spent and the marker is STILL at an idle
+        // prompt, so every rung we fired failed. Press nothing — say so. The
+        // persistent StuckInputSentinel owns recovery from here (it survives a
+        // server restart, which these in-process timers do not), and it is the
+        // layer that escalates; this report exists so the failure is on the
+        // record at the moment it is known rather than inferred later.
+        if (attempt >= verifyOnlyIdx) {
+          if (recoveryFiredOnce || recoveryRefusedOnce) {
+            console.warn(`[SessionManager] Injection recovery FAILED in "${tmuxSession}" — marker "${marker.slice(0, 30)}…" is still at an idle prompt after the full ladder. The message is NOT delivered; handing off to StuckInputSentinel.`);
+            DegradationReporter.getInstance().report({
+              feature: 'SessionManager.verifyInjection',
+              primary: 'Bracketed paste + Enter submits injected message',
+              fallback: 'Persistent StuckInputSentinel continues recovery across server restarts',
+              reason: 'Marker still at an idle prompt after every in-process recovery rung',
+              impact: 'Message still unsubmitted — NOT recovered by the in-process verifier',
+            });
+          }
+          return;
+        }
+
+        // Still stuck. Fire escalating recovery action — and CONSUME its outcome.
+        // Ignoring the return value is how this reported success it had not
+        // earned: a `refused` verdict means no key was ever sent, yet the
+        // degradation below still read "Recovered without user intervention"
+        // while the operator's message sat at the prompt (indra, 2026-10-20).
+        const fired = this.fireStuckInputRecovery(tmuxSession, attempt);
+        if (fired.status === 'refused') {
+          if (!recoveryRefusedOnce) {
+            recoveryRefusedOnce = true;
+            console.warn(`[SessionManager] Injection stuck in "${tmuxSession}" and recovery was REFUSED (${fired.reason ?? 'no reason given'}) — marker "${marker.slice(0, 30)}…" is still at the prompt and no key was sent. The message is NOT delivered.`);
+            DegradationReporter.getInstance().report({
+              feature: 'SessionManager.verifyInjection',
+              primary: 'Bracketed paste + Enter submits injected message',
+              fallback: 'None — the recovery keypress was refused before it was sent',
+              reason: `Recovery refused: ${fired.reason ?? 'unknown'}`,
+              impact: 'Message left unsubmitted at the prompt; the persistent StuckInputSentinel is the remaining backstop',
+            });
+          }
+          // Keep polling: a refusal can be transient (ownership moving), and
+          // the next rung re-asks rather than assuming the answer is permanent.
+          const nextRefusedIdx = attempt + 1;
+          if (nextRefusedIdx < markerCheckSchedule.length) {
+            const delay = markerCheckSchedule[nextRefusedIdx] - markerCheckSchedule[attempt];
+            setTimeout(() => runCheck(nextRefusedIdx), delay);
+          }
+          return;
+        }
 
         if (!recoveryFiredOnce) {
           recoveryFiredOnce = true;
@@ -8147,7 +8287,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
             reason:
               'Enter after bracketed-paste-end did not submit; text left at the prompt ' +
               '(first observed on Claude Code TUI v2.1.105+, but the race is not framework-specific)',
-            impact: 'Recovered without user intervention',
+            // Reports what was DONE, not what it achieved. The outcome is not
+            // known at this point — the key has only just been sent — and the
+            // verify-only pass above is what states whether it worked. Claiming
+            // recovery here is what made a 28-minute undelivered message read
+            // as self-healed in the degradation record.
+            impact: 'Recovery keypress sent; outcome reported by the verification pass that follows',
           });
         }
 
@@ -8313,8 +8458,22 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const markerEvidence = this.strandedDraftMarkers?.get(tmuxSession);
     const deliveryId = markerEvidence?.deliveryId;
     const conversationId = markerEvidence?.conversationId ?? tmuxSession;
-    if (this.stageBActivation.active) {
-      if (!deliveryId || !this.inboundDeliveries || !this.trackedPhysicalEffects) {
+    // Stage B fences a recovery keypress behind the SAME durable delivery row
+    // that authorized the original injection, so a key can never be replayed
+    // against a conversation this machine no longer owns. That fence is only
+    // satisfiable where such a row exists — and rows are prepared for
+    // codex-cli ONLY (see the stageB branch in injectIntoSession). Requiring it
+    // for every framework turned every claude-code recovery into a permanent
+    // refusal: one agent logged 75,001 consecutive
+    // `refused/missing-durable-delivery-evidence` rows, every one at attempt 0,
+    // so the keypress ladder never advanced, never exhausted and never
+    // escalated. An operator's message sat unsubmitted at the prompt for 28
+    // minutes while the logs reported recovery (indra, 2026-10-20).
+    // Keep the fence wherever the evidence exists; where it structurally cannot
+    // exist, fall through to the pre-Stage-B best-effort keypress — the same
+    // untracked path this session's own injection still takes.
+    if (this.stageBActivation.active && deliveryId) {
+      if (!this.inboundDeliveries || !this.trackedPhysicalEffects) {
         return { status: 'refused', reason: 'missing-durable-delivery-evidence' };
       }
       const delivery = this.inboundDeliveries.get(conversationId, deliveryId);
@@ -8383,6 +8542,10 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
       if (this.detectClaudePrompt(tmuxSession)) {
         console.log(`[SessionManager] Session ready in "${tmuxSession}" after ${Date.now() - start}ms`);
+        // The positive signal the start-failure tracker resets on: this machine
+        // has just demonstrated it CAN start a session, so any standing
+        // "cannot start" placement block is cleared without operator action.
+        this.emit('sessionStartSucceeded', { tmuxSession });
         return true;
       }
       await new Promise(r => setTimeout(r, 500));
@@ -8498,6 +8661,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
       if (this.detectClaudePrompt(tmuxSession)) {
         console.log(`[SessionManager] Session ready in "${tmuxSession}" during extended wait (${Date.now() - extendedStart}ms after primary timeout)`);
+        this.emit('sessionStartSucceeded', { tmuxSession });
         return true;
       }
       await new Promise(r => setTimeout(r, 1000));
