@@ -379,6 +379,10 @@ export class LifelineIngressGuard {
    * owner pairs it (Justin, topic 61599, 2026-10-21).
    */
   tapsProvable(): boolean {
+    // Like health() and guardStatus(): with no lifeline ingress there is nothing to wait for, so
+    // arm now. Otherwise a fresh polling agent whose first act is pairing would read as unarmed.
+    const nowMs = this.now();
+    this.armIfNoLifeline(nowMs, new Date(nowMs).toISOString());
     if (this.bypassed()) return false;
     if (this.mode() === 'enforce') return true;
     if (this.opts.explicitEnforce() === false) return false;

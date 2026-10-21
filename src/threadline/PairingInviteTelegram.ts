@@ -115,7 +115,7 @@ export interface ForwardedInvite {
   topicId: number;
   fromUserId?: number;
   chatId?: number | string;
-  /** The forward carried the lifeline-only secret. */
+  /** The forward carried the lifeline-only secret, or was read straight from Telegram by a polling server. */
   verified: boolean;
 }
 

@@ -247,6 +247,12 @@ describe('LifelineIngressGuard', () => {
       g.evaluate(wrong(), 'lifeline-proof');
       expect(g.tapsProvable()).toBe(false);
     });
+    it('a FRESH polling agent (no lifeline ingress): true on the very first call, nothing read before it', () => {
+      lifelineIsIngress = false;
+      const g = make(false);
+      expect(g.tapsProvable()).toBe(true);
+      expect(h(g)).toMatchObject({ armedBy: 'no-lifeline-ingress', mode: 'enforce' });
+    });
     it('stays true across a server restart once proven', () => {
       const g = make(false);
       g.evaluate(good(), 'lifeline-proof');

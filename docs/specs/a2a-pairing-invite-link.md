@@ -3,7 +3,7 @@ title: "Verified pairing by invite link (replaces the 12-word confirmation)"
 slug: "a2a-pairing-invite-link"
 author: "dawn"
 parent-principle: "Know Your Principal — An Unverified Identity Is a Guess"
-status: "approved r3; r4 amendment (§11) approved 2026-10-21; r5 (§6.1 taps in armed observe) approved 2026-10-21 (Echo reviewed 6879b7d1a; direction Justin, topic 61599); r6 (§6.1 say why there are no buttons) proposed 2026-10-21, approved: false"
+status: "approved r3; r4 amendment (§11) approved 2026-10-21; r5 (§6.1 taps in armed observe) approved 2026-10-21 (Echo reviewed 6879b7d1a; direction Justin, topic 61599); r6 (§6.1 say why there are no buttons) approved 2026-10-21 (Echo); r7 (§6.1 polling agents) proposed 2026-10-21, approved: false"
 owners: "Dawn (author), Echo (review)"
 supersedes-ux-of: "docs/specs/secure-a2a-verified-pairing.md (§3.2 human comparison, §3.6 panel)"
 eli16-overview: "a2a-pairing-invite-link.eli16.md"
@@ -162,6 +162,13 @@ approves, accepts or finishes.
   version (`tapsUnprovableReason()`, plus "reads Telegram directly" when the server polls). Justin's
   second PP test still got the dashboard line, and nobody could tell which cause without access to
   PP's machine.)*
+  *(r7, 2026-10-21: an agent with **no lifeline**, whose server polls Telegram itself, takes invites
+  and taps on that polling path. Updates read with `getUpdates` come from Telegram itself (TLS, the
+  bot token), so they are as authentic as the lifeline's forwards; they go to the same handler and
+  its owner, chat and one-time-token checks. The guard on such an agent arms as
+  `no-lifeline-ingress` and enforces, so a Bearer-token call to the internal routes is still
+  refused. Luna read PP on 2026-10-21: 1.3.1384, no lifeline, armedBy no-lifeline-ingress. Pairing
+  had dropped the buttons whenever the server polled.)*
 - the callback's `from.id` is the agent's configured operator user id, **and** the chat is the
   operator's chat or topic. In a forum group, other members see the buttons, so the handler checks
   both;

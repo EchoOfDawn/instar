@@ -3441,10 +3441,12 @@ export function createRoutes(ctx: RouteContext): Router {
       operatorTopicId: () => ctx.telegram!.getLifelineTopicId(),
       // Buttons whenever a tap can be proven, not only in enforce: a new agent is in observe
       // for its first day or more, and that is when its owner pairs it (spec §6.1, r5).
+      // A polling server (no lifeline) reads taps straight from Telegram; they reach pairing through
+      // the adapter's handler below, so polling is no longer a reason to drop the buttons (§6.1 r7).
       enforcing: () => lifelineIngressGuard.tapsProvable()
-        && (ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true,
+        && ((ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true || ctx.telegram!.hasPairingHandler?.() === true),
       whyNoButtons: () => {
-        const why = (ctx.telegram as unknown as { isPolling?: boolean }).isPolling === true
+        const why = (ctx.telegram as unknown as { isPolling?: boolean }).isPolling === true && ctx.telegram!.hasPairingHandler?.() !== true
           ? 'this agent reads Telegram directly, not through its listener'
           : lifelineIngressGuard.tapsUnprovableReason();
         return why ? `${why} (Instar ${ctx.config.version || 'unknown version'})` : null;
@@ -3461,6 +3463,7 @@ export function createRoutes(ctx: RouteContext): Router {
       },
     })
     : null;
+  ctx.telegram?.setPairingHandler?.(pairingInviteTelegram ?? null);
   ctx.guardRegistry?.register('telegramIngress.lifelineSecret', () => lifelineIngressGuard.guardStatus());
   // One inline-button tap has one effect, however many times it is delivered.
   // Proven taps go to the durable store; a tap accepted without proof (only
