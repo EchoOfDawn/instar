@@ -247,12 +247,40 @@ describe('LifelineIngressGuard', () => {
       g.evaluate(wrong(), 'lifeline-proof');
       expect(g.tapsProvable()).toBe(false);
     });
+    it('a FRESH polling agent (no lifeline ingress): true on the very first call, nothing read before it', () => {
+      lifelineIsIngress = false;
+      const g = make(false);
+      expect(g.tapsProvable()).toBe(true);
+      expect(h(g)).toMatchObject({ armedBy: 'no-lifeline-ingress', mode: 'enforce' });
+    });
     it('stays true across a server restart once proven', () => {
       const g = make(false);
       g.evaluate(good(), 'lifeline-proof');
       const g2 = restart(g);
       g2.evaluate(good(), 'lifeline-proof');
       expect(g2.tapsProvable()).toBe(true);
+    });
+  });
+
+  describe('tapsUnprovableReason (the cause shown to the owner when there are no buttons)', () => {
+    it('null whenever taps are provable', () => {
+      const g = make(false);
+      g.evaluate(good(), 'lifeline-proof');
+      expect(g.tapsUnprovableReason()).toBeNull();
+      expect(make(true).tapsUnprovableReason()).toBeNull();
+    });
+    it('a new agent whose lifeline never proved itself: says so', () => {
+      expect(make(false).tapsUnprovableReason()).toMatch(/has not yet proven itself/);
+    });
+    it('held observe: names the config setting', () => {
+      explicit = false;
+      const g = make(false);
+      g.evaluate(good(), 'lifeline-proof');
+      expect(g.tapsUnprovableReason()).toMatch(/watch-only in its config/);
+    });
+    it('bypass: names the bypass', () => {
+      bypass = true;
+      expect(make(false).tapsUnprovableReason()).toMatch(/switched off in its config/);
     });
   });
 

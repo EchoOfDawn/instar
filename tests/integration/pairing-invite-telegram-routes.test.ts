@@ -40,7 +40,7 @@ interface Effects {
   flow: string[];
 }
 
-interface Boot { owner?: number | undefined; operators?: TopicOperatorStore | null }
+interface Boot { owner?: number | undefined; operators?: TopicOperatorStore | null; polling?: boolean; pollingHandler?: { h: null | { onForwardedInvite(m: unknown): Promise<void>; onCallback(c: unknown): Promise<boolean> } } }
 
 function makeContext(stateDir: string, fx: Effects, extra: Record<string, unknown>, b: Boot = {}): RouteContext {
   const owner = 'owner' in b ? b.owner : OWNER;
@@ -60,7 +60,7 @@ function makeContext(stateDir: string, fx: Effects, extra: Record<string, unknow
     state: { getJobState: () => null, getSession: () => null, queryEvents: () => [] } as never,
     scheduler: null,
     telegram: {
-      isPolling: false,
+      isPolling: b.polling === true,
       onTopicMessage: (m: { content: string }) => { fx.topicMessages.push(m.content); },
       logInboundMessage: () => { fx.inboundLogged++; },
       dispatchAgentMessageHook: async () => false,
@@ -72,6 +72,10 @@ function makeContext(stateDir: string, fx: Effects, extra: Record<string, unknow
       getOwnerUserId: () => owner,
       getChatId: () => '-100',
       getLifelineTopicId: () => 3,
+      ...(b.pollingHandler ? {
+        setPairingHandler: (h: never) => { b.pollingHandler!.h = h; },
+        hasPairingHandler: () => b.pollingHandler!.h !== null,
+      } : {}),
     } as never,
     pairingInvites: { flow, handshake: flow, store: {} as never, events: new EventEmitter() } as never,
     topicOperatorStore: b.operators ?? null,
@@ -313,6 +317,35 @@ describe('invite pairing — Telegram routes', () => {
       expect(fx.topicMessages).toEqual([]);
       expect(fx.inboundLogged).toBe(0);
       expect(fx.sent.at(-1)?.text).toMatch(/dashboard/);
+      // ...and says WHY, with the version, so the owner never has to ask someone to read /health.
+      expect(fx.sent.at(-1)?.text).toMatch(/because its Telegram listener has not yet proven itself/);
+      expect(fx.sent.at(-1)?.text).toMatch(/\(Instar [^)]+\)/);
+    });
+    it('the cause goes ONLY to the owner: anyone else who pastes an invite gets the generic line (no version, no setup)', async () => {
+      const app = boot();
+      await forward(app, INVITE, { from: 555 });
+      const text = fx.sent.at(-1)?.text ?? '';
+      expect(text).toMatch(/until its listener protection is fully on/);
+      expect(text).not.toMatch(/Instar|because/);
+    });
+    it('a POLLING agent (no lifeline, like PP): routes wires the adapter, which hands invites and taps straight from Telegram → Approve, and the tap approves', async () => {
+      const sink: NonNullable<Boot['pollingHandler']> = { h: null };
+      boot({}, { polling: true, pollingHandler: sink });
+      expect(sink.h).not.toBeNull();
+      await sink.h!.onForwardedInvite({ text: `Fwd: ${INVITE}`, topicId: 4242, fromUserId: OWNER, chatId: '-100', verified: true });
+      const prompt = fx.sent.at(-1)!;
+      expect(prompt.buttons?.map((b) => b.text)).toEqual(['Approve', 'Decline']);
+      expect(prompt.text).not.toMatch(/dashboard/);
+      // someone else in the group tapping is still refused
+      await sink.h!.onCallback({ callbackQueryId: 'cq-x', data: prompt.buttons![0].data, fromUserId: 555, chatId: '-100', verified: true });
+      expect(fx.flow).toEqual(['receive']);
+      await sink.h!.onCallback({ callbackQueryId: 'cq-ok', data: prompt.buttons![0].data, fromUserId: OWNER, chatId: '-100', verified: true });
+      expect(fx.flow).toEqual(['receive', `approve:${IID}`]);
+    });
+    it('a polling server whose adapter has NO pairing handler (older adapter) says so (owner)', async () => {
+      const app = boot({}, { polling: true });
+      await forward(app, INVITE, { secret: secret() });
+      expect(fx.sent.at(-1)?.text).toMatch(/because this agent reads Telegram directly, not through its listener \(Instar [^)]+\)/);
     });
   });
 });

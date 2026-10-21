@@ -24,6 +24,8 @@ Nobody reads, compares or types anything.
 - Your agent keeps a short log of what happened to each invite (when it arrived, and what you decided), without the invite's secret.
 - Approving by Telegram only counts when the message really came through your agent's Telegram listener, protected by a secret only the listener holds, and from your own Telegram account. Otherwise you approve on the dashboard with your PIN.
 - (Change r5, approved 2026-10-21 after Echo's review.) A brand-new agent runs its listener protection in a trial mode for its first day or more. The buttons used to be switched off for that whole time, so the first pairing on a new agent always said "go to the dashboard". That is what happened when Justin paired PP. Now the buttons show as soon as the listener has proven it holds its secret. Each tap still has to carry that secret, and the trial mode already rejects taps that don't, so the check is just as strict.
+- (Change r6, approved 2026-10-21.) If an agent still can't show buttons, its message now says why, for example "its Telegram listener has not yet proven itself", and which Instar version it runs. When Justin tested PP again it still said "go to the dashboard", and nobody could tell why without getting onto PP's machine.
+- (Change r7, proposed 2026-10-21.) Luna checked PP and found the real reason. PP has no separate Telegram listener: its own server reads Telegram directly. Pairing switched its buttons off for any agent set up that way. Now those agents take the invite and your taps straight from Telegram, with the same checks: it has to be you, in your chat, with that button's one-time code.
 
 ## What it can't do
 

@@ -24,6 +24,7 @@ import { AgentServer } from '../../../src/server/AgentServer.js';
 import { PairingInviteTelegram, OWN_AGENT_PROMPT } from '../../../src/threadline/PairingInviteTelegram.js';
 import { PairingTopicStore } from '../../../src/threadline/PairingTopicStore.js';
 import { LifelineIngressGuard } from '../../../src/server/LifelineIngressGuard.js';
+import { TelegramAdapter } from '../../../src/messaging/TelegramAdapter.js';
 import { ensureLifelineIngressSecret, LIFELINE_SECRET_HEADER } from '../../../src/core/LifelineIngressSecret.js';
 import { createTempProject, createMockSessionManager } from '../../helpers/setup.js';
 import type { TempProject } from '../../helpers/setup.js';
@@ -69,7 +70,7 @@ describe('pairing handshake — production path', () => {
   let relayUrl: string;
   const sides: Side[] = [];
 
-  async function bootSide(name: string, port: number, timings: typeof FAST = CALM, enforcing: () => boolean = () => true): Promise<Side> {
+  async function bootSide(name: string, port: number, timings: typeof FAST = CALM, enforcing: () => boolean = () => true, whyNoButtons?: () => string | null): Promise<Side> {
     const project = createTempProject();
     const auth = `${name}-auth`;
     const boot = await bootstrapThreadline({
@@ -99,6 +100,7 @@ describe('pairing handshake — production path', () => {
       chatId: () => '-100',
       operatorTopicId: () => 1, // the Lifeline topic
       enforcing,
+      whyNoButtons,
       topics: new PairingTopicStore(project.stateDir),
       ownOpenInvite: (iid) => { const inv = pi.store.getInternal(iid); return inv && inv.state === 'open' ? { exp: inv.exp } : null; },
       reportUndelivered: (what, reason) => { undelivered.push(`${what}: ${reason}`); },
@@ -152,6 +154,68 @@ describe('pairing handshake — production path', () => {
     await relay?.stop();
     relayData?.cleanup();
   });
+
+  it('a POLLING agent (no lifeline, like PP): the Finish tap read by the real TelegramAdapter completes the pairing', async () => {
+    // Luna's read of PP, 2026-10-21 13:27 PDT: 1.3.1384, no lifeline, armedBy no-lifeline-ingress.
+    // Pairing used to drop the buttons whenever the server polled Telegram itself.
+    const guardDir = createTempProject();
+    const guard = new LifelineIngressGuard({
+      stateDir: guardDir.stateDir, explicitEnforce: () => undefined, bypass: () => false,
+      raiseAttention: () => undefined, config: { developmentAgent: false }, lifelineIsIngress: () => false,
+      writeRestartSignal: () => true, reportDegradation: () => {}, log: () => {}, bootNudgeDelayMs: null,
+    });
+    const adapterDir = createTempProject();
+    try {
+      const adapter = new TelegramAdapter({ token: '', chatId: '-100', authorizedUserIds: [OWNER] } as never, adapterDir.stateDir);
+      const A = await bootSide('pp-polling', 4107, CALM, () => guard.tapsProvable() && adapter.hasPairingHandler());
+      adapter.setPairingHandler(A.tg); // what routes.ts does
+      const B = await bootSide('echo-dev3', 4108);
+      await inviteAndForward(A, B, 100, 110);
+      await tap(B, button(B, 'Approve').data);
+      await vi.waitFor(() => expect(texts(A, 100).some((t) => t.includes('accepted your pairing invite'))).toBe(true), { timeout: 30_000 });
+      const fin = button(A, 'Finish');
+      const proc = (adapter as unknown as { processUpdate(u: unknown): Promise<void> }).processUpdate.bind(adapter);
+      // Someone else in the group taps first: refused, nothing changes.
+      await proc({ update_id: 1, callback_query: { id: 'cq-other', data: fin.data, from: { id: 555, first_name: 'X' }, message: { message_id: 1, chat: { id: -100, type: 'supergroup' } } } });
+      expect(A.boot.trustManager!.isCredentialShareAllowedByFingerprint(B.fp)).toBe(false);
+      // The owner's tap, read from Telegram by the polling adapter:
+      await proc({ update_id: 2, callback_query: { id: 'cq-owner', data: fin.data, from: { id: OWNER, first_name: 'Justin' }, message: { message_id: 1, chat: { id: -100, type: 'supergroup' } } } });
+      await vi.waitFor(() => {
+        expect(texts(A, 100)).toContain('Connected ✓ "echo-dev3" and I are paired, and we\'ve each checked we can message the other privately.');
+        expect(texts(B, 110)).toContain('Connected ✓ "pp-polling" and I are paired, and we\'ve each checked we can message the other privately.');
+      }, { timeout: 30_000 });
+    } finally {
+      guard.flush();
+      guardDir.cleanup();
+      adapterDir.cleanup();
+    }
+  }, 120_000);
+
+  it('a new agent whose listener never proved itself: the Finish prompt says WHY there is no button, with its version', async () => {
+    // Justin's second PP test, 2026-10-21 12:57 PDT: still "go to the dashboard", and nobody could
+    // tell which cause without access to PP's machine. The prompt now names the cause.
+    const guardDir = createTempProject();
+    const guard = new LifelineIngressGuard({
+      stateDir: guardDir.stateDir, explicitEnforce: () => undefined, bypass: () => false,
+      raiseAttention: () => undefined, config: { developmentAgent: false }, lifelineIsIngress: () => true,
+      writeRestartSignal: () => true, reportDegradation: () => {}, log: () => {}, bootNudgeDelayMs: null,
+    });
+    try {
+      const A = await bootSide('pp-unproven', 4105, CALM, () => guard.tapsProvable(),
+        () => { const w = guard.tapsUnprovableReason(); return w ? `${w} (Instar 9.9.9)` : null; });
+      const B = await bootSide('echo-dev2', 4106);
+      await inviteAndForward(A, B, 80, 90);
+      await tap(B, button(B, 'Approve').data);
+      await vi.waitFor(() => expect(texts(A, 80).some((t) => t.includes('accepted your pairing invite'))).toBe(true), { timeout: 30_000 });
+      const prompt = texts(A, 80).find((t) => t.includes('accepted your pairing invite'))!;
+      expect(prompt).toMatch(/because its Telegram listener has not yet proven itself/);
+      expect(prompt).toContain('(Instar 9.9.9)');
+      expect(A.posted.find((m) => m.text === prompt)?.buttons).toBeUndefined();
+    } finally {
+      guard.flush();
+      guardDir.cleanup();
+    }
+  }, 120_000);
 
   it('a NEW agent (fleet, guard still in observe) gets the Finish BUTTON once its lifeline has proven itself — never "go to the dashboard"', async () => {
     // Justin's PP test, 2026-10-21: PP is a normal new agent, so its lifeline guard was in observe
