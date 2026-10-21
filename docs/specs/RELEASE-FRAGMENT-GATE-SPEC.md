@@ -163,8 +163,9 @@ the criterion is part of this spec:
   reached users with no release note of their own, because a warn-only verdict blocks
   nothing. That is exactly the failure the gate was built to prevent, observed in
   production rather than inferred from a soak.
-- Rollback lever: re-add `WARN_ONLY: '1'` to the workflow's env block. The checker's
-  warn-only branch is retained for that reason.
+- Rollback lever: re-add `WARN_ONLY: '1'` to the workflow's env block. `scripts/check-
+  release-fragment.mjs` is untouched by the flip, so its warn-only branch is still
+  there to receive it.
 
 The lesson worth keeping is narrower than the flip: a graduation criterion that reads a
 file nothing writes is not a criterion. Either build the collector with the gate, or

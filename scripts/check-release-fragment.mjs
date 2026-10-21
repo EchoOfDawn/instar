@@ -93,9 +93,7 @@ if (invokedDirectly) {
     // The workflow provides the changed-file list as JSON in PR_FILES_JSON
     // (array of { path/filename, status }), and PR_AUTHOR_LOGIN / PR_AUTHOR_TYPE
     // / PR_TITLE from the event. WARN_ONLY=1 reports the verdict without failing
-    // — the soak posture (spec D2/D3). The workflow stopped setting it on
-    // 2026-10-21 when the operator flipped the gate to blocking; the branch is
-    // kept as the rollback lever (re-add `WARN_ONLY: '1'` to the workflow env).
+    // (soak phase — spec D2/D3).
     let files = [];
     try {
       const parsed = JSON.parse(process.env.PR_FILES_JSON || '[]');
