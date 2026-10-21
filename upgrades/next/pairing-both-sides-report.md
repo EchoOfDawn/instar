@@ -8,6 +8,7 @@
 - **Every step is an operator message, in the right topic.** Approve and Finish get an immediate line ("Approved — finishing the connection with … and checking we can talk…"); then progress, "Connected ✓", refusals, `no-answer` / `not-finished` / `no-hello` timeouts and expired invites, on both sides, in plain words. They go to the Telegram topic where the invite was posted (learned from `/telegram/reply`, or `topicId` on `POST /threadline/pairing/invites`) or forwarded, else Lifeline (`threadline/pairing-topics.json`, 0600, no secret). An undeliverable pairing message is a `Threadline.pairingNotices` degradation report instead of a silent return or an empty catch.
 - **Relay verdicts on every invite control message are logged** (`[pairing-handshake] relay verdict <op> → <fp>: delivered|queued|rejected|none in time`).
 - **"It's one of my agents"**: a Telegram button next to an invite the agent posts (same tap checks as Approve/Finish) and a dashboard button (PIN, `POST /threadline/pairing/invites/:iid/own-agent`). It pre-authorizes the Finish for that open invite, so the first valid accept is finished without a second tap. In memory only.
+- **A restart between the accept and the Finish no longer breaks the check:** the restarted inviter waits up to 60 s for the acceptor's hello and both sides still report "Connected ✓" (checked); handshake refusals now name their reason (a different invite expiry vs a bad signature).
 - `GET /threadline/pairing/invites` adds `handshake` (a secret-free view of pairings in progress).
 
 ## What to Tell Your User

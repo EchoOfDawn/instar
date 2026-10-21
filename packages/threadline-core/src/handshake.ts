@@ -56,6 +56,12 @@ export interface HandshakeTimings {
   helloResendMs: number[];
   /** Own Finish/finish with no peer hello → `no-hello` (§11.4). */
   helloTimeoutMs: number;
+  /**
+   * After a restart the inviter no longer knows whether the acceptor speaks the handshake (the `hs`
+   * flag rode on the accept, before the restart). It waits this long for the acceptor's hello before
+   * reporting the pairing as unchecked (§11.4).
+   */
+  unknownPeerHelloWaitMs: number;
   /** Least gap between two answers (receipt or refusal) to one sender for one invite. */
   replyMinGapMs: number;
   /** Most answers to one sender per minute. */
@@ -68,6 +74,7 @@ export const HANDSHAKE_TIMINGS: HandshakeTimings = {
   finishWaitGraceMs: 10 * 60_000,
   helloResendMs: [5_000, 15_000, 30_000, 60_000, 120_000],
   helloTimeoutMs: 5 * 60_000,
+  unknownPeerHelloWaitMs: 60_000,
   replyMinGapMs: 5_000,
   replyPerMinute: 10,
 };
@@ -155,6 +162,8 @@ interface Session {
   exp: string;
   /** The peer said it speaks the handshake (`hs: 1`). */
   peerHs: boolean;
+  /** Whether `peerHs` was learned from the peer (false: a session rebuilt after a restart, flag unknown). */
+  peerHsKnown: boolean;
   /** Recipient: the accept payload, resent until answered. */
   accept?: Record<string, unknown>;
   answered: boolean;
@@ -358,7 +367,7 @@ export class PairingHandshake {
 
   private newSession(role: HandshakeRole, iid: string, peerFp: string, peerKey: string, peerName: string, exp: string, peerHs: boolean): Session {
     return {
-      iid, role, peerFp, peerKey, peerName, exp, peerHs,
+      iid, role, peerFp, peerKey, peerName, exp, peerHs, peerHsKnown: true,
       answered: false, refused: false, receiptStates: new Set(), localVerified: false, peerHello: false, peerSeenUs: false,
       sentSeen1: false, lastHelloReplyAt: 0, helloReplies: 0, helloTries: 0, pairedNotified: false, timedOut: new Set(), timers: new Map(),
     };
@@ -400,10 +409,17 @@ export class PairingHandshake {
     }
     const body = { ...payload, hs: 1 };
     const id = this.deps.sendPlaintext(toFp, op, body); // a throw propagates: the engine rolls the approve back
-    const ctx = this.approving;
     const iid = lower(payload.iid);
+    // The invite's expiry and claimed name, which every signed handshake message for it carries.
+    // From the approve in progress, or (when the engine was driven directly) from the engine's own
+    // waiting list: the invite is still listed there while its accept is being sent.
+    let ctx = this.approving && this.approving.iid === iid ? this.approving : null;
+    if (!ctx) {
+      const p = this.engine().listPendingAccepts().find((x) => x.iid === iid);
+      if (p) ctx = { iid, inviterFp: p.inviterFp, claimedAgent: p.claimedAgent, exp: p.exp };
+    }
     const key = this.deps.trust.getProfileByFingerprint(lower(toFp))?.peerIdentityPub ?? '';
-    const s = this.newSession('recipient', iid, lower(toFp), lower(key), ctx && ctx.iid === iid ? ctx.claimedAgent : '', ctx && ctx.iid === iid ? ctx.exp : '', false);
+    const s = this.newSession('recipient', iid, lower(toFp), lower(key), ctx ? ctx.claimedAgent : '', ctx ? ctx.exp : '', false);
     s.accept = body;
     this.asRecipient.get(iid)?.timers.forEach((cancel) => cancel());
     this.asRecipient.set(iid, s);
@@ -494,6 +510,9 @@ export class PairingHandshake {
   private scheduleAcceptResend(s: Session, index: number): void {
     if (index >= this.t.acceptResendMs.length) return;
     this.arm(s, 'resend', this.t.acceptResendMs[index], () => {
+      // Defence in depth: every answer path (receipt, refusal, finish, used) already disarms 'resend',
+      // and approveAccept is synchronous, so this check never decides today. It stays so a future answer
+      // path that forgets to disarm, or an async approve, cannot keep resending an answered accept.
       if (s.answered || !s.accept) return;
       try {
         const id = this.deps.sendPlaintext(s.peerFp, OP_ACCEPT, s.accept);
@@ -563,7 +582,12 @@ export class PairingHandshake {
     this.heldPrompts.delete(iid);
     if (!a) return r;
     let s = this.asInviter.get(iid);
-    if (!s) { s = this.newSession('inviter', iid, a.fp, a.key, a.agent, inv?.exp ?? '', false); this.asInviter.set(iid, s); }
+    if (!s) {
+      // No session: this agent restarted after the accept, and the accept's `hs` flag went with it.
+      s = this.newSession('inviter', iid, a.fp, a.key, a.agent, inv?.exp ?? '', false);
+      s.peerHsKnown = false;
+      this.asInviter.set(iid, s);
+    }
     s.localVerified = true;
     this.emit({ kind: 'finishing', iid, peerFp: s.peerFp, peerName: s.peerName, auto });
     this.afterLocalVerified(s);
@@ -716,7 +740,8 @@ export class PairingHandshake {
     const state = String(p.state ?? '');
     if (!s || s.peerFp !== from) return { ok: false, reason: 'no accept of ours waiting for this receipt' };
     if (state !== 'awaiting-operator' && state !== 'finishing') return { ok: false, reason: 'malformed receipt' };
-    if (String(p.exp ?? '') !== s.exp || !this.verifyFromPeer(OP_RECEIVED, s, p, state)) return { ok: false, reason: 'bad signature' };
+    if (String(p.exp ?? '') !== s.exp) return { ok: false, reason: `receipt names a different invite expiry (${String(p.exp ?? '') || 'none'}, this side holds ${s.exp || 'none'})` };
+    if (!this.verifyFromPeer(OP_RECEIVED, s, p, state)) return { ok: false, reason: 'bad signature' };
     s.answered = true;
     s.peerHs = true;
     this.disarm(s, 'resend');
@@ -748,7 +773,8 @@ export class PairingHandshake {
     if (!s || s.peerFp !== from) return { ok: false, reason: 'no accept of ours waiting for this refusal' };
     if (!REFUSAL_REASONS.has(reason)) return { ok: false, reason: 'malformed refusal' };
     const exp = String(p.exp ?? '');
-    if ((exp !== '' && exp !== s.exp) || !this.verifyFromPeer(OP_REFUSED, s, p, reason)) return { ok: false, reason: 'bad signature' };
+    if (exp !== '' && exp !== s.exp) return { ok: false, reason: `refusal names a different invite expiry (${exp}, this side holds ${s.exp || 'none'})` };
+    if (!this.verifyFromPeer(OP_REFUSED, s, p, reason)) return { ok: false, reason: 'bad signature' };
     s.answered = true;
     if (s.refused || s.localVerified) return { ok: true, duplicate: true };
     s.refused = true;
@@ -811,6 +837,19 @@ export class PairingHandshake {
   // ── Hello (§11.4) ────────────────────────────────────────────────────────────
 
   private afterLocalVerified(s: Session): void {
+    if (!s.peerHs && !s.peerHsKnown) {
+      // After a restart: an acceptor that speaks the handshake sends its hello once it has our finish
+      // (which always carries `hs: 1`), and that hello settles it (onHello answers and completes). An
+      // older acceptor sends nothing, so after a short wait the pairing is reported as unchecked.
+      this.arm(s, 'hs-wait', this.t.unknownPeerHelloWaitMs, () => {
+        if (s.peerHs || s.pairedNotified) return;
+        s.peerHsKnown = true;
+        s.pairedNotified = true;
+        this.emit({ kind: 'paired', iid: s.iid, peerFp: s.peerFp, peerName: s.peerName, role: s.role, checked: false });
+      });
+      this.checkComplete(s);
+      return;
+    }
     if (!s.peerHs) {
       // An older peer sends no hello: report the pairing as it stands, without the check.
       s.pairedNotified = true;
@@ -851,8 +890,10 @@ export class PairingHandshake {
     if (!s) return { ok: false, reason: 'no pairing with that agent for this invite' };
     const seen = p.seen === 1 || p.seen === '1' || p.seen === true;
     const peerRole = s.role === 'inviter' ? 'B' : 'A';
-    if (String(p.exp ?? '') !== s.exp || !this.verifyFromPeer(OP_HELLO, s, p, `${peerRole}:${seen ? 1 : 0}`)) return { ok: false, reason: 'bad signature' };
+    if (String(p.exp ?? '') !== s.exp) return { ok: false, reason: `hello names a different invite expiry (${String(p.exp ?? '') || 'none'}, this side holds ${s.exp || 'none'})` };
+    if (!this.verifyFromPeer(OP_HELLO, s, p, `${peerRole}:${seen ? 1 : 0}`)) return { ok: false, reason: 'bad signature' };
     s.peerHs = true;
+    s.peerHsKnown = true;
     s.peerHello = true;
     if (seen) { s.peerSeenUs = true; this.disarm(s, 'hello-resend'); }
     if (s.localVerified && (!seen || !s.sentSeen1) && this.now() - s.lastHelloReplyAt >= 1_000 && s.helloReplies < MAX_HELLO_REPLIES) {
@@ -867,7 +908,7 @@ export class PairingHandshake {
   private checkComplete(s: Session): void {
     if (!s.localVerified || !s.peerHello || s.pairedNotified) return;
     s.pairedNotified = true;
-    this.disarm(s, 'hello-timeout');
+    this.disarm(s, 'hello-timeout', 'hs-wait');
     this.emit({ kind: 'paired', iid: s.iid, peerFp: s.peerFp, peerName: s.peerName, role: s.role, checked: true });
   }
 

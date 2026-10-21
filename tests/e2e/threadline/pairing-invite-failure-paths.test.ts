@@ -14,13 +14,14 @@ import { RelayServer } from '../../../src/threadline/relay/RelayServer.js';
 import { bootstrapThreadline } from '../../../src/threadline/ThreadlineBootstrap.js';
 import { createTempProject } from '../../helpers/setup.js';
 import type { TempProject } from '../../helpers/setup.js';
+import type { PairingNotice } from '../../../src/threadline/pairingHandshake.js';
 import type { InviteEvent } from '../../../src/threadline/PairingInviteFlow.js';
 import { findInviteToken, createInvite, inviteMessage } from '../../../src/threadline/PairingInvite.js';
 
 interface Side {
   name: string; project: TempProject; port: number;
   boot: Awaited<ReturnType<typeof bootstrapThreadline>>;
-  fp: string; events: InviteEvent[];
+  fp: string; events: InviteEvent[]; notices: PairingNotice[]; refusedHellos: string[];
 }
 
 describe('invite pairing — failure paths (production path)', () => {
@@ -39,8 +40,10 @@ describe('invite pairing — failure paths (production path)', () => {
     });
     expect(b.relayClient?.connectionState).toBe('connected');
     const events: InviteEvent[] = [];
+    const notices: PairingNotice[] = [];
     b.pairingInvites!.events.on('event', (e: InviteEvent) => events.push(e));
-    const s: Side = { name, project: p, port, boot: b, fp: b.relayClient!.fingerprint!.toLowerCase(), events };
+    b.pairingInvites!.events.on('notice', (n: PairingNotice) => notices.push(n));
+    const s: Side = { name, project: p, port, boot: b, fp: b.relayClient!.fingerprint!.toLowerCase(), events, notices, refusedHellos: [] };
     live.push(s);
     return s;
   }
@@ -112,7 +115,7 @@ describe('invite pairing — failure paths (production path)', () => {
     expect(A.events.some((e) => e.kind === 'finish-prompt')).toBe(false);
   }, 60_000);
 
-  it('the inviter restarts between the accept and the Finish: Finish still works and both sides are paired', async () => {
+  it('the inviter restarts between the accept and the Finish: Finish still works and both sides are paired, checked, with no hello refused', async () => {
     const A = await boot('nova', 4176);
     const B = await boot('orbit', 4177);
     const inv = flow(A).createInvite() as { ok: true; iid: string; message: string };
@@ -123,10 +126,27 @@ describe('invite pairing — failure paths (production path)', () => {
     await stop(A);
     const A2 = await boot('nova', 4176, project);
     expect(A2.fp).toBe(A.fp); // same identity after restart
-    expect(flow(A2).approveFinish(inv.iid)).toMatchObject({ ok: true });
+    // The operator's Finish goes through the pairing handshake, as every production surface does
+    // (routes.ts, PairingInviteTelegram). A refused hello on either side is recorded.
+    for (const side of [A2, B]) {
+      const hs = side.boot.pairingInvites!.handshake;
+      const orig = hs.handleControl.bind(hs);
+      hs.handleControl = async (op, from, payload) => {
+        const r = await orig(op, from, payload);
+        if (!r.ok && op === 'pair-invite-hello') side.refusedHellos.push(r.reason);
+        return r;
+      };
+    }
+    expect(A2.boot.pairingInvites!.handshake.approveFinish(inv.iid)).toMatchObject({ ok: true });
     await vi.waitFor(() => {
       expect(trust(A2).isCredentialShareAllowedByFingerprint(B.fp)).toBe(true);
       expect(trust(B).isCredentialShareAllowedByFingerprint(A2.fp)).toBe(true);
     }, { timeout: 15_000 });
+    // Both operators are told "Connected ✓", checked: the restarted inviter verified the acceptor's hello.
+    await vi.waitFor(() => {
+      expect(A2.notices.filter((n) => n.kind === 'paired')).toEqual([expect.objectContaining({ checked: true, role: 'inviter' })]);
+      expect(B.notices.filter((n) => n.kind === 'paired')).toEqual([expect.objectContaining({ checked: true, role: 'recipient' })]);
+    }, { timeout: 30_000 });
+    expect([...A2.refusedHellos, ...B.refusedHellos]).toEqual([]);
   }, 90_000);
 });

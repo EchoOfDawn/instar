@@ -328,6 +328,32 @@ describe.each([['threadline-core', coreHs], ['Instar copy', instarHs as unknown 
     expect(kinds(B)).not.toContain('accept-refused');
   });
 
+  it('a hello or receipt naming a different invite expiry is refused for THAT reason, not as a bad signature', async () => {
+    const { net, clock, A, B } = await setup(M);
+    const inv = await offer(A, B);
+    net.offline.add(A.fp);
+    B.hs.approveAccept(inv.iid);
+    await clock.advance(0, net);
+    const other = new Date(Date.parse(inv.exp) + 1).toISOString(); // same format, one millisecond apart
+    const evil = generateIdentityKeyPair();
+    for (const [op, field, extra] of [['pair-invite-hello', 'A:0', { seen: 0 }], ['pair-invite-received', 'finishing', { state: 'finishing' }]] as const) {
+      const signed = (key: Buffer, exp: string) => {
+        const nonce = crypto.randomBytes(16).toString('hex');
+        const msg = M.handshakeMessage({ op, iid: inv.iid, fpA: A.fp, idA: A.pub, fpB: B.fp, idB: B.pub, exp, field, nonce });
+        return { iid: inv.iid, exp, nonce, sig: sign(key, Buffer.from(msg)).toString('hex'), ...extra };
+      };
+      // Correctly signed by A, over a different expiry: the expiry is what is wrong, and the reason says so.
+      const r1 = await B.hs.handleControl(op, A.fp, signed(A.kp.privateKey, other));
+      expect(r1).toMatchObject({ ok: false, reason: expect.stringMatching(/different invite expiry/) });
+      expect((r1 as { reason: string }).reason).toContain(other);
+      expect((r1 as { reason: string }).reason).toContain(inv.exp);
+      // The right expiry under another key: that is the bad signature.
+      expect(await B.hs.handleControl(op, A.fp, signed(evil.privateKey, inv.exp))).toEqual({ ok: false, reason: 'bad signature' });
+      // Control: the right key over the right expiry is accepted.
+      expect(await B.hs.handleControl(op, A.fp, signed(A.kp.privateKey, inv.exp))).toMatchObject({ ok: true });
+    }
+  });
+
   it('a refusal with a reason outside the spec\'s list is dropped, even when correctly signed', async () => {
     const { net, clock, A, B } = await setup(M);
     const inv = await offer(A, B);
@@ -486,6 +512,73 @@ describe.each([['threadline-core', coreHs], ['Instar copy', instarHs as unknown 
     // §11.4: a hello for a pairing completed before the restart changes nothing else, so a relay
     // replaying an old hello cannot produce a fresh "we've each checked" line.
     expect(find(B2, 'paired')).toHaveLength(0);
+  });
+
+  it('the INVITER restarts between the accept and the Finish: the acceptor\'s hello is verified and BOTH say "Connected ✓" (checked)', async () => {
+    const { net, clock, A, B } = await setup(M);
+    const inv = await offer(A, B);
+    B.hs.approveAccept(inv.iid);
+    await clock.advance(0, net);
+    A.hs.dispose();
+    const A2 = makeAgent(M, net, clock, 'pp', A);
+    expect(A2.hs.approveFinish(inv.iid)).toMatchObject({ ok: true });
+    expect(kinds(A2)).not.toContain('paired'); // not reported unchecked before the acceptor can answer
+    await clock.advance(1_000, net);
+    expect(find(A2, 'paired')).toEqual([expect.objectContaining({ checked: true, role: 'inviter' })]);
+    expect(find(B, 'paired')).toEqual([expect.objectContaining({ checked: true, role: 'recipient' })]);
+    // No hello was refused on either side.
+    const hellos = net.sent.filter((m) => m.op === 'pair-invite-hello');
+    for (const m of hellos) expect(await net.agents.get(m.to)!.hs.handleControl(m.op, m.from, m.payload)).toMatchObject({ ok: true });
+    await clock.advance(10 * 60_000, net);
+    expect([...kinds(A2), ...kinds(B)]).not.toContain('pairing-timeout');
+  });
+
+  it('the inviter restarts and the acceptor is an OLDER agent: after a short wait the pairing is reported, honestly unchecked', async () => {
+    const { net, clock, A, B } = await setup(M);
+    const inv = await offer(A, B);
+    net.filter = (m) => { if (m.op === 'pair-invite-accept') delete m.payload.hs; if (m.op === 'pair-invite-hello' && m.from === B.fp) return false; return true; };
+    B.hs.approveAccept(inv.iid);
+    await clock.advance(0, net);
+    A.hs.dispose();
+    const A2 = makeAgent(M, net, clock, 'pp', A);
+    A2.hs.approveFinish(inv.iid);
+    await clock.advance(50_000, net);
+    expect(kinds(A2)).not.toContain('paired');
+    await clock.advance(15_000, net);
+    expect(find(A2, 'paired')).toEqual([expect.objectContaining({ checked: false })]);
+  });
+
+  it('the engine driven directly (no handshake approve): the accept still carries the invite\'s expiry, so the hellos verify', async () => {
+    const { net, clock, A, B } = await setup(M);
+    const inv = await offer(A, B);
+    expect(B.flow.approveAccept(inv.iid)).toMatchObject({ ok: true });
+    await clock.advance(0, net);
+    A.hs.approveFinish(inv.iid);
+    const helloRefusals: string[] = [];
+    const origPump = net.pump.bind(net);
+    net.pump = async () => { for (const m of net.queue.splice(0)) { const r = await net.agents.get(m.to)!.hs.handleControl(m.op, m.from, m.payload); if (!r.ok && m.op === 'pair-invite-hello') helloRefusals.push(r.reason); } if (net.queue.length) await net.pump(); };
+    await clock.advance(1_000, net);
+    net.pump = origPump;
+    expect(helloRefusals).toEqual([]);
+    expect(find(A, 'paired')).toEqual([expect.objectContaining({ checked: true })]);
+    expect(find(B, 'paired')).toEqual([expect.objectContaining({ checked: true, peerName: 'pp' })]);
+  });
+
+  it('a second accept never produces a receipt to anyone (pins the receipt-to-old-peer invariant)', async () => {
+    const { net, clock, A, B } = await setup(M);
+    const C = makeAgent(M, net, clock, 'mallory');
+    const inv = await offer(A, B);
+    expect((await C.hs.receiveInvite(inv.message)).ok).toBe(true);
+    B.hs.approveAccept(inv.iid);
+    await clock.advance(0, net);
+    const receiptsBefore = net.sent.filter((m) => m.op === 'pair-invite-received').length;
+    expect(receiptsBefore).toBe(1); // the first acceptor's receipt
+    await clock.advance(6_000, net); // past the per-invite reply gap, so the rate limit cannot be what holds a receipt back
+    C.hs.approveAccept(inv.iid);
+    await clock.advance(60_000, net); // C's accept and its resends
+    expect(A.events.some((e) => e.kind === 'second-accept-alarm')).toBe(true);
+    expect(net.sent.filter((m) => m.op === 'pair-invite-received')).toHaveLength(receiptsBefore);
+    expect(net.sent.filter((m) => m.op === 'pair-invite-received' && m.to === C.fp)).toEqual([]);
   });
 
   it('a finish that arrives after a restart still runs the hello and reports "paired" on both sides', async () => {

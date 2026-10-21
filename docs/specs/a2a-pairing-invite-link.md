@@ -341,6 +341,14 @@ The exchange (`seen` = "I have your hello"):
   `mutual-verified`) is answered with `hello(seen=1)` and changes nothing else, so the other side still
   completes and a relay replaying an old hello cannot produce a fresh `paired` line. A finish that
   arrives after a restart is new, and runs the normal path (finish-received, hello, `paired`).
+- **The inviter restarts between the accept and its Finish.** The accept's `hs` flag is lost with the
+  restart, so the inviter does not know whether the acceptor speaks the handshake. It does not report
+  anything yet: an acceptor that does speak it sends its hello once it has the finish (the finish always
+  carries `hs: 1`), and the inviter answers that hello and both sides report `paired` (checked). If no
+  hello arrives within **60 s**, the inviter reports `paired` unchecked, which is the truth for an older
+  acceptor.
+- Every handshake message for an invite carries that invite's own `exp`, taken from the invite itself
+  on both sides (the acceptor reads it from the invite it approved, however the approve was driven).
 - A side answers at most **6** hellos per pairing, at most one a second, so a replayed hello cannot
   drive sends without end.
 
