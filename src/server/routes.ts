@@ -293,6 +293,7 @@ import {
   type EvidencePointer,
 } from '../core/UnjustifiedStopGate.js';
 import { StopGateDb, dayKeyFor, type EvalMode } from '../core/StopGateDb.js';
+import { summarizeJobFailures, JOB_FAILURE_WINDOW_MS } from './jobFailureCurrency.js';
 import { randomUUID as cryptoRandomUUID } from 'node:crypto';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -346,6 +347,8 @@ const execFile = promisify(execFileCb);
  * requiring operator intervention.
  */
 const CONTINUE_CEILING = 2;
+
+
 const APPRENTICESHIP_CYCLE_CHANNEL_SET = new Set<string>(APPRENTICESHIP_CYCLE_CHANNELS);
 const FOLLOW_THROUGH_OPT_OUT_REASON_MAX_CHARS = 2_000;
 
@@ -5050,14 +5053,26 @@ export function createRoutes(ctx: RouteContext): Router {
     const maxSessions = ctx.config.sessions?.maxSessions ?? 10;
     const sessionExhausted = sessionCount >= maxSessions;
 
-    let totalFailures = 0;
-    if (ctx.scheduler) {
-      const jobs = ctx.scheduler.getJobs();
-      for (const j of jobs) {
-        const st = ctx.state.getJobState(j.slug);
-        if (st) totalFailures += st.consecutiveFailures;
-      }
-    }
+    // Job-failure counting is CURRENCY-BOUNDED: `consecutiveFailures` is durable
+    // state that never self-clears, so without a bound one old failure pins /health
+    // "degraded" for the rest of the process lifetime. A disabled job is the acute
+    // case — it can never run, so its count can never come down. Both exclusions are
+    // REPORTED (see `staleJobFailures` below), never dropped. See
+    // ./jobFailureCurrency.ts for the incident this was earned from.
+    const jobFailures = ctx.scheduler
+      ? summarizeJobFailures(
+          ctx.scheduler.getJobs().map((j) => {
+            const st = ctx.state.getJobState(j.slug);
+            return {
+              slug: j.slug,
+              enabled: j.enabled,
+              failures: st?.consecutiveFailures ?? 0,
+              lastRun: st?.lastRun ?? null,
+            };
+          }),
+        )
+      : { current: 0, stale: [], staleTotal: 0 };
+    const totalFailures = jobFailures.current;
 
     // Only RECENT degradations count toward health status + the reported count/summary.
     // Events are append-only and never self-clear, so a single old transient fallback
@@ -5125,6 +5140,16 @@ export function createRoutes(ctx: RouteContext): Router {
       base.sessions = { current: sessionCount, max: maxSessions };
       base.schedulerRunning = ctx.scheduler !== null;
       base.consecutiveJobFailures = totalFailures;
+      // What the currency bound excluded, so the information is MOVED rather than
+      // lost: a disabled-but-failing job stays visible to anyone reading /health
+      // without pinning the health verdict. Absent when there is nothing excluded.
+      if (jobFailures.stale.length > 0) {
+        base.staleJobFailures = {
+          total: jobFailures.staleTotal,
+          windowHours: JOB_FAILURE_WINDOW_MS / (60 * 60 * 1000),
+          jobs: jobFailures.stale,
+        };
+      }
 
       // Cross-Machine Seamlessness (spec §11) — the Phase-1 "feature is alive"
       // surface. Always present with valid fields (never null/503), even on a
