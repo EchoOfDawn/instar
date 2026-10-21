@@ -10129,6 +10129,35 @@ export async function startServer(options: StartOptions): Promise<void> {
               next_attempt_at: input.next_attempt_at,
             })
           : undefined,
+        // Last resort when there is no lifeline topic. The gateway already
+        // reaches whichever platform this agent actually uses, so a Slack-only
+        // agent stops dropping every unbound-session notice it produces
+        // (indra, 2026-10-20: repeated no-topic outcomes, nothing delivered).
+        // Reports whether a destination existed so the notifier can record the
+        // honest outcome instead of guessing.
+        fallbackNotify: (text) => {
+          const hasTelegramDest = Boolean(_notifyState?.get<number>('agent-attention-topic'));
+          const hasSlackDest = Boolean(_slackAdapter && _notifyState?.get<string>('slack-attention-channel'));
+          if (!hasTelegramDest && !hasSlackDest) return false;
+          notify('SUMMARY', 'session-reap', text, undefined, {
+            producerId: 'reap-notifier',
+            author: unknownAutomationAuthor('reap-reason-author-unavailable'),
+          });
+          return true;
+        },
+        raiseNoDestination: (detail) => {
+          try {
+            void telegram?.createAttentionItem({
+              id: 'reap-notice-no-destination',
+              title: 'Notices about interrupted work have nowhere to go',
+              summary: 'no lifeline topic and no fallback channel',
+              description: detail,
+              category: 'session',
+              priority: 'HIGH',
+              sourceContext: 'reap-notifier',
+            });
+          } catch { /* @silent-fallback-ok: reporting the gap must never throw */ }
+        },
         recordNotify: (e) => reapLog.recordNotify(e),
         quietHoursEndAt: (now) => notificationBatcher.quietHoursEndAt(now),
         summaryReleaseAt: (now) => notificationBatcher.nextSummaryReleaseAt(now),
@@ -15626,7 +15655,16 @@ export async function startServer(options: StartOptions): Promise<void> {
     }
 
     let presenceProxy: import('../monitoring/PresenceProxy.js').PresenceProxy | undefined;
-    if (sharedIntelligence && telegram) {
+    // The unanswered-message watcher (and everything wired alongside it) used to
+    // require a Telegram adapter to exist. Its Slack support is written and sits
+    // INSIDE this block, so a Slack-only agent got neither: the watcher was never
+    // constructed at all. The indra agent's log carries no "Presence Proxy wired
+    // to Slack" line in its entire history, which is why an operator message
+    // could sit unanswered for 28 minutes on 2026-10-20 with nothing raised.
+    // Every dep below already branches on the Slack synthetic-id map first and
+    // falls back to Telegram, so admitting a Slack-only agent is a gate change,
+    // not a redesign.
+    if (sharedIntelligence && (telegram || _slackAdapter)) {
       try {
         const { PresenceProxy, isBriefAck } = await import('../monitoring/PresenceProxy.js');
         const { execSync: shellExecSync } = await import('child_process');
@@ -15734,7 +15772,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             if (slackChId && _slackAdapter) {
               return _slackAdapter.getSessionForChannel(slackChId) ?? null;
             }
-            return telegram!.getSessionForTopic(topicId);
+            return telegram?.getSessionForTopic(topicId) ?? null;
           },
           isSessionAlive: (name) => sessionManager.isSessionAlive(name),
           sendMessage: async (topicId, text, metadata) => {
@@ -15831,7 +15869,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             const slackChId = slackProxyChannelMap.get(topicId);
             const sessionName = (slackChId && _slackAdapter)
               ? _slackAdapter.getSessionForChannel(slackChId)
-              : telegram!.getSessionForTopic(topicId);
+              : telegram?.getSessionForTopic(topicId) ?? null;
             return sessionName ? rateLimitSentinel.isRecoveryActive(sessionName) : false;
           },
           // Honest turn-receipts: when any recovery sentinel already owns this
@@ -15855,8 +15893,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         });
 
         // Hook into Telegram's onMessageLogged callback (always active, unlike EventBus which requires a feature flag)
-        const existingCallback = telegram.onMessageLogged;
-        telegram.onMessageLogged = (entry) => {
+        const existingCallback = telegram?.onMessageLogged;
+        if (telegram) telegram.onMessageLogged = (entry) => {
           // Call existing callback first (TopicMemory dual-write)
           if (existingCallback) {
             existingCallback(entry);
@@ -15878,8 +15916,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         // Human-as-Detector: observe inbound HUMAN messages for coherence-break
         // corrections — a correction the user had to make is evidence a guardian
         // failed. Chains the prior callback; best-effort (observe never throws).
-        const beforeHadCallback = telegram.onMessageLogged;
-        telegram.onMessageLogged = (entry) => {
+        const beforeHadCallback = telegram?.onMessageLogged;
+        if (telegram) telegram.onMessageLogged = (entry) => {
           if (beforeHadCallback) beforeHadCallback(entry);
           const missSignal = observeInboundMessage(humanAsDetectorLog, entry);
           // ── Usher precision, path (b): the user just had to correct me (a
@@ -15961,8 +15999,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               // Per-topic runaway guard beyond the pre-filter.
               rateCeiling: { maxPerWindow: 30, windowMs: 60_000 },
             });
-            const beforeCaptureCb = telegram.onMessageLogged;
-            telegram.onMessageLogged = (entry) => {
+            const beforeCaptureCb = telegram?.onMessageLogged;
+            if (telegram) telegram.onMessageLogged = (entry) => {
               if (beforeCaptureCb) beforeCaptureCb(entry);
               // Fire-and-forget — capture latency must never reach the delivery path.
               void captureLoop({
@@ -16002,8 +16040,8 @@ export async function startServer(options: StartOptions): Promise<void> {
                 },
                 rateCeiling: { maxPerWindow: 20, windowMs: 60_000 },
               });
-              const beforeUsherCb = telegram.onMessageLogged;
-              telegram.onMessageLogged = (entry) => {
+              const beforeUsherCb = telegram?.onMessageLogged;
+              if (telegram) telegram.onMessageLogged = (entry) => {
                 if (beforeUsherCb) beforeUsherCb(entry);
                 void usherLoop({
                   messageId: entry.messageId,
@@ -16154,8 +16192,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               const aspClassifier = buildAspInboundClassifier(config.stateDir, config.projectName);
               setAspClassifierRef(aspClassifier);
               if (aspClassifier) {
-                const beforeAspCb = telegram.onMessageLogged;
-                telegram.onMessageLogged = (entry) => {
+                const beforeAspCb = telegram?.onMessageLogged;
+                if (telegram) telegram.onMessageLogged = (entry) => {
                   if (beforeAspCb) beforeAspCb(entry);
                   aspClassifier.classify({
                     topicId: entry.topicId,
@@ -16176,8 +16214,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               console.warn('[instar] ASP inbound classifier not wired:', err);
             }
 
-            const beforeCorrectionCb = telegram.onMessageLogged;
-            telegram.onMessageLogged = (entry) => {
+            const beforeCorrectionCb = telegram?.onMessageLogged;
+            if (telegram) telegram.onMessageLogged = (entry) => {
               if (beforeCorrectionCb) beforeCorrectionCb(entry);
               // Layer 0 (SYNC, free) — classify on the seam. No signal → stop at
               // ~zero cost on the vast majority of messages.
@@ -16402,7 +16440,7 @@ export async function startServer(options: StartOptions): Promise<void> {
               });
             },
             captureSessionOutput: (name, lines) => sessionManager.captureOutput(name, lines),
-            getSessionForTopic: (topicId) => telegram!.getSessionForTopic(topicId),
+            getSessionForTopic: (topicId) => telegram?.getSessionForTopic(topicId) ?? null,
             isSessionAlive: (name) => sessionManager.isSessionAlive(name),
             // Double-spawn detector input (escalation §6): count live sessions
             // bound to a topic. Same resolution the ResumeQueue drainer uses.
@@ -16613,8 +16651,8 @@ export async function startServer(options: StartOptions): Promise<void> {
           // structurally-symmetric /resume endpoint. False-positive cost:
           // one extra heartbeat that re-pauses on next idle cycle.
           const KEEP_WATCHING_RE = /\bkeep[\s-]?watching\b/i;
-          const previousTelegramHook = telegram.onMessageLogged;
-          telegram.onMessageLogged = (entry) => {
+          const previousTelegramHook = telegram?.onMessageLogged;
+          if (telegram) telegram.onMessageLogged = (entry) => {
             if (previousTelegramHook) previousTelegramHook(entry);
             if (!entry.fromUser) return;
             if (!entry.topicId) return;
