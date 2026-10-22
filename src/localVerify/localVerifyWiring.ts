@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { installedSafeMergePath } from '../core/installedSafeMerge.js';
 import { createAuthenticatedGitHubCliRuntimeResolver } from '../core/githubRuntime.js';
 import { PROTECTED_PATH_PREFIXES } from '../monitoring/greenPrAutomergeWiring.js';
 import { LocalVerifyService, appendLocalVerifyAudit, type UpdatePendingState } from './LocalVerifyService.js';
@@ -27,6 +28,9 @@ import { buildFloorGateGitHubSeams, buildGhRunner, buildReconcilerGitHubSeams, t
 import type { LocalVerifyRecord } from './record.js';
 import type { MainHealthSnapshot } from './mainHealth.js';
 import type { ContextPin, EvaluateRequiredContexts, FloorMode } from './statusProjection.js';
+
+/** Where the server's own (installed) safe-merge lives — shared with the green-PR watcher. */
+export { installedSafeMergePath };
 
 export interface LocalVerifyConfigBlock {
   enabled?: boolean;
@@ -204,22 +208,10 @@ export interface SafeMergeFloorExports {
 }
 
 /**
- * The safe-merge that ships with the running server's own install
- * (`<package>/scripts/safe-merge.mjs`, next to `dist/`). The trusted side of
- * local-verify always comes from the installed copy (spec §2 "Where the
- * verifier's own code comes from"), never from a working checkout: the agent's
- * home checkout can sit on any branch with uncommitted edits (found on the first
- * enable, 2026-10-22: it held a pre-local-verify safe-merge, so no reconciler
- * was built).
- */
-export function installedSafeMergePath(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts', 'safe-merge.mjs');
-}
-
-/**
  * Load safe-merge's own evaluation function, Actions-floor constant and approver
- * acceptance judgement from the installed safe-merge (one implementation, never
- * a copy). A safe-merge that lacks any of them builds no reconciler.
+ * acceptance judgement from the INSTALLED safe-merge (one implementation, never
+ * a copy; never the working checkout — spec §2). A safe-merge that lacks any of
+ * them builds no reconciler.
  */
 export async function loadSafeMergeFloor(safeMergePath: string = installedSafeMergePath()): Promise<SafeMergeFloorExports | null> {
   try {
