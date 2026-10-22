@@ -65,13 +65,27 @@ distinction until it was written down plainly.
 
 The real answer is that machines shouldn't be using that shared password with each other at
 all. Instar already has a better mechanism built in — each request signed individually, so
-nothing reusable is ever sent. Switching to it is a bigger, security-sensitive change that
-deserves its own design document rather than being bolted onto this one, and it is written
-down as the next step rather than left as a good intention.
+nothing reusable ever travels.
+
+One correction worth making plainly, because an earlier draft of this page got it wrong:
+signing proves **who sent** a request, not **who answered it**. So switching to it removes the
+reusable-password problem but does *not* by itself confirm the machine on the other end is
+really Justin's. Doing that properly needs the signature to also commit to the intended
+recipient and the exact request, plus a signed reply. That is a bigger, security-sensitive
+change with its own design document — written down as the next step rather than left as a good
+intention, and deliberately not bolted onto this one.
 
 ## What changes for Justin
 
 Cross-machine questions start working: "what's running everywhere," "how much quota is left
-across all my machines," "what needs my attention." Before, those were silently empty. After,
-they answer — within a couple of polling cycles rather than instantly, which is the price of
-not widening what gets access to the password.
+across all my machines," "what needs my attention." Before, those were silently empty.
+
+Two different promises, kept apart on purpose:
+
+- **Guaranteed, immediately:** a road the security check refuses is never chosen again, so the
+  permanent dead end is gone from the first attempt. That is the reported problem, and it is
+  fixed outright.
+- **Not guaranteed:** a road that is *allowed* but dead is only dropped after three failures in
+  a row, and because that memory is shared with other traffic, a success elsewhere can reset the
+  count. So that case usually recovers within a few cycles and in an unlucky pattern might not.
+  Saying "it recovers" without that caveat would be claiming more than the mechanism delivers.

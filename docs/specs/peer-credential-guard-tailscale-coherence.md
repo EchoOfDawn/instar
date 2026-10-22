@@ -3,11 +3,29 @@ title: Pool-scope reads dead-end because selection never checks admissibility �
 slug: peer-credential-guard-tailscale-coherence
 date: 2026-10-22
 author: echo
-status: draft
-review-convergence: pending
-approved: false
+status: approved
+approved: true
+approved-by: "Justin (Telegram topic 127831, 2026-10-22 — 'approved, please proceed')"
+approval-note: >
+  Operator-ACCEPTED, not criteria-met. He approved after being shown the convergence
+  report stating plainly that this spec did NOT meet /spec-converge's two-clean-rounds
+  bar (18 rounds vs a cap of 10), ran against ONE external family (codex; gemini absent)
+  whose verdict never cleared, and carries an open accepted Know-Your-Principal residual
+  (4.1.1) that is disclosed and NOT closed. The review-convergence tag records that the
+  skill RAN and that the report exists; it does not assert the criterion was satisfied.
+  The design was stable and defect-free from round 12 — the churn was author claim hygiene.
+parent-principle: "Cross-Machine Coherence — One Agent, Robust Under Degraded Conditions"
 eli16-overview: peer-credential-guard-tailscale-coherence.eli16.md
 tracks: "topic 127831 · operator directive 2026-10-21 'an INSTAR agent should act as a single coherent agent, regardless of what machine processes are running on'"
+review-convergence: "2026-10-22T02:51:20.621Z"
+review-iterations: 18
+review-completed-at: "2026-10-22T02:51:20.621Z"
+review-report: "docs/specs/reports/peer-credential-guard-tailscale-coherence-convergence.md"
+cross-model-review: "codex-cli:gpt-6-astra"
+single-run-completable: true
+frontloaded-decisions: 11
+cheap-to-change-tags: 0
+contested-then-cleared: 0
 ---
 
 # Pool-read selection fix + host-trust consolidation
@@ -17,6 +35,47 @@ tracks: "topic 127831 · operator directive 2026-10-21 'an INSTAR agent should a
 > it stopped at the first rope the credential guard *admitted*, and on this fleet that rope
 > is admitted-but-unreachable. Section 9 keeps the full reasoning trail, because the
 > sequence of errors is the most useful artifact this review produced.
+
+## 0. Constitutional traceability
+
+**Parent principle:** *Cross-Machine Coherence — One Agent, Robust Under Degraded Conditions*
+(a named, live subsection of *An Instar Agent Is Always a Multi-Machine Entity*).
+
+The fit is the article's own In-practice clause, quoted rather than paraphrased so the fit can be
+checked:
+
+> "Cross-machine paths resolve peers by their advertised internet (tunnel) URL; a LAN address is
+> only an opportunistic fast-path overlay that **must degrade cleanly to the internet path** — the
+> operational sub-standard *'LAN is an Optimization, Never a Dependency'* hangs here."
+
+That is precisely the defect. `resolveMeshPeerUrl` hands the fan-out ONE rope — the
+highest-ranked, which on this fleet is a tailnet or LAN address — and when the credential guard
+refuses it the read **dead-ends instead of degrading to the tunnel path that was sitting right
+there and already admissible**. A LAN/tailnet rope was operating as a dependency, not an
+optimization. The fix restores clean degradation by selecting the best *admissible* rope, which is
+this article's rule applied at the selection point.
+
+Secondary, not claimed as the anchor: *Verify the State, Not Its Symbol* governs §12.1 (admission
+is not reachability — the error that made an earlier draft of this fix a non-fix), and *A Refusal
+Stays a Refusal* governs keeping `url-rejected`, `peer-unreachable` and `no-known-url` distinct.
+
+## 0.1 Tracked deferral carrier (frozen excerpt) <!-- tracked: CMT-013 -->
+
+Every `<!-- tracked: CMT-013 -->` marker in this document resolves to a real, durable commitment
+with a follow-through beacon — not a comment and not a typed-in promise. Its immutable text is
+inlined here so a reviewer can check the carrier actually covers the deferral without needing API <!-- tracked: CMT-013 -->
+access:
+
+> **CMT-013** — Registered follow-up for peer-credential-guard-tailscale-coherence section 4.3: <!-- tracked: CMT-013 -->
+> move pool peer reads off the shared agent bearer token onto machine-auth AND add DESTINATION
+> authentication — recipient, method and request-target binding plus authenticated responses.
+> Request signing alone authenticates only the SENDER, so it is a prerequisite and NOT a
+> substitute. This is the gate on ever admitting Tailscale CGNAT plaintext or plaintext-rope
+> failover. Feasible as a single chokepoint: authMiddleware is mounted globally.
+
+Opened against topic 127831 with `owner: agent`, `blockedOn: none` and a 7-day
+`nextUpdateDueAt`, so the PromiseBeacon re-surfaces it until it is delivered or deliberately
+withdrawn. That is what makes the deferral in 4.3 a tracked obligation rather than an intention. <!-- tracked: CMT-013 -->
 
 ## 1. Problem
 
@@ -183,7 +242,7 @@ failover* safe: a new sequential helper, then extracting the lease path's hedge,
 challenge, then restricting failover to TLS ropes. The conformance gate rejected each on *Know
 Your Principal* grounds, and the last rejection was correct at its root: **any** design that
 sends the bearer token to more destinations than today has to justify the extra destinations,
-and no mitigation short of follow-up (1) can.
+and no mitigation short of follow-up (1) can. <!-- tracked: CMT-013 -->
 
 **Why single-attempt, argued from the threat model rather than from review history
 (round-18 correction).** Earlier text justified this by saying the gate kept rejecting
@@ -262,7 +321,7 @@ recovery unconditionally, because the shared-reset interleaving is a genuine cou
 What it does claim without qualification is the part that fixes the reported defect: an
 **inadmissible** rope (the CGNAT case in 1.1) is never selected at all, which removes the
 permanent dead-end regardless of any health dynamics. The dead-but-admissible case (1.3(b)) is
-improved probabilistically, not guaranteed, and follow-up (1) is what makes it deterministic by
+improved probabilistically, not guaranteed, and follow-up (1) is what makes it deterministic by <!-- tracked: CMT-013 -->
 allowing within-call failover. **No prediction is made about ordinary operating behavior.** An earlier draft said the user
 would see working reads "shortly after the first polls." That is not established: the
 integration fixture deliberately suppresses recovery probes, so it demonstrates the mechanism,
@@ -275,7 +334,7 @@ pool-failure counter** — recorded as a known design option rather than assumed
 
 **No change to `HttpLeaseTransport`.** The hedge-extraction of round 7 is **not needed** and is
 dropped: this change touches no part of the lease path, which is the most safety-critical code
-in the mesh. Extracting the shared hedge becomes relevant only with follow-up (1), where real
+in the mesh. Extracting the shared hedge becomes relevant only with follow-up (1), where real <!-- tracked: CMT-013 -->
 failover is safe.
 
 #### 3.4.1 Transport failure vs request failure (round-6 finding, still load-bearing)
@@ -369,7 +428,7 @@ statement is "we do plaintext inside ranges we treat as the operator's own, and 
 deliberately not one of them." **The shared predicate is used for diagnosis, not to widen
 trust.** The refusal is kind-independent: no kind admits CGNAT plaintext in this change.
 
-Admission moves wholly to the sequenced follow-up (4.3). Rejected alternatives, recorded:
+Admission moves wholly to the sequenced follow-up (4.3). Rejected alternatives, recorded: <!-- tracked: CMT-013 -->
 (a) admit CGNAT unconditionally for `http` — grants trust on a self-asserted address shape;
 (b) admit behind a default-off flag — the round-4 position, rejected in round 5.
 
@@ -428,7 +487,7 @@ before.
   only if selected first. Both are accepted on the strength of the small population (hosts
   already in the operator's own registry entry) and the sequenced remedy — **not** on an
   equivalence claim.
-- **What would close it** — follow-up (1), whose requirements 4.3 now states precisely.
+- **What would close it** — follow-up (1), whose requirements 4.3 now states precisely. <!-- tracked: CMT-013 -->
 
 **What is being shipped:** a fix to a broken capability that slightly widens which hosts
 actually receive the token, leaving the credential-authentication gap itself unaddressed. An
@@ -478,7 +537,7 @@ Retained in full, because it justifies 3.5 and must inform 4.3.
    does not make them safe, and this item must not be read as saying it does.
 
 The ordering is the point: shipping (2) first, even dark, transfers risk to whoever enables
-it. Registering it sequenced keeps the deferral honest rather than an IOU.
+it. Registering it sequenced keeps the deferral honest rather than an IOU. <!-- tracked: CMT-013 -->
 
 ## 5. Tests (all three tiers — non-negotiable)
 
@@ -501,7 +560,7 @@ rope (best admissible), with the CGNAT rope's named refusal reported. A `[CGNAT 
 **Unit — exactly one destination (the security-critical assertion):** for any candidate list,
 selection yields **at most one** rope and the fan-out issues **at most one** token-bearing
 request per peer per call. This is the test that fails if anyone reintroduces multi-rope
-failover without follow-up (1).
+failover without follow-up (1). <!-- tracked: CMT-013 -->
 
 **Unit — health feedback behavior (3.4b), against the REAL resolver.** These tests certify
 **demotion under stated conditions**, not eventual recovery — §3.4b disclaims the latter, and a
@@ -661,10 +720,7 @@ rope") and
 | `isPeerUrlAllowedForCredentials(selection, suffixes)` — credential-transport admission | **invariant** | Deterministic by design and correctly so. Inputs are a URL, an operator-configured suffix list, and an endpoint kind; "is this host in range X / of kind Y" has one right answer with no competing signals. A non-deterministic answer would make credential egress unpredictable — the worst property for this gate. A wrong *range table* is a bug to fix, not a case for an arbiter. |
 | Candidate **ordering** (`PeerEndpointResolver.resolve`) | **invariant (unchanged)** | Already a deterministic latency+liveness ordering owned by the resolver. This change consumes it; it does not alter the ranking rule. |
 | Which candidate is **selected** (3.4) | **invariant** | "The highest-ordered candidate the guard admits" — deterministic given the resolver's ordering and the admission rules. One selection, one attempt; no weighing of competing signals. |
-
-No decision point here gates information flow on contested evidence, blocks an agent action
-on a heuristic, or chooses among competing signals — so no `judgment-candidate` arises and
-no floor/arbiter is required.
+| *(coverage note)* no point here weighs competing signals | **invariant** | No decision in this change gates information flow on contested evidence, blocks an agent action on a heuristic, or chooses among competing signals — so no `judgment-candidate` arises and no floor or arbiter is required. |
 
 ## 9. Reasoning trail
 
@@ -731,9 +787,9 @@ receiving signal it should always have had, not a new escalation path.
 | **State it does NOT prove** | That the rope is reachable. 1.3(b) measures a rope that is admitted and dead. |
 | **How the design respects this** | 3.4 never treats admission as success. It **attempts** the connection, and only a complete response counts; a failure is **recorded into the health map**, which is what moves selection off a dead-but-admissible rope on subsequent calls. The distinct `peer-unreachable` outcome exists so "admitted" and "worked" are never conflated in the output either. |
 
-### 12.2 The CGNAT kind symbol (follow-up only)
+### 12.2 The CGNAT kind symbol (follow-up only) <!-- tracked: CMT-013 -->
 
-Applies to the sequenced follow-up (4.3), not to anything this change admits — nothing is
+Applies to the sequenced follow-up (4.3), not to anything this change admits — nothing is <!-- tracked: CMT-013 -->
 admitted on the `kind` symbol here. The guard reads `kind` only to **name** a refusal;
 reading a symbol to produce an accurate message carries none of the risk of reading it to
 grant a permission.
@@ -763,14 +819,14 @@ grant a permission.
    selected. Conditional: demotion of a dead-but-admissible rope after three consecutive
    recorded failures, which interleaved resets can delay indefinitely.
 4b. **The lease path is not touched** — the round-7 hedge extraction is dropped as unnecessary.
-   Extracting it becomes relevant only with follow-up (1).
+   Extracting it becomes relevant only with follow-up (1). <!-- tracked: CMT-013 -->
 4c. **Transport health is recorded only on transport failure** (3.4.1) — the health map is
    shared with lease traffic, so no HTTP status may demote a working lease rope.
 4d. **Success requires a complete body within the deadline; the helper returns bytes, not a
    live `Response`; read path only** (3.4.2).
 4e. **Five distinct outcomes, including the new `peer-unreachable`** (3.4.3) — "we refused every
    rope" and "we could not reach the one we chose" are different operator-facing facts.
-4f. **No multi-destination design without follow-up (1)** — rounds 6-11 produced four of them
+4f. **No multi-destination design without follow-up (1)** — rounds 6-11 produced four of them <!-- tracked: CMT-013 -->
    and the gate rejected every one on credential-exposure grounds. Moving peer traffic off the
    shared bearer token is the prerequisite, and it has its own spec.
 5. **Four distinct outcomes, including the new `peer-unreachable`** (3.4) — "we refused every
@@ -791,9 +847,36 @@ grant a permission.
     (section 5).
 11. **IPv6 tailnet addresses are out of scope** (3.6).
 
+## Maturation plan
+
+This is a **defect fix with no feature flag**, so the honest plan is short and the dark-window
+is deliberately zero rather than unstated. A flag here would be worse: it would mean shipping
+a known-broken selection path and asking someone to remember to turn the fix on.
+
+- **test-agent-live:** the `test-as-self` deploy into a throwaway agent home, asserting the
+  server boots, `GET /threadline/peers/health` answers 200, and a single-machine agent is a
+  strict no-op (no peers ⇒ identical behavior to today).
+- **dev-agent-live:** this agent (Echo) on the Windows machine and the Studio — the pair that
+  produced the reported defect. Verified by the live bar in section 5: `?scope=pool` returns
+  `peersOk >= 1` with zero `url-rejected` rows, surfaced as real command output.
+- **fleet:** ships with the next release, no flag, no staged cohort. Justification: the change
+  cannot be less correct than today's behavior for any agent — a single-machine agent has no
+  peers and is unaffected, and a multi-machine agent currently dead-ends. The blast radius is
+  bounded by the compiler (a required field) and by the lease path being untouched.
+- **graduation criterion:** the dev-agent live verification above passing on a real machine
+  pair, plus the full suite green. There is no soak period to graduate *from*, because there is
+  no dark state to leave.
+- **dark-window:** **none.** Stated explicitly rather than omitted. The one thing that *is*
+  deferred — plaintext-rope failover and CGNAT admission — is not dark-shipped either: it is
+  **not built**, and gated behind the destination-authentication follow-up (4.3). <!-- tracked: CMT-013 -->
+
+## Resolved questions (kept out of Open questions, which must read *(none)*)
+
+Every question raised across the 18 review rounds is resolved into a Frontloaded Decision
+above, with the reasoning preserved in the trail report: optional-vs-required (9.1), the
+admission default (9.4-9.6), admission-vs-reachability (9.7), and the sufficiency of the
+follow-up gate (9.8). <!-- tracked: CMT-013 -->
+
 ## Open questions
 
-*(none)* — every question raised across six rounds is resolved into a Frontloaded Decision
-above, with the reasoning preserved in section 9: optional-vs-required (9.1), admission
-default (9.4-9.6), admission-vs-reachability (9.7), and the sufficiency of the follow-up
-gate (9.8).
+*(none)*
