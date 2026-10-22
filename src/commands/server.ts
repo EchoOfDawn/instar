@@ -9,6 +9,7 @@ import { bindUnknownProducerTelegramSender, sendDeterministicTelegramNotice } fr
  *   topic message → find/spawn session → inject message → session replies via [telegram:N]
  */
 
+import { vitestConfigForTestPath } from '../localVerify/inventory.js';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import fs from 'node:fs';
@@ -22195,6 +22196,128 @@ export async function startServer(options: StartOptions): Promise<void> {
       }
     }
 
+    // ── local-verify (local-verify-merge-authority §2) ──────────────────
+    // The server runs the full suite on a PR's merge tree and keeps the result,
+    // so a merge can wait on a local run instead of GitHub Actions. Repo-gated
+    // and off unless monitoring.localVerify.enabled; null → routes 503.
+    let localVerifyService: import('../localVerify/LocalVerifyService.js').LocalVerifyService | null = null;
+    let localVerifyTimer: NodeJS.Timeout | null = null;
+    let localVerifyStatus: import('../localVerify/StatusReconciler.js').StatusReconciler | null = null;
+    {
+      const lvCfg = (config.monitoring as { localVerify?: { enabled?: boolean; operatorGhLogin?: string; postStatuses?: boolean } } | undefined)?.localVerify;
+      const gpCfg = config.monitoring?.greenPrAutoMerge as { expectedGhLogin?: string; repo?: string } | undefined;
+      const lvMachineId = coordinator.identity?.machineId ?? `m_host_${os.hostname()}`;
+      const lvHooks: import('../localVerify/localVerifyWiring.js').LocalVerifyHooks = {};
+      // Deduped attention for local-verify signals (main-red, status-stuck, mirror-pending, …).
+      lvHooks.signal = (key, detail) => {
+        if (!telegram) return;
+        const id = typeof detail.head === 'string' && key === 'local-verify:mirror-pending' ? `${key}:${detail.head}` : key;
+        void telegram.createAttentionItem({
+          id,
+          title: `local-verify: ${key.replace(/^local-verify:/, '')}`,
+          summary: JSON.stringify(detail).slice(0, 900),
+          category: 'degradation',
+          priority: ['local-verify:no-required-checks', 'local-verify:main-red', 'local-verify:required-but-not-posting'].includes(key) ? 'HIGH' : 'MEDIUM',
+        } as never).catch(() => { /* attention delivery is non-fatal */ });
+      };
+      const wiring = await import('../localVerify/localVerifyWiring.js');
+      if (lvCfg?.enabled) {
+        const built = wiring.buildLocalVerifyService({
+          config: lvCfg,
+          expectedGhLogin: gpCfg?.expectedGhLogin,
+          repo: 'JKHeadley/instar',
+          repoPath: process.cwd(),
+          stateDir: config.stateDir,
+          agentHome: path.dirname(config.stateDir),
+          machineId: lvMachineId,
+          hooks: lvHooks,
+        });
+        if (built.service) {
+          localVerifyService = built.service;
+          try {
+            await localVerifyService.boot();
+            const svc = localVerifyService;
+            localVerifyTimer = setInterval(() => { void svc.tick().catch(() => { /* a failed tick retries next interval */ }); }, 30_000);
+            localVerifyTimer.unref();
+            console.log(pc.green('  local-verify enabled (server-run test verification for merges)'));
+          } catch (e) {
+            console.log(pc.red(`  local-verify NOT started — boot failed: ${(e as Error)?.message ?? e}`));
+            localVerifyService = null;
+          }
+        } else {
+          console.log(pc.dim(`  local-verify enabled in config but inert (${built.reason})`));
+        }
+      }
+      // The status reconcile loop (§3). Built on any instar source checkout with the
+      // agent's GitHub login: the Actions-floor mirror must stay on whenever GitHub
+      // requires the check, independent of monitoring.localVerify.enabled (with the
+      // verifier off, the loop does nothing unless the check is required). Posting
+      // is dry-run unless monitoring.localVerify.postStatuses is true.
+      if (gpCfg?.expectedGhLogin) {
+        try {
+          const st = await wiring.buildStatusReconciler({
+            repo: 'JKHeadley/instar',
+            repoPath: process.cwd(),
+            stateDir: config.stateDir,
+            machineId: lvMachineId,
+            expectedGhLogin: gpCfg.expectedGhLogin,
+            operatorGhLogin: lvCfg?.operatorGhLogin?.trim() || null,
+            service: localVerifyService,
+            localVerifyEnabled: () => liveConfig.get<boolean>('monitoring.localVerify.enabled', false) === true,
+            postStatuses: () => liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true,
+            configFloor: () => (liveConfig.get<string>('monitoring.greenPrAutoMerge.floor', 'actions') === 'local' ? 'local' : 'actions'),
+            watcherRepo: () => liveConfig.get<string>('monitoring.greenPrAutoMerge.repo', 'JKHeadley/instar'),
+            lease: coordinator.enabled
+              ? {
+                  holdsLease: () => coordinator.holdsLease(),
+                  leaseEpoch: () => coordinator.getSyncStatus().leaseEpoch,
+                  leaseHolder: () => coordinator.getSyncStatus().leaseHolder ?? null,
+                }
+              : { holdsLease: () => true, leaseEpoch: () => 0, leaseHolder: () => lvMachineId },
+            signal: lvHooks.signal,
+            // Decision 16: the same executor status safe-merge reads (this agent's own server).
+            readExecutorStatus: async () => {
+              try {
+                const r = await fetch(`http://127.0.0.1:${config.port}/feedback-factory/execute/status`, {
+                  headers: { Authorization: `Bearer ${config.authToken ?? ''}` }, signal: AbortSignal.timeout(10_000),
+                });
+                return { status: r.status, body: r.ok ? await r.json() : null };
+              } catch { return null; } // @silent-fallback-ok — unreadable ⇒ the acceptance does not match (refuses)
+            },
+          });
+          if (st.reconciler) {
+            localVerifyStatus = st.reconciler;
+            const rec = st.reconciler;
+            lvHooks.onRecord = (r) => rec.onRecord(r.headSha);
+            lvHooks.onMainHealthChange = (snap) => { if (snap.state !== 'healthy') rec.withdrawAll(snap.state); };
+            rec.start(); // runs a pass now (boot), then every 60 s
+            console.log(pc.dim(`  local-verify status loop started (${liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true ? 'posting' : 'dry-run'})`));
+          } else {
+            console.log(pc.dim(`  local-verify status loop inert (${st.reason})`));
+          }
+        } catch (e) {
+          console.log(pc.red(`  local-verify status loop NOT started: ${(e as Error)?.message ?? e}`));
+        }
+      }
+      // The watcher reads local-verify late-bound (it is built first): the
+      // candidate pre-filter, the actions→local disarm and verify requests
+      // (local-verify-merge-authority §2/§3). The effective floor follows GitHub's
+      // real settings (the reconciler's floor gate); without a reconciler it is
+      // unmeasurable (null ⇒ actions). Main health is the service's machine state.
+      if (localVerifyService) {
+        const svc = localVerifyService;
+        const rec = localVerifyStatus;
+        greenPrAutoMerger?.attachLocalVerify({
+          effectiveFloor: () => (rec ? rec.effectiveFloor() : null),
+          mainHealth: () => svc.mainHealth().state,
+          hasRecord: (pr, head, base) => !!svc.getRecord(pr, head, base),
+          requestVerify: (pr) => svc.request(pr, { explicit: false }),
+          // Dry-run posting also suppresses the watcher's actions→local disarm write.
+          postStatuses: () => liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true,
+        });
+      }
+    }
+
     // ── Multi-Machine Session Pool registry (§L2) — live MachineCapacity view for GET /pool ──
     // Always instantiated (cheap); the feature stays dark behind the sessionPool stage gate.
     // Self-attests hardware + records a self-heartbeat so GET /pool + the Machines tab show
@@ -27653,7 +27776,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               resolve(r);
             };
             try {
-              const child = cp.spawn(vitestBin, ['run', args.testPath, '--reporter=dot'], {
+              // The failover check is an e2e file; the default config is the unit lane only.
+              const child = cp.spawn(vitestBin, ['run', '--config', vitestConfigForTestPath(args.testPath), args.testPath, '--reporter=dot'], {
                 cwd: sourceRoot,
                 stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
                 env: { ...process.env },
@@ -28630,7 +28754,7 @@ export async function startServer(options: StartOptions): Promise<void> {
       console.log(pc.yellow(`  Agent identity runtime: not wired (${err instanceof Error ? err.message : String(err)})`));
     }
 
-    const server = new AgentServer({ config, singleInstanceLock, agentIdentity: _agentIdentityDeps, terminateSessionAuthority: terminateWithAuthority, subscriptionEmailBinding: credentialLocationLedger, subscriptionEmailBarrier, subscriptionIdentityOracle, sessionManager, llmQueue: sharedLlmQueue, state, scheduler, telegram, telegramOrigin: telegramOriginBoot?.runtime, relationships, feedback, feedbackAnomalyDetector, dispatches, updateChecker, autoUpdater, autoDispatcher, quotaTracker, quotaManager, publisher, viewer, tunnel, evolution, watchdog, topicMemory, triageNurse, projectMapper, cartographerRoots: cartographerRoots ?? undefined, coherenceGate: scopeVerifier, contextHierarchy, canonicalState, operationGate, sentinel, adaptiveTrust, memoryMonitor, orphanReaper, coherenceMonitor, commitmentTracker, subscriptionPool, accountFollowMePeerViews: async () => { const nickById = new Map((_listPoolMachines?.() ?? []).map((m) => [m.machineId, m.nickname ?? m.machineId])); let peers = (_resolvePeerUrls?.() ?? []).map((p) => ({ machineId: p.machineId, nickname: nickById.get(p.machineId) ?? p.machineId, url: p.url })); if (peers.length === 0) { peers = (_listPoolMachines?.() ?? []).filter((m) => m.machineId !== _meshSelfId && !!m.lastKnownUrl).map((m) => ({ machineId: m.machineId, nickname: m.nickname ?? m.machineId, url: m.lastKnownUrl as string })); } if (peers.length === 0) return []; const { fetchPeerSubscriptionViews } = await import('../core/fetchPeerSubscriptionViews.js'); return fetchPeerSubscriptionViews({ peers: () => peers, fetchImpl: fetch as unknown as Parameters<typeof fetchPeerSubscriptionViews>[0]['fetchImpl'], authToken: config.authToken ?? '' }); }, quotaPoller, quotaAwareScheduler: _quotaAwareScheduler ?? undefined, proactiveSwapMonitor: _proactiveSwapMonitor ?? undefined, inUseAccountResolver, enrollmentWizard, accountFollowMeRevocation, credentialRepointing, semanticMemory, activitySentinel, rateLimitSentinel, releaseReadinessSentinel: releaseReadinessSentinel ?? undefined, greenPrAutoMerger: greenPrAutoMerger ?? undefined, guardLatchStore: guardLatchStore ?? undefined, messageRouter, summarySentinel, spawnManager, systemReviewer, capabilityMapper, selfKnowledgeTree, coverageAuditor, topicResumeMap: _topicResumeMap ?? undefined, topicProfile: _topicProfileCtx ?? undefined, sessionRefresh: _sessionRefresh ?? undefined, autonomyManager, trustElevationTracker, autonomousEvolution, coordinator: coordinator.enabled ? coordinator : undefined, meshBindActive: coordinator.managers.identityManager.hasIdentity() && config.multiMachine?.meshTransport?.enabled !== false, localSigningKeyPem, leaseTransport, peerEndpointRecorder, getSelfMeshEndpoints, onLeasePullRequest: () => leaseCoordinatorRef?.currentLease() ?? null, liveTailReceiver, handoffWireTransport, onHandoffBegin, onHandoffInitiate: handoffInitiate, handoffInProgress: handoffSentinelInProgress, messageLedger, currentInboundByTopic, replyMarkerTransport, onReplyMarker: messageLedger ? (marker: unknown) => { const m = marker as { dedupeKey: string; platform: string; replyIdempotencyKey: string; epoch: number; topic?: string | null }; messageLedger!.applyRemoteReplyMarker(m.dedupeKey, { platform: m.platform, replyIdempotencyKey: m.replyIdempotencyKey, epoch: m.epoch, topic: m.topic ?? null }); } : undefined, whatsapp: whatsappAdapter, slack: slackAdapter, imessage: imessageAdapter, conversationRegistry, conversationBindAuth, conversationFollowThrough, whatsappBusinessBackend, messageBridge, hookEventReceiver, worktreeMonitor, subagentTracker, instructionsVerifier, handshakeManager: threadlineHandshake, threadlineRouter, conversationStore, threadLog, threadMessageRecorder, warrantsReplyGate, collaborationSurfacer, threadResumeMap, topicLinkageHandler: topicLinkageHandler ?? undefined, threadlineRelayClient, pairingInvites: threadlinePairingInvites, getLastRelayEvent: threadlineGetLastRelayEvent, a2aRelayForward: _a2aRelayForwardCtx ?? undefined, threadlineReplyWaiters, listenerManager: listenerManager ?? undefined, a2aDeliveryTracker: a2aDeliveryTracker ?? undefined, relayVerdictCounters: threadlineRelayClient ? (() => ({ ...threadlineRelayClient!.relayVerdictCounters, expiredMismatchIgnored: a2aDeliveryTracker?.expiredMismatchIgnored ?? 0 })) : undefined, inboundIdLedger: _inboundIdLedger ?? undefined, inboundIdLedgerDaemonDeferred: () => _inboundIdLedgerDaemonDeferred, responseReviewGate, reviewCanaryBattery, messagingToneGate, outboundDedupGate, telemetryHeartbeat, pasteManager, featureRegistry, discoveryEvaluator, completionEvaluator, unifiedTrust, liveConfig, sharedStateLedger, ledgerSessionRegistry, worktreeManager, oidcEnrolledRepos: parallelDevConfig?.oidcEnrolledRepos, initiativeTracker, projectRoundRunner, projectDriftChecker, machineHeartbeat, machinePoolRegistry, ropeHealthMonitor, writeAdmission: writeAdmission ?? undefined, getInboundQueue: () => _inboundQueue, getMachineCoherence: () => _machineCoherenceSentinel, getSingleMachineFailoverGap: () => _singleMachineFailoverGap, getMissingLoginSession: () => _missingLoginSession, getSessionPoolFailoverRunner: () => _sessionPoolFailoverRunnerDriver?.status() ?? null, sessionPoolPromotionActivation: _sessionPoolPromotionActivation, meshRpcDispatcher, deliverA2aToMachine: _deliverA2aToMachine ?? undefined, workingSetPullCoordinator, workingSetArtifactManager, orchestratorPoller, commitmentReplicaStore, preferenceReplicaStore, replicatedRecordEmitter, conflictStore, rollbackUnmerge, droppedOriginRegistry, preferencesUnionReader, jevMemoryPicker, forwardCommitmentMutate, sessionOwnershipRegistry, sendDrain: _sendDrain ?? undefined, topicPinStore: _topicPinStore ?? undefined, topicPinSkewQuarantine: _topicPinSkewQuarantine ?? undefined, topicPinFoldView: _topicPinFoldView ?? undefined, ownershipReconciler: _ownershipReconciler ?? undefined, staleOwnerEngine: _staleOwnerEngine ?? undefined, duplicateReconciler: _duplicateReconciler ?? undefined, ownerDarkLadder: _ownerDarkLadder ?? undefined, spawnAdmission: _spawnAdmission ?? undefined, judgmentProvenance: _judgmentProvenance ?? undefined, leaseHandback: _leaseHandbackCtx ?? undefined, streamTicketStore: _streamTicketStore ?? undefined, poolStreamAllowRemoteInput: (config as { dashboard?: { poolStream?: { allowRemoteInput?: boolean } } }).dashboard?.poolStream?.allowRemoteInput ?? false, poolStreamConnector: _poolStreamConnector ?? undefined, secretSync: _secretSyncHandle ?? undefined, meshSelfId: _meshSelfId ?? undefined, resolveRouterUrl: _resolveRouterUrl ?? undefined, resolvePeerUrls: _resolvePeerUrls ?? undefined, guardRegistry, listPoolMachines: _listPoolMachines ?? undefined, deliverMandateToMachine: _deliverMandateToMachine ?? undefined, passkeyRevokeOutbox: _passkeyRevokeOutbox ? () => _passkeyRevokeOutbox! : undefined, passkeyPeerOnline: _passkeyPeerOnline, passkeyPoolReader: _passkeyPoolReader ? () => _passkeyPoolReader! : undefined, passkeyProofBrowser: async (profileDir: string) => { const { ChromeCdpReloginBrowser } = await import('../core/ChromeCdpReloginBrowser.js'); return new ChromeCdpReloginBrowser({ userDataDir: profileDir, passkeyMode: true, headless: true, launchTimeoutMs: 30_000, operationTimeoutMs: 20_000 }); }, poolLink: _poolLink ?? undefined, poolPollCache: _poolPollCache ?? undefined, sessionPoolE2EResultStore, proxyCoordinator, topicIntentStore, topicIntentArcCheck, usherSignalStore, intelligence: sharedIntelligence ?? undefined, telegramBridgeConfig, telegramBridge: telegramBridge ?? undefined, threadlineObservability, briefDeps, workingMemory, taskFlowRegistry, threadlineFlowBridge, sessionReaper, agentWorktreeReaper, externalHogSentinel, orphanedWorkSentinel, mcpProcessReaper, geminiLoopRunner, sleepController, agentActivityState, reapLog, resumeQueue, resumeDrainer, autonomousLivenessReconciler, enforcedTerminationStatus: () => enforcedTerminationWatchdog?.guardStatus() ?? null, prHandLease: prHandLease ?? undefined, standDownRegistry: _standDownRegistry ?? undefined, standDownAudit: _standDownAudit ?? undefined, operatorStopRecorder: recordOperatorStop, sleepWakeDetector, unjustifiedStopGate, stopGateDb, stopNotifier, liveTestGate, liveTestGateMode, liveTestRunnerCtx });    // Resolve the late-bound topic-operator getter (increment 2e): routing was
+    const server = new AgentServer({ config, singleInstanceLock, agentIdentity: _agentIdentityDeps, terminateSessionAuthority: terminateWithAuthority, subscriptionEmailBinding: credentialLocationLedger, subscriptionEmailBarrier, subscriptionIdentityOracle, sessionManager, llmQueue: sharedLlmQueue, state, scheduler, telegram, telegramOrigin: telegramOriginBoot?.runtime, relationships, feedback, feedbackAnomalyDetector, dispatches, updateChecker, autoUpdater, autoDispatcher, quotaTracker, quotaManager, publisher, viewer, tunnel, evolution, watchdog, topicMemory, triageNurse, projectMapper, cartographerRoots: cartographerRoots ?? undefined, coherenceGate: scopeVerifier, contextHierarchy, canonicalState, operationGate, sentinel, adaptiveTrust, memoryMonitor, orphanReaper, coherenceMonitor, commitmentTracker, subscriptionPool, accountFollowMePeerViews: async () => { const nickById = new Map((_listPoolMachines?.() ?? []).map((m) => [m.machineId, m.nickname ?? m.machineId])); let peers = (_resolvePeerUrls?.() ?? []).map((p) => ({ machineId: p.machineId, nickname: nickById.get(p.machineId) ?? p.machineId, url: p.url })); if (peers.length === 0) { peers = (_listPoolMachines?.() ?? []).filter((m) => m.machineId !== _meshSelfId && !!m.lastKnownUrl).map((m) => ({ machineId: m.machineId, nickname: m.nickname ?? m.machineId, url: m.lastKnownUrl as string })); } if (peers.length === 0) return []; const { fetchPeerSubscriptionViews } = await import('../core/fetchPeerSubscriptionViews.js'); return fetchPeerSubscriptionViews({ peers: () => peers, fetchImpl: fetch as unknown as Parameters<typeof fetchPeerSubscriptionViews>[0]['fetchImpl'], authToken: config.authToken ?? '' }); }, quotaPoller, quotaAwareScheduler: _quotaAwareScheduler ?? undefined, proactiveSwapMonitor: _proactiveSwapMonitor ?? undefined, inUseAccountResolver, enrollmentWizard, accountFollowMeRevocation, credentialRepointing, semanticMemory, activitySentinel, rateLimitSentinel, releaseReadinessSentinel: releaseReadinessSentinel ?? undefined, greenPrAutoMerger: greenPrAutoMerger ?? undefined, localVerify: localVerifyService ?? undefined, localVerifyStatus: localVerifyStatus ?? undefined, guardLatchStore: guardLatchStore ?? undefined, messageRouter, summarySentinel, spawnManager, systemReviewer, capabilityMapper, selfKnowledgeTree, coverageAuditor, topicResumeMap: _topicResumeMap ?? undefined, topicProfile: _topicProfileCtx ?? undefined, sessionRefresh: _sessionRefresh ?? undefined, autonomyManager, trustElevationTracker, autonomousEvolution, coordinator: coordinator.enabled ? coordinator : undefined, meshBindActive: coordinator.managers.identityManager.hasIdentity() && config.multiMachine?.meshTransport?.enabled !== false, localSigningKeyPem, leaseTransport, peerEndpointRecorder, getSelfMeshEndpoints, onLeasePullRequest: () => leaseCoordinatorRef?.currentLease() ?? null, liveTailReceiver, handoffWireTransport, onHandoffBegin, onHandoffInitiate: handoffInitiate, handoffInProgress: handoffSentinelInProgress, messageLedger, currentInboundByTopic, replyMarkerTransport, onReplyMarker: messageLedger ? (marker: unknown) => { const m = marker as { dedupeKey: string; platform: string; replyIdempotencyKey: string; epoch: number; topic?: string | null }; messageLedger!.applyRemoteReplyMarker(m.dedupeKey, { platform: m.platform, replyIdempotencyKey: m.replyIdempotencyKey, epoch: m.epoch, topic: m.topic ?? null }); } : undefined, whatsapp: whatsappAdapter, slack: slackAdapter, imessage: imessageAdapter, conversationRegistry, conversationBindAuth, conversationFollowThrough, whatsappBusinessBackend, messageBridge, hookEventReceiver, worktreeMonitor, subagentTracker, instructionsVerifier, handshakeManager: threadlineHandshake, threadlineRouter, conversationStore, threadLog, threadMessageRecorder, warrantsReplyGate, collaborationSurfacer, threadResumeMap, topicLinkageHandler: topicLinkageHandler ?? undefined, threadlineRelayClient, pairingInvites: threadlinePairingInvites, getLastRelayEvent: threadlineGetLastRelayEvent, a2aRelayForward: _a2aRelayForwardCtx ?? undefined, threadlineReplyWaiters, listenerManager: listenerManager ?? undefined, a2aDeliveryTracker: a2aDeliveryTracker ?? undefined, relayVerdictCounters: threadlineRelayClient ? (() => ({ ...threadlineRelayClient!.relayVerdictCounters, expiredMismatchIgnored: a2aDeliveryTracker?.expiredMismatchIgnored ?? 0 })) : undefined, inboundIdLedger: _inboundIdLedger ?? undefined, inboundIdLedgerDaemonDeferred: () => _inboundIdLedgerDaemonDeferred, responseReviewGate, reviewCanaryBattery, messagingToneGate, outboundDedupGate, telemetryHeartbeat, pasteManager, featureRegistry, discoveryEvaluator, completionEvaluator, unifiedTrust, liveConfig, sharedStateLedger, ledgerSessionRegistry, worktreeManager, oidcEnrolledRepos: parallelDevConfig?.oidcEnrolledRepos, initiativeTracker, projectRoundRunner, projectDriftChecker, machineHeartbeat, machinePoolRegistry, ropeHealthMonitor, writeAdmission: writeAdmission ?? undefined, getInboundQueue: () => _inboundQueue, getMachineCoherence: () => _machineCoherenceSentinel, getSingleMachineFailoverGap: () => _singleMachineFailoverGap, getMissingLoginSession: () => _missingLoginSession, getSessionPoolFailoverRunner: () => _sessionPoolFailoverRunnerDriver?.status() ?? null, sessionPoolPromotionActivation: _sessionPoolPromotionActivation, meshRpcDispatcher, deliverA2aToMachine: _deliverA2aToMachine ?? undefined, workingSetPullCoordinator, workingSetArtifactManager, orchestratorPoller, commitmentReplicaStore, preferenceReplicaStore, replicatedRecordEmitter, conflictStore, rollbackUnmerge, droppedOriginRegistry, preferencesUnionReader, jevMemoryPicker, forwardCommitmentMutate, sessionOwnershipRegistry, sendDrain: _sendDrain ?? undefined, topicPinStore: _topicPinStore ?? undefined, topicPinSkewQuarantine: _topicPinSkewQuarantine ?? undefined, topicPinFoldView: _topicPinFoldView ?? undefined, ownershipReconciler: _ownershipReconciler ?? undefined, staleOwnerEngine: _staleOwnerEngine ?? undefined, duplicateReconciler: _duplicateReconciler ?? undefined, ownerDarkLadder: _ownerDarkLadder ?? undefined, spawnAdmission: _spawnAdmission ?? undefined, judgmentProvenance: _judgmentProvenance ?? undefined, leaseHandback: _leaseHandbackCtx ?? undefined, streamTicketStore: _streamTicketStore ?? undefined, poolStreamAllowRemoteInput: (config as { dashboard?: { poolStream?: { allowRemoteInput?: boolean } } }).dashboard?.poolStream?.allowRemoteInput ?? false, poolStreamConnector: _poolStreamConnector ?? undefined, secretSync: _secretSyncHandle ?? undefined, meshSelfId: _meshSelfId ?? undefined, resolveRouterUrl: _resolveRouterUrl ?? undefined, resolvePeerUrls: _resolvePeerUrls ?? undefined, guardRegistry, listPoolMachines: _listPoolMachines ?? undefined, deliverMandateToMachine: _deliverMandateToMachine ?? undefined, passkeyRevokeOutbox: _passkeyRevokeOutbox ? () => _passkeyRevokeOutbox! : undefined, passkeyPeerOnline: _passkeyPeerOnline, passkeyPoolReader: _passkeyPoolReader ? () => _passkeyPoolReader! : undefined, passkeyProofBrowser: async (profileDir: string) => { const { ChromeCdpReloginBrowser } = await import('../core/ChromeCdpReloginBrowser.js'); return new ChromeCdpReloginBrowser({ userDataDir: profileDir, passkeyMode: true, headless: true, launchTimeoutMs: 30_000, operationTimeoutMs: 20_000 }); }, poolLink: _poolLink ?? undefined, poolPollCache: _poolPollCache ?? undefined, sessionPoolE2EResultStore, proxyCoordinator, topicIntentStore, topicIntentArcCheck, usherSignalStore, intelligence: sharedIntelligence ?? undefined, telegramBridgeConfig, telegramBridge: telegramBridge ?? undefined, threadlineObservability, briefDeps, workingMemory, taskFlowRegistry, threadlineFlowBridge, sessionReaper, agentWorktreeReaper, externalHogSentinel, orphanedWorkSentinel, mcpProcessReaper, geminiLoopRunner, sleepController, agentActivityState, reapLog, resumeQueue, resumeDrainer, autonomousLivenessReconciler, enforcedTerminationStatus: () => enforcedTerminationWatchdog?.guardStatus() ?? null, prHandLease: prHandLease ?? undefined, standDownRegistry: _standDownRegistry ?? undefined, standDownAudit: _standDownAudit ?? undefined, operatorStopRecorder: recordOperatorStop, sleepWakeDetector, unjustifiedStopGate, stopGateDb, stopNotifier, liveTestGate, liveTestGateMode, liveTestRunnerCtx });    // Resolve the late-bound topic-operator getter (increment 2e): routing was
     const readIdentityProjectionPeerRows = async () => {
       const peers = _resolvePeerUrls?.() ?? [];
       const extra = (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
@@ -29979,6 +30103,9 @@ export async function startServer(options: StartOptions): Promise<void> {
         process.exit(1);
       }
       _shuttingDown = true;
+      if (localVerifyTimer) { clearInterval(localVerifyTimer); localVerifyTimer = null; }
+      try { localVerifyStatus?.stop(); } catch { /* best effort */ }
+      try { localVerifyService?.shutdown(); } catch { /* best effort: a restart re-queues lazily */ }
       if (dropSecondPassTimer) { clearTimeout(dropSecondPassTimer); dropSecondPassTimer = null; }
       // Hard deadline: the teardown below awaits many subsystems in sequence and
       // any one of them (an origin worker, a tunnel, a Threadline relay, a server
