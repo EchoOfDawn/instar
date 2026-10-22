@@ -1,4 +1,5 @@
 import { ORIGIN_LOCAL_GITIGNORE } from '../messaging/telegram-origin/OriginLocalPaths.js';
+import { poolReadSelectionAwareness } from './poolReadAwareness.js';
 import { originToolGuardHook } from '../messaging/telegram-origin/OriginToolGuard.js';
 /**
  * Post-Update Migrator — the "intelligence download" layer.
@@ -6954,6 +6955,14 @@ setTimeout(() => process.exit(0), 2000);
       }
     }
 
+    // peer-credential-guard-tailscale-coherence — a pool read's failure reasons
+    // changed meaning (peer-unreachable is new; the CGNAT refusal is now named).
+    if (!content.includes('cgnat-plaintext-unsupported')) {
+      content += '\n' + poolReadSelectionAwareness();
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added pool-read selection + failure-reason awareness');
+    }
+
     if (!content.includes('/telegram/system-topics')) {
       content += '\n' + telegramSystemTopicsAwareness();
       patched = true;
@@ -11976,6 +11985,12 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
     // sections preserve narrative ordering in the shadow.
     const markers = [
       '### Telegram message origin',
+      // peer-credential-guard-tailscale-coherence: a pool read's failure reasons
+      // are server-side and framework-neutral — a Codex/Gemini agent runs the
+      // same fan-out and must not report `url-rejected` and the new
+      // `peer-unreachable` interchangeably, nor promise an immediate fix for a
+      // dead-but-admissible rope.
+      'cgnat-plaintext-unsupported',
       // Hand-started Codex connect: the audience IS a Codex-framework operator, so
       // the AGENTS.md shadow must carry the command and the shared-entry caveat.
       '### Hand-started Codex: `instar codex connect <agent>`',
