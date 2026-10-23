@@ -228,11 +228,57 @@ describe('workspaces and the confined spawn', () => {
     expect(h.sessions.spawned).toHaveLength(0);
     expect(h.attentionExec.filter((a) => a.id.startsWith('feedback-execute:profile-unenforceable'))).toHaveLength(1);
     expect((await h.exec.refreshAvailability()).reason).toBe('profile-unenforceable');
-    // The latch clears after 24 h and the next attempt re-runs the canary.
+    // The first failure waits an hour (not a day); the next attempt re-runs the canary.
     h.runScript.fn = () => null;
-    h.now.value += 25 * 60 * 60_000;
+    h.now.value += 59 * 60_000;
+    expect((await h.exec.refreshAvailability()).reason).toBe('profile-unenforceable');
+    h.now.value += 2 * 60_000;
     h.fixWith({ 'src/thing.ts': 'x' });
     expect((await h.exec.tick()).started).toBe(1);
+  });
+
+  it('consecutive canary failures back off 1 h then 2 h, keep one Attention item per episode, and a pass resets the ladder', async () => {
+    h = await createExecHarness();
+    await h.workItem('c1');
+    await h.workItem('c2');
+    h.runScript.fn = (cmd) => (/^cat /.test(cmd.command) ? { exitCode: 0, stdout: 'leaked' } : null);
+    await h.exec.tick();
+    h.now.value += 61 * 60_000;
+    await h.exec.tick();
+    const latch = h.exec.summary().profileUnenforceable as { failures: number; until: number; episode: number };
+    expect(latch.failures).toBe(2);
+    expect(latch.until - h.now.value).toBe(2 * 60 * 60_000);
+    // Both failures raise under the same episode id, which the Attention queue folds into one item.
+    expect(new Set(h.attentionExec.filter((a) => a.id.startsWith('feedback-execute:profile-unenforceable')).map((a) => a.id)).size).toBe(1);
+    // Passing after the wait clears the latch; a later failure starts a fresh episode at one hour.
+    h.runScript.fn = () => null;
+    h.now.value += 2 * 60 * 60_000 + 60_000;
+    h.fixWith({ 'src/thing.ts': 'x' });
+    expect((await h.exec.tick()).started).toBe(2);
+    const cleared = h.exec.summary().profileUnenforceable;
+    expect(cleared).toMatchObject({ failures: 0, until: 0 });
+  });
+
+  it('a latch written under the old flat-day rule expires an hour after it was set', async () => {
+    h = await createExecHarness();
+    await h.workItem('c1');
+    // The old rule wrote { until: now + 24h } with no failure count, 90 minutes ago.
+    h.store.setMeta('exec:profile_unenforceable', JSON.stringify({ until: h.now.value - 90 * 60_000 + 24 * 60 * 60_000, episode: 1, failed: ['session-ran-every-probe'] }));
+    h.fixWith({ 'src/thing.ts': 'x' });
+    expect((await h.exec.refreshAvailability()).reason).toBe('ok');
+    expect((await h.exec.tick()).started).toBe(1);
+  });
+
+  it('a canary session that ends without its report records what its screen last showed', async () => {
+    h = await createExecHarness();
+    await h.workItem('c1');
+    h.sessions.canaryReport.fn = () => { /* the session wrote nothing */ };
+    h.sessions.canaryTranscript.fn = () => null;
+    h.sessions.canaryTail.value = '\u001b[31mLogin expired\u001b[0m\n\nPlease run /login\n';
+    await h.exec.tick();
+    expect(h.execStore.all()[0]).toMatchObject({ state: 'stopped', reason: 'profile-unenforceable' });
+    const latch = h.exec.summary().profileUnenforceable as { failedDetail: Array<{ probe: string; detail: string }> };
+    expect(latch.failedDetail.find((d) => d.probe === 'session-last-screen')?.detail).toBe('screen: Login expired | Please run /login');
   });
 
   it('a session-path canary that skipped a probe fails closed', async () => {

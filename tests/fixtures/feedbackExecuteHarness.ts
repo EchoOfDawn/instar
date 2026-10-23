@@ -46,7 +46,7 @@ export interface ExecHarness extends Harness {
   runScript: { fn: (cmd: ConfinedCommand) => Partial<ConfinedResult> | null };
   runnerAvailable: { value: boolean };
   deps: { ok: boolean; ensureCalls: number };
-  sessions: { alive: Set<string>; spawned: Array<{ name: string; prompt: string; cwd: string; settingsPath?: string; trusted: boolean }>; behavior: { fn: (workspace: string, prompt: string) => void }; stopped: string[]; remoteStops: Array<{ machine: string; name: string }>; canaryReport: { fn: ((reportPath: string, workspace: string, prompt: string) => void) | null };
+  sessions: { alive: Set<string>; spawned: Array<{ name: string; prompt: string; cwd: string; settingsPath?: string; trusted: boolean }>; behavior: { fn: (workspace: string, prompt: string) => void }; stopped: string[]; remoteStops: Array<{ machine: string; name: string }>; canaryReport: { fn: ((reportPath: string, workspace: string, prompt: string) => void) | null }; canaryTail: { value: string | null };
     /** The canary session's transcript lines (default: one tool result per step plus the report, no nonce). */
     canaryTranscript: { fn: ((prompt: string) => string[] | null) | null }; claudeHome: string };
   attentionExec: AttentionInput[];
@@ -106,7 +106,7 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
   h.runnerAvailable = { value: true };
   h.deps = { ok: true, ensureCalls: 0 };
   h.attentionExec = [];
-  h.sessions = { alive: new Set(), spawned: [], behavior: { fn: () => {} }, stopped: [], remoteStops: [], canaryReport: { fn: null }, canaryTranscript: { fn: null }, claudeHome: path.join(base.dir, 'claude-home') };
+  h.sessions = { alive: new Set(), spawned: [], behavior: { fn: () => {} }, stopped: [], remoteStops: [], canaryReport: { fn: null }, canaryTail: { value: null }, canaryTranscript: { fn: null }, claudeHome: path.join(base.dir, 'claude-home') };
 
   const git: AttemptGit = {
     fetchBase: async () => BASE_SHA,
@@ -189,6 +189,8 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(path.join(dir, `${sessionUuid}.jsonl`), `${lines.join('\n')}\n`);
         }
+        // A canary session that shows a screen stays alive for one poll, then ends (captureTail below).
+        if (h.sessions.canaryTail.value !== null) h.sessions.alive.add(`tmux-${input.name}`);
         return { sessionName: `tmux-${input.name}`, sessionId: `uuid-${input.name}`, transcript: { configHome: h.sessions.claudeHome, sessionUuid } };
       }
       h.sessions.alive.add(`tmux-${input.name}`);
@@ -204,6 +206,11 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
     stop: async (name) => { h.sessions.stopped.push(name); h.sessions.alive.delete(name); return true; },
     remoteStop: async (machine, name) => { h.sessions.remoteStops.push({ machine, name }); return true; },
     frameworkVersion: async () => '2.1.295 (Claude Code)',
+    captureTail: async (name) => {
+      if (!name.startsWith('tmux-feedback-canary-')) return null;
+      h.sessions.alive.delete(name);
+      return h.sessions.canaryTail.value;
+    },
   };
   h.execStore = new FeedbackExecuteStore(h.drain, h.store, { clock: () => h.now.value });
   h.exec = new FeedbackExecutorService({

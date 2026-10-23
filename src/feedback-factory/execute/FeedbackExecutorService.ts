@@ -30,7 +30,7 @@ import { governor } from '../../monitoring/selfaction/governor.js';
 import type { DerivedTarget } from '../../monitoring/selfaction/types.js';
 import { FeedbackExecuteStore, OPEN_PR_STATES, type ExecutionRow, type ExecutionState } from './FeedbackExecuteStore.js';
 import {
-  CONFINED_COMMAND_TIMEOUT_MS, DAY_MS, HOUR_MS, DEPS_RETRY_LADDER_MS, EVIDENCE_FILE, EXECUTE_TICK_MIN_INTERVAL_MS, EXECUTION_LEASE_MS, HOLD_LABEL,
+  CANARY_RETRY_LADDER_MS, CONFINED_COMMAND_TIMEOUT_MS, DAY_MS, HOUR_MS, DEPS_RETRY_LADDER_MS, EVIDENCE_FILE, EXECUTE_TICK_MIN_INTERVAL_MS, EXECUTION_LEASE_MS, HOLD_LABEL,
   MERGE_ARMED_DEADLINE_MS, MERGE_RETRY_DELAY_MS, SANDBOX_RUNTIME_VERSION, VERIFY_QUIET_MS, WORKSPACE_DISK_CAP_BYTES,
   buildClaudeSandboxSettings, buildSandboxRuntimeSettings, confinedEnv, pathSlug, publishFork, safeSlug, type ConfinementPaths, type ExecuteLiveConfig,
 } from './executePolicy.js';
@@ -56,6 +56,12 @@ export const FEEDBACK_EXECUTE_STAGE = {
 const feedbackExecuteGovernor = governor.for('feedback-execute');
 function deriveTargetKey(initiativeId: string): DerivedTarget { return { key: `feedback-execute:${initiativeId}`, classId: 'feedback-execute', keyIsVolatile: false }; }
 
+/** The end of a pane capture as one short line (ANSI removed, blank lines dropped); scrubbed again before it is stored. */
+export function summarizeTail(tail: string): string {
+  const text = tail.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').split('\n').map((l) => l.trim()).filter(Boolean).join(' | ').replace(/\s+/g, ' ');
+  return `screen: ${text.slice(-260)}`;
+}
+
 export interface ConfinedSessionPort {
   /** Spawn the CONFINED build or canary session (claude-code adapter, omitAuthEnv, cwd under .worktrees). */
   spawnConfined(input: { name: string; prompt: string; cwd: string; settingsPath: string; tmpDir: string; maxDurationMinutes: number }): Promise<{
@@ -73,6 +79,8 @@ export interface ConfinedSessionPort {
   remoteStop(machineId: string, sessionName: string, sessionUuid: string | null): Promise<boolean>;
   /** The confined framework's version (the canary stamps it); null when unreadable. */
   frameworkVersion(): Promise<string | null>;
+  /** The last lines of a live session's pane, or null. The canary keeps the latest one so a session that dies before writing its report still says what it showed. */
+  captureTail?(sessionName: string): Promise<string | null>;
 }
 
 /** Consecutive saturated admission checks before one degradation report (12 × 30 min ≈ 6 h). */
@@ -248,8 +256,12 @@ export class FeedbackExecutorService {
     if (!independence.independent && !accepted) return out('approver-not-independent', extra);
     const runner = this.opts.runner.available();
     if (!runner.ok) return out('profile-unenforceable', extra);
-    const latch = this.metaJson<{ until: number }>('exec:profile_unenforceable');
-    if (latch && latch.until > at) return out('profile-unenforceable', extra);
+    const latch = this.metaJson<{ until: number; failures?: number }>('exec:profile_unenforceable');
+    // A latch written under the old flat-day rule carries no failure count; read it as one failure
+    // on the ladder (the day it asked for was set at until - DAY_MS) so a deploy does not keep an
+    // already-stale stop for the rest of its day.
+    const latchUntil = latch ? (latch.failures === undefined ? Math.min(latch.until, latch.until - DAY_MS + CANARY_RETRY_LADDER_MS[0]) : latch.until) : 0;
+    if (latch && latchUntil > at) return out('profile-unenforceable', extra);
     const deps = this.metaJson<{ nextRetryAt: number; failures: number }>('exec:deps');
     if (deps && deps.failures > 0 && deps.nextRetryAt > at) return out('deps-unavailable', extra);
     // Publication goes through a fork only (CI on a same-repository branch would run with the
@@ -592,7 +604,10 @@ export class FeedbackExecutorService {
       const reason = error instanceof DrainConflictError ? 'stale-epoch'
         : error instanceof RerouteRefusedError ? 'reroute-capacity'
         : error instanceof Error && /^(confinement|omit-auth-env|profile-unenforceable)/.test(error.message) ? 'profile-unenforceable' : 'prepare-failed';
-      this.opts.audit.append('execute:prepare-failed', { attemptId: row.attemptId, reason, error: error instanceof Error ? error.name : 'unknown' });
+      // The message says which step failed (clone, deps, symlink, …); without it every failure read "Error".
+      const message = error instanceof Error ? scrubForStore(error.message, { maxBytes: 2048 }) : null;
+      this.opts.audit.append('execute:prepare-failed', { attemptId: row.attemptId, reason, error: error instanceof Error ? error.name : 'unknown',
+        detail: message ? (message.error ? '[detail withheld: scrub failed]' : message.text.slice(0, 300)) : null });
       // Under a stale epoch every write below is refused; the new owner ends the row.
       if (reason === 'stale-epoch') return false;
       try {
@@ -657,9 +672,19 @@ export class FeedbackExecutorService {
         const spawned = await this.opts.sessions.spawnConfined({ name: `feedback-canary-${pathSlug(row.initiativeId)}-a${row.attempt}`, prompt: sessionCanaryPrompt(paths, fixture, reportPath),
           cwd: paths.workspace, settingsPath, tmpDir: paths.tmpDir, maxDurationMinutes: 10 });
         canarySession = spawned.sessionName;
-        await this.waitForSession(spawned.sessionName, this.opts.sessionWaitMs ?? 10 * 60_000);
+        let lastTail: string | null = null;
+        await this.waitForSession(spawned.sessionName, this.opts.sessionWaitMs ?? 10 * 60_000, async () => {
+          const tail = await this.opts.sessions.captureTail?.(spawned.sessionName).catch(() => null); // @silent-fallback-ok: the tail is diagnostic only
+          if (tail && tail.trim()) lastTail = tail;
+        });
         canarySession = null;
-        probes.push(...evaluateSessionCanary(paths, fixture, reportPath, findSessionTranscript(spawned.transcript ?? null)));
+        const sessionProbes = evaluateSessionCanary(paths, fixture, reportPath, findSessionTranscript(spawned.transcript ?? null));
+        probes.push(...sessionProbes);
+        // A session that never wrote its report (it exited at startup, sat at a prompt, …) left no
+        // other evidence: record what its screen last showed. It is already a failure; this says why.
+        if (sessionProbes.some((p) => p.probe === 'session-ran-every-probe' && !p.ok)) {
+          probes.push({ probe: 'session-last-screen', expect: 'succeed', ok: false, detail: lastTail ? summarizeTail(lastTail) : 'no screen captured (the session ended before the first check)' });
+        }
         // The must-succeed probes leave two marker files in the workspace; they are not part of any change set.
         for (const marker of [`.feedback-canary-ok-${fixture.nonce}`, `.feedback-canary-bash-${fixture.nonce}`]) {
           try { removeAttemptTree(path.join(paths.workspace, marker), this.trashRoot(), 'feedback-execute canary marker cleanup'); } catch (error) {
@@ -676,13 +701,18 @@ export class FeedbackExecutorService {
     const epoch = this.opts.ownerEpoch();
     this.setMeta(epoch, 'exec:canary_last', { at: this.now(), ok: verdict.ok, stamp, frameworkVersion, sandboxRuntimeVersion: SANDBOX_RUNTIME_VERSION, failed: probes.filter((p) => !p.ok).map((p) => p.probe) });
     if (verdict.ok && !fullGateDone) this.setMeta(epoch, 'exec:canary_full_gate', { stamp, at: this.now() });
+    if (verdict.ok) {
+      const latch = this.metaJson<{ episode: number; failures?: number }>('exec:profile_unenforceable');
+      if (latch && (latch.failures ?? 1) > 0) this.setMeta(epoch, 'exec:profile_unenforceable', { until: 0, episode: latch.episode, failures: 0, clearedAt: this.now() });
+    }
     this.opts.audit.append('execute:canary', { attemptId: row.attemptId, ok: verdict.ok, failed: probes.filter((p) => !p.ok).map((p) => p.probe) });
     return verdict;
   }
 
-  private async waitForSession(sessionName: string, maxMs: number): Promise<boolean> {
+  private async waitForSession(sessionName: string, maxMs: number, onPoll?: () => Promise<void>): Promise<boolean> {
     const deadline = this.now() + maxMs;
     while (this.opts.sessions.isAlive(sessionName)) {
+      if (onPoll) await onPoll();
       if (this.now() >= deadline) { await this.opts.sessions.stop(sessionName); return false; }
       await this.sleep(5_000);
     }
@@ -690,8 +720,12 @@ export class FeedbackExecutorService {
   }
 
   private async profileUnenforceable(epoch: number, probes: CanaryProbeResult[]): Promise<void> {
-    const existing = this.metaJson<{ until: number; episode: number }>('exec:profile_unenforceable');
-    const episode = existing && existing.until > this.now() - DAY_MS ? existing.episode : (existing?.episode ?? 0) + 1;
+    const existing = this.metaJson<{ until: number; episode: number; failures?: number }>('exec:profile_unenforceable');
+    // An episode runs from the first failure to the next pass; a pass sets failures back to 0.
+    const continuing = existing !== null && (existing.failures ?? 1) > 0;
+    const episode = continuing ? existing!.episode : (existing?.episode ?? 0) + 1;
+    const failures = continuing ? (existing!.failures ?? 1) + 1 : 1;
+    const retryInMs = CANARY_RETRY_LADDER_MS[Math.min(failures - 1, CANARY_RETRY_LADDER_MS.length - 1)];
     // Record WHY, not just which. A probe failure here is a 24h stop no route can clear, and the
     // canary report that explains it is deleted with the attempt tree — so without this the cause is
     // unrecoverable after the fact (it cost a full manual repro on 2026-10-21). Bounded and scrubbed:
@@ -700,13 +734,13 @@ export class FeedbackExecutorService {
       const scrubbed = scrubForStore(p.detail, { maxBytes: 2048 });
       return { probe: p.probe, detail: scrubbed.error ? '[detail withheld: scrub failed]' : scrubbed.text.slice(0, 300) };
     });
-    this.setMeta(epoch, 'exec:profile_unenforceable', { until: this.now() + DAY_MS, episode, failed: probes.filter((p) => !p.ok).map((p) => p.probe), failedDetail });
+    this.setMeta(epoch, 'exec:profile_unenforceable', { until: this.now() + retryInMs, episode, failures, failed: probes.filter((p) => !p.ok).map((p) => p.probe), failedDetail });
     this.availability = null;
     await this.attention({
       id: `feedback-execute:profile-unenforceable:${episode}`,
       title: 'Feedback executor stopped: sandbox check failed',
       summary: 'The sandbox check before a feedback fix attempt did not hold, so no attempts will start.',
-      description: `Failed checks: ${probes.filter((p) => !p.ok).map((p) => p.probe).join(', ') || 'unknown'}. The executor retries the check in 24 hours. Triage is unaffected.`,
+      description: `Failed checks: ${probes.filter((p) => !p.ok).map((p) => p.probe).join(', ') || 'unknown'}. The executor runs the check again in ${Math.round(retryInMs / HOUR_MS)} hour(s), then waits longer after each further failure (up to a day); a pass resumes fix attempts. Triage is unaffected.`,
       category: 'monitoring', priority: 'HIGH', sourceContext: 'feedback-execute:profile-unenforceable',
     });
   }

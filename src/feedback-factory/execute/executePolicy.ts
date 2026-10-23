@@ -37,6 +37,12 @@ export const MERGE_RETRY_DELAY_MS = HOUR_MS;
 export const VERIFY_QUIET_MS = 30 * DAY_MS;
 /** Dependency install retry ladder (§4 step 3). */
 export const DEPS_RETRY_LADDER_MS = [30 * 60_000, HOUR_MS, 4 * HOUR_MS] as const;
+/**
+ * After a failed confinement canary, how long until the next attempt may run it again, by consecutive
+ * failure. Running the canary is itself safe (it is the check, and no fix attempt starts unless it
+ * passes), so a fixed day-long stop only delayed the evidence. A pass resets the ladder.
+ */
+export const CANARY_RETRY_LADDER_MS = [HOUR_MS, 2 * HOUR_MS, 4 * HOUR_MS, 8 * HOUR_MS, DAY_MS] as const;
 /** The summary must show deps-unavailable within this long. */
 export const DEPS_STATUS_LATENCY_MS = 300_000;
 export const EXECUTE_TICK_MIN_INTERVAL_MS = 30_000;
