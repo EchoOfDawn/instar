@@ -78,6 +78,13 @@ export interface ExecuteLiveConfig {
    * to publish (`publish-fork-unset`).
    */
   publishRepo: string | null;
+  /**
+   * Who admits a fix PR to merge. `independent` (the default, operator directive 2026-10-21 /
+   * 2026-10-23, topic 18330): a cross-family reviewer AND the Claude clean-door reviewer both pass
+   * the exact head; the owner's own GitHub approval still admits on its own, and CODEOWNERS-owned
+   * paths always wait for their owner. `operator`: the original rule, the owner's approval only.
+   */
+  reviewGate: 'independent' | 'operator';
   actionTopicId?: number;
 }
 
@@ -110,6 +117,7 @@ export function resolveExecuteConfig(raw: Record<string, unknown> | undefined, a
     baseSmokeTests: smoke && smoke.length > 0 ? smoke : [...EXECUTE_CONFIG_DEFAULTS.baseSmokeTests],
     maxDurationMinutes: int(raw?.maxDurationMinutes, EXECUTE_CONFIG_DEFAULTS.maxDurationMinutes, 10, EXECUTION_LEASE_MS / 60_000),
     publishRepo: publish,
+    reviewGate: raw?.reviewGate === 'operator' ? 'operator' : 'independent',
     ...(Number.isSafeInteger(topic) && topic !== 0 ? { actionTopicId: topic } : {}),
   };
 }

@@ -38,7 +38,8 @@ import {
   ChangeSetError, applyChangeSet, buildChangeSet, checkSpecDraft, secretGate, sourcePaths, testEntries, toolingPathsTouched, type ChangeEntry, type ChangeSet,
 } from './changeSet.js';
 import { buildExecutorPrompt, classifyBaseFailure, readSessionResult, relativeImports, shq, testNamePattern, type SessionResult } from './executorSession.js';
-import { approvedAtHead, approvedSha, approverIndependence, codeownersOutsideApprover, deriveApprover, mapSafeMergeExit, type AgentIdentityFacts } from './reviewGate.js';
+import { approvedAtHead, approvedSha, approverIndependence, codeownersOutsideApprover, codeownersOwned, deriveApprover, mapSafeMergeExit, type AgentIdentityFacts } from './reviewGate.js';
+import { REVIEW_DIFF_MAX_BYTES, buildExecutorReviewPrompt, judgeIndependentReview, renderReviewComment, reviewRefusalIsAboutTheChange, type IndependentReviewVerdict, type ReviewerOutcome } from './independentReview.js';
 import { DegradationReporter } from '../../monitoring/DegradationReporter.js';
 import { RerouteRefusedError } from '../../core/rerouteRefusedError.js';
 import { canaryStamp, evaluateSessionCanary, findSessionTranscript, prepareCanaryFixture, prepareSessionLinkProbe, runRunnerCanary, sessionCanaryPrompt, verdictOf, type CanaryProbeResult } from './confinementCanary.js';
@@ -75,6 +76,11 @@ export interface ConfinedSessionPort {
   frameworkVersion(): Promise<string | null>;
 }
 
+/** Runs the independent reviewers over one prompt (one outcome per family that was asked). */
+export interface IndependentReviewPort {
+  run(input: { prompt: string }): Promise<ReviewerOutcome[]>;
+}
+
 /** Consecutive saturated admission checks before one degradation report (12 × 30 min ≈ 6 h). */
 export const REROUTE_SATURATION_REPORT_TICKS = 12;
 
@@ -107,6 +113,8 @@ export interface FeedbackExecutorServiceOptions {
   runner: ConfinedRunner;
   deps: DepsCachePort;
   sessions: ConfinedSessionPort;
+  /** The independent review gate's reviewers; absent → no PR is admitted without the owner's approval. */
+  review?: IndependentReviewPort;
   admission: ExecutorAdmission;
   identityFacts: () => Omit<AgentIdentityFacts, 'agentGithubLogin' | 'agentGithubAccounts'>;
   /** Ranked `work` items (the triage queue order). */
@@ -1215,8 +1223,12 @@ export class FeedbackExecutorService {
     const reviews = await this.opts.github.reviews(slug, prNumber);
     if (!reviews) { this.opts.audit.append('execute:gh-unknown', { attemptId: row.attemptId, pr: prNumber, what: 'reviews' }); return; }
     const verdict = approvedAtHead(reviews, approver, pr.headRefOid);
-    if (!verdict.approved) return;
-    if (!row.gradedApproval) {
+    // The owner's approval of this head admits on its own. Otherwise, under the independent gate,
+    // a cross-family reviewer and the Claude reviewer both passing this head admits it.
+    let admittedBy: 'operator' | 'independent' | null = verdict.approved ? 'operator' : null;
+    if (!admittedBy && this.opts.config().reviewGate === 'independent') admittedBy = await this.independentAdmission(row, epoch, slug, prNumber, pr.headRefOid);
+    if (!admittedBy) return;
+    if (admittedBy === 'operator' && !row.gradedApproval) {
       this.gradeLatestDecision(epoch, row.initiativeId, 'executor-operator-approved', 'right', 'medium');
       this.opts.store.patch(epoch, row.attemptId, { gradedApproval: true });
     }
@@ -1244,6 +1256,85 @@ export class FeedbackExecutorService {
       return;
     }
     await this.mergeRefused(this.opts.store.get(row.attemptId)!, epoch, merge.reason);
+  }
+
+  /**
+   * The independent review gate (§4 step 9, amended 2026-10-23). Judges each head once: a pass is
+   * remembered for that head; a refusal about the CHANGE (serious findings, an unparseable reply,
+   * a diff too large to read) is written on the PR and holds the item (listed once); a refusal
+   * because a reviewer was away is retried after the merge-retry delay. The owner's approval at
+   * the head still admits either way (the operator branch runs first). A path CODEOWNERS assigns
+   * to someone else is never admitted here: that owner's GitHub review is required.
+   */
+  private async independentAdmission(row: ExecutionRow, epoch: number, slug: string, prNumber: number, headSha: string): Promise<'independent' | null> {
+    if (row.codeownersOutside.length > 0) return null;
+    if (row.reviewSha === headSha) return row.reviewVerdict === 'pass' ? 'independent' : null;
+    // A reviewer was away last time: a structurally absent family (unavailable) is asked again daily,
+    // a failing one (degraded) after the merge-retry delay — never every tick.
+    if (row.reviewVerdict === 'retry' && row.reviewedAt !== null) {
+      const wait = (row.reviewReason ?? '').endsWith('-unavailable') ? DAY_MS : MERGE_RETRY_DELAY_MS;
+      if (this.now() - row.reviewedAt < wait) return null;
+    }
+    // A code-owned PR waits for its owner; its file list is re-read on the retry cadence, not every tick.
+    if (row.reviewReason === 'codeowners-owned' && row.reviewedAt !== null && this.now() - row.reviewedAt < MERGE_RETRY_DELAY_MS) return null;
+    if (!this.opts.review) return null;
+    const files = await this.opts.github.prFiles(slug, prNumber);
+    if (files === null) { this.opts.audit.append('execute:gh-unknown', { attemptId: row.attemptId, pr: prNumber, what: 'files' }); return null; }
+    // A path CODEOWNERS assigns to anyone (on the canonical repository: the constitution) is never
+    // admitted by the reviewers; that owner's GitHub review is required (GitHub enforces the same).
+    const owned = codeownersOwned(this.readSourceCodeowners(), files);
+    if (owned.length > 0) {
+      if (row.reviewReason !== 'codeowners-owned') this.opts.store.patch(epoch, row.attemptId, { reviewSha: null, reviewVerdict: null, reviewReason: 'codeowners-owned', reviewedAt: this.now() });
+      return null;
+    }
+    const diff = await this.opts.github.prDiff(slug, prNumber);
+    if (diff === null) { this.opts.audit.append('execute:gh-unknown', { attemptId: row.attemptId, pr: prNumber, what: 'diff' }); return null; }
+    let outcome: IndependentReviewVerdict;
+    if (Buffer.byteLength(diff, 'utf8') > REVIEW_DIFF_MAX_BYTES) outcome = { pass: false, reason: 'diff-too-large', reviewers: [] };
+    else {
+      const triage = this.opts.triageStore.get(row.initiativeId);
+      const prompt = buildExecutorReviewPrompt({
+        prNumber, headSha, summary: triage?.summary ?? '', brief: triage?.brief ?? { component: '', symptom: '', expected: '', reproduction: '' }, changedPaths: files, diff,
+      });
+      let reviewers: ReviewerOutcome[];
+      try { reviewers = await this.opts.review.run({ prompt }); } catch (error) {
+        // A throwing reviewer port is a degraded reviewer (every family, the cross-family one
+        // included), never an aborted tick for every later row.
+        reviewers = [{ family: 'review-port', model: null, status: 'degraded', verdict: null, crossFamily: true, reason: error instanceof Error ? error.name : 'threw', body: null }];
+      }
+      outcome = { ...judgeIndependentReview(reviewers), reviewers };
+    }
+    this.opts.audit.append('execute:independent-review', { attemptId: row.attemptId, pr: prNumber, head: headSha, pass: outcome.pass, reason: outcome.reason,
+      reviewers: outcome.reviewers.map((r) => ({ family: r.family, model: r.model, status: r.status, verdict: r.verdict })) });
+    if (outcome.pass) {
+      this.opts.store.patch(epoch, row.attemptId, { reviewSha: headSha, reviewVerdict: 'pass', reviewReason: outcome.reason, reviewedAt: this.now() });
+      this.gradeLatestDecision(epoch, row.initiativeId, 'executor-independent-review-passed', 'right', 'weak');
+      return 'independent';
+    }
+    if (!reviewRefusalIsAboutTheChange(outcome.reason)) {
+      // A reviewer was away: not the change's fault, and not a verdict on this head. The owner's
+      // approval is unaffected (no merge-retry delay is set); the reviewers are asked again later.
+      this.opts.store.patch(epoch, row.attemptId, { reviewSha: null, reviewVerdict: 'retry', reviewReason: outcome.reason, reviewedAt: this.now() });
+      if (outcome.reason.endsWith('-unavailable')) {
+        this.opts.reportDegradation({ feature: 'feedback-execute:reviewer-unavailable', primary: 'Independent review of a feedback fix PR', fallback: 'The PR waits for the owner\'s approval; the reviewers are asked again in 24 h',
+          reason: outcome.reason, impact: `Fix PR #${prNumber} is not merged until a reviewer family is available or the owner approves it.` });
+      }
+      return null;
+    }
+    // A refusal about the change: say why on the PR and keep the row OPEN under the gate, so the
+    // owner's approval, a new push (reviewed afresh) and a hand-merge all still land. Judged once
+    // per head: the reviewSha short-circuit above never re-asks for this head.
+    const commented = await this.opts.github.comment(slug, prNumber, renderReviewComment(outcome, headSha));
+    if (!commented) this.opts.audit.append('execute:gh-unknown', { attemptId: row.attemptId, pr: prNumber, what: 'comment' });
+    this.opts.store.patch(epoch, row.attemptId, { reviewSha: headSha, reviewVerdict: 'fail', reviewReason: outcome.reason, reviewedAt: this.now(), reason: `review-failed:${outcome.reason}` });
+    return null;
+  }
+
+  /** `.github/CODEOWNERS` of the canonical checkout (the base the PR targets); null when absent or unreadable. */
+  private readSourceCodeowners(): string | null {
+    const repo = this.opts.config().sourceRepoPath;
+    if (!repo) return null;
+    try { return fs.readFileSync(path.join(repo, '.github', 'CODEOWNERS'), 'utf8'); } catch { return null; } // @silent-fallback-ok: no CODEOWNERS file → no owned paths
   }
 
   /** merge-refused: disarm; retried once after 1 h; then hold merge-unavailable (listed once in the action list). */
@@ -1521,8 +1612,16 @@ export class FeedbackExecutorService {
     for (const row of this.opts.store.all()) {
       const prLink = row.prNumber && slug ? `https://github.com/${slug}/pull/${row.prNumber}/files` : link;
       if ((row.state === 'pr-open' || row.state === 'spec-pr-open') && row.headSha) {
+        const kind = row.state === 'spec-pr-open' ? 'Spec draft' : 'Fix';
         const owners = row.codeownersOutside.length > 0 ? ` (CODEOWNERS also needs another owner for ${row.codeownersOutside.slice(0, 3).join(', ')})` : '';
-        items.push({ line: `${row.state === 'spec-pr-open' ? 'Spec draft' : 'Fix'} PR #${row.prNumber} awaits your approval${owners}: ${prLink}`, metaKey: `action_list:exec:pr:${row.attemptId}:${row.headSha}` });
+        const key = `action_list:exec:pr:${row.attemptId}:${row.headSha}`;
+        if (row.reviewVerdict === 'fail' && row.reviewSha === row.headSha) {
+          items.push({ line: `${kind} PR #${row.prNumber} did not pass the independent review (${row.reviewReason ?? 'refused'}); the reasons are on the PR. Approve it on GitHub to merge it anyway, push a fix, or close it: ${prLink}`, metaKey: `${key}:review-failed` });
+        } else if (row.reviewVerdict === 'retry') {
+          items.push({ line: `${kind} PR #${row.prNumber} is waiting for a reviewer (${row.reviewReason ?? 'unavailable'}); your approval on GitHub merges it now: ${prLink}`, metaKey: `${key}:review-waiting` });
+        } else if (row.reviewVerdict !== 'pass') {
+          items.push({ line: `${kind} PR #${row.prNumber} awaits your approval${owners}: ${prLink}`, metaKey: key });
+        }
       }
       if (row.state === 'held' && row.reason === 'needs-review-secret-shape') {
         items.push({ line: `A feedback fix is held because some files look like they contain a secret: ${row.secretFiles.slice(0, 5).join(', ')}. Review and publish with your PIN, or leave it: ${link}`, metaKey: `action_list:exec:secret:${row.attemptId}` });
