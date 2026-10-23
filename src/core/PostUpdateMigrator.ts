@@ -1,5 +1,6 @@
 import { ORIGIN_LOCAL_GITIGNORE } from '../messaging/telegram-origin/OriginLocalPaths.js';
 import { poolReadSelectionAwareness } from './poolReadAwareness.js';
+import { peerHomebaseAwareness } from './peerHomebaseAwareness.js';
 import { originToolGuardHook } from '../messaging/telegram-origin/OriginToolGuard.js';
 /**
  * Post-Update Migrator — the "intelligence download" layer.
@@ -7047,6 +7048,17 @@ setTimeout(() => process.exit(0), 2000);
       result.upgraded.push('CLAUDE.md: added pool-read selection + failure-reason awareness');
     }
 
+    // peer-conversation-homebase-topic — where a peer agent's notices go.
+    // Its OWN sniff string, deliberately: nesting it under the pool-read guard above would
+    // mean an agent that already received that card could never receive this one, which is
+    // the Migration Parity defect the standard exists to prevent (a feature that only
+    // reaches new agents is a broken feature).
+    if (!content.includes('per-peer homebase topic')) {
+      content += '\n' + peerHomebaseAwareness();
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added per-peer homebase topic awareness');
+    }
+
     if (!content.includes('/telegram/system-topics')) {
       content += '\n' + telegramSystemTopicsAwareness();
       patched = true;
@@ -12428,6 +12440,12 @@ Two layers keep my machine-to-machine \"ropes\" (Tailscale / LAN / Cloudflare) h
       // Codex/Gemini agent seeing a negative topicId must know it is a minted
       // conversation id resolvable at GET /conversations/:id, or it will guess.
       '### Durable Conversation Identity',
+      // peer-conversation-homebase-topic: a paired peer's notices land in a
+      // specific topic, and the binding-provenance rule (an operator's choice is
+      // never overridden, an unknown one is preserved) is framework-neutral. A
+      // Codex/Gemini agent without this keeps reporting "I passed it on" while
+      // posting where the operator has no reason to look — the founding incident.
+      '### Where a peer agent\'s notices go (per-peer homebase topic)',
     ];
     // Some mirrored capabilities are nested bullets rather than standalone
     // sections. These sentinels bound their slice without themselves becoming
