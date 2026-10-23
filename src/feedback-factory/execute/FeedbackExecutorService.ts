@@ -45,7 +45,7 @@ import { canaryStamp, evaluateSessionCanary, findSessionTranscript, prepareCanar
 import { treeBytes, type ConfinedRunner } from './ConfinedRunner.js';
 import type { DepsCachePort } from './depsCache.js';
 import type { AttemptGit, GitHubGateway } from './executorPorts.js';
-import { removeAttemptTree, sweepTrash } from './attemptFs.js';
+import { SHORT_ATTEMPT_TMP_RE, ensurePrivateAttemptTmpDir, removeAttemptTree, shortAttemptTmpDir, shortTmpRealRoot, sweepTrash } from './attemptFs.js';
 
 export const FEEDBACK_EXECUTE_STAGE = {
   canonicalPipelineId: 'feedback-factory',
@@ -526,7 +526,9 @@ export class FeedbackExecutorService {
 
   attemptPaths(row: Pick<ExecutionRow, 'initiativeId' | 'attempt'>): { workspace: string; publishClone: string; baseClone: string; headClone: string; gateClone: string; tmpDir: string; reviewDir: string } {
     const base = path.join(this.opts.paths.agentHome, '.worktrees', `feedback-${pathSlug(row.initiativeId)}-a${row.attempt}`);
-    return { workspace: base, publishClone: `${base}-publish`, baseClone: `${base}-base`, headClone: `${base}-head`, gateClone: `${base}-gate`, tmpDir: `${base}-tmp`, reviewDir: `${base}-review` };
+    // tmpDir is short and real on purpose (see shortAttemptTmpDir): under the agent home it is
+    // too long for Claude Code's sandbox temp override, and every confined Bash call exits 1.
+    return { workspace: base, publishClone: `${base}-publish`, baseClone: `${base}-base`, headClone: `${base}-head`, gateClone: `${base}-gate`, tmpDir: shortAttemptTmpDir(row.initiativeId, row.attempt), reviewDir: `${base}-review` };
   }
 
   private executeStateDir(): string { return path.join(this.opts.paths.stateDir, 'state', 'feedback-factory', 'execute'); }
@@ -564,7 +566,7 @@ export class FeedbackExecutorService {
       this.setMeta(epoch, `exec:attempt-deps:${row.attemptId}`, { hash: deps.hash });
       await this.opts.git.createClone(cfg.sourceRepoPath!, p.workspace, baseSha);
       await this.opts.git.createClone(cfg.sourceRepoPath!, p.publishClone, baseSha);
-      fs.mkdirSync(p.tmpDir, { recursive: true, mode: 0o700 });
+      ensurePrivateAttemptTmpDir(p.tmpDir, this.trashRoot());
       // No project hooks or settings may load in the confined session: .claude/ is removed (and write-denied).
       removeAttemptTree(path.join(p.workspace, '.claude'), this.trashRoot(), 'feedback-execute strip workspace .claude');
       fs.symlinkSync(path.join(deps.dir, 'node_modules'), path.join(p.workspace, 'node_modules'), 'dir');
@@ -1068,6 +1070,18 @@ export class FeedbackExecutorService {
         const full = path.join(dir, name);
         try { if (fs.statSync(full).mtimeMs < cutoff) removeAttemptTree(full, this.trashRoot(), 'feedback-execute scratch retention'); } catch { /* @silent-fallback-ok: retried next tick */ }
       }
+    }
+    // Attempt temp directories live under the system temp root (shortAttemptTmpDir), outside the
+    // .worktrees sweep above: a crash between spawn and cleanup leaves one behind. Only our own
+    // shape is touched, and only when no recorded attempt still maps to it.
+    const live = new Set(this.opts.store.inStates('claimed', 'running', 'verifying').map((r) => shortAttemptTmpDir(r.initiativeId, r.attempt)));
+    const root = shortTmpRealRoot();
+    let scratch: string[] = [];
+    try { scratch = fs.readdirSync(root).filter((name) => SHORT_ATTEMPT_TMP_RE.test(name)); } catch { scratch = []; } // @silent-fallback-ok: no temp root to sweep
+    for (const name of scratch.slice(0, 200)) {
+      const full = path.join(root, name);
+      if (live.has(full)) continue;
+      try { if (fs.statSync(full).mtimeMs < cutoff) removeAttemptTree(full, this.trashRoot(), 'feedback-execute stale attempt temp'); } catch { /* @silent-fallback-ok: retried next tick */ }
     }
   }
 
