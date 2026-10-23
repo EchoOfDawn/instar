@@ -153,6 +153,7 @@ export function buildFeedbackExecutor(input: {
       return { sessionName: session.tmuxSession, sessionId: session.id };
     },
     isAlive: (name) => (sm ? sm.isSessionAlive(name) : false),
+    async captureTail(name) { return sm ? sm.captureOutput(name, 30) : null; },
     async stop(name) {
       if (!sm) return false;
       const session = sm.listRunningSessions().find((s) => s.tmuxSession === name);
