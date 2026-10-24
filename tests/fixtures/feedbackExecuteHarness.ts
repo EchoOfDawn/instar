@@ -15,6 +15,7 @@ import type { ConfinedCommand, ConfinedResult, ConfinedRunner } from '../../src/
 import type { AttemptGit, GitHubGateway } from '../../src/feedback-factory/execute/executorPorts.js';
 import type { DepsCachePort } from '../../src/feedback-factory/execute/depsCache.js';
 import type { PrReview, RepoInfo } from '../../src/feedback-factory/execute/reviewGate.js';
+import type { ReviewerOutcome } from '../../src/feedback-factory/execute/independentReview.js';
 import type { AttentionInput } from '../../src/feedback-factory/triage/FeedbackTriageService.js';
 
 export const BASE_SHA = 'a'.repeat(40);
@@ -38,6 +39,12 @@ export interface ExecHarness extends Harness {
   pushes: PushRecord[];
   prs: Map<number, { state: string; mergedAt: string | null; headRefOid: string; mergeCommit: string | null; author: string | null; headRefName: string; labels: string[]; title: string; body: string }>;
   reviews: Map<number, PrReview[]>;
+  /** The diff `prDiff` answers (null = gh error) and every comment left on a PR. */
+  prDiff: { value: string | null };
+  prFiles: { value: string[] | null };
+  comments: Array<{ pr: number; body: string }>;
+  /** The independent reviewers' outcomes (default: none installed → the owner-approval route alone, as before) and each prompt they were asked. */
+  review: { outcomes: ReviewerOutcome[] | null; calls: string[] };
   disarmed: number[];
   merges: Array<{ pr: number; sha: string }>;
   safeMergeExit: { code: number | null; stdout: string };
@@ -87,7 +94,7 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
   fs.writeFileSync(path.join(h.sourceRepo, 'package.json'), '{"name":"fixture"}\n');
   fs.writeFileSync(path.join(h.sourceRepo, 'src', 'thing.ts'), 'export const thing = 1;\n');
   fs.writeFileSync(path.join(h.sourceRepo, '.claude', 'settings.json'), '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"evil"}]}]}}');
-  h.cfg = { dryRun: false, sourceRepoPath: h.sourceRepo, maxConcurrent: 2, maxStartsPerDay: 6, maxOpenPrs: 4, lintCommand: 'npm run lint', baseSmokeTests: ['tests/unit/smoke.test.ts'], maxDurationMinutes: 300, publishRepo: 'agent-bot/repo', ...(opts.config ?? {}) };
+  h.cfg = { dryRun: false, sourceRepoPath: h.sourceRepo, maxConcurrent: 2, maxStartsPerDay: 6, maxOpenPrs: 4, lintCommand: 'npm run lint', baseSmokeTests: ['tests/unit/smoke.test.ts'], maxDurationMinutes: 300, publishRepo: 'agent-bot/repo', reviewGate: 'independent', ...(opts.config ?? {}) };
   h.enabled = { value: true };
   h.epoch = { value: 1 };
   h.repo = { info: { ownerLogin: 'Owner', ownerType: 'User', allowAutoMerge: true }, viewer: 'agent-bot', accounts: ['agent-bot'] };
@@ -97,6 +104,10 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
   h.pushes = [];
   h.prs = new Map();
   h.reviews = new Map();
+  h.prDiff = { value: 'diff --git a/src/thing.ts b/src/thing.ts\n+++ b/src/thing.ts\n+x\n' };
+  h.prFiles = { value: ['src/thing.ts', 'tests/fix.test.ts'] };
+  h.comments = [];
+  h.review = { outcomes: [], calls: [] };
   h.disarmed = [];
   h.merges = [];
   h.safeMergeExit = { code: 5, stdout: 'safe-merge-result: {"result":"armed"}' };
@@ -148,6 +159,9 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
     removeLabel: async (_slug, pr, label) => { const p = h.prs.get(pr); if (p) p.labels = p.labels.filter((l) => l !== label); return true; },
     disableAuto: async (_slug, pr) => { h.disarmed.push(pr); return true; },
     safeMerge: async (_slug, pr, sha) => { h.merges.push({ pr, sha }); return { exitCode: h.safeMergeExit.code, stdout: h.safeMergeExit.stdout }; },
+    prDiff: async () => h.prDiff.value,
+    prFiles: async () => h.prFiles.value,
+    comment: async (_slug, pr, body) => { h.comments.push({ pr, body }); return true; },
   };
   const runner: ConfinedRunner = {
     available: () => (h.runnerAvailable.value ? { ok: true, version: '0.0.77' } : { ok: false, reason: 'sandbox-runtime-not-installed' }),
@@ -215,6 +229,7 @@ export async function createExecHarness(opts: { config?: Partial<ExecuteLiveConf
   h.execStore = new FeedbackExecuteStore(h.drain, h.store, { clock: () => h.now.value });
   h.exec = new FeedbackExecutorService({
     triageStore: h.store, store: h.execStore, audit: h.audit,
+    review: { run: async ({ prompt }) => { h.review.calls.push(prompt); if (h.review.outcomes === null) throw new Error('reviewers-down'); return h.review.outcomes; } },
     processing: { activeClusters: () => [...h.clusters.values()], feedbackByCluster: () => new Map([...h.reports].map(([k, v]) => [k, v.map((r) => ({ ...r }))])) },
     initiatives: h.tracker, git, github, runner, deps: depsPort, sessions,
     admission: { spawnLimiterSaturated: () => h.admission.saturated, quotaShedding: () => h.admission.shedding, updatePending: () => h.admission.updatePending, rerouteSaturated: () => h.admission.rerouteSaturated === true },
