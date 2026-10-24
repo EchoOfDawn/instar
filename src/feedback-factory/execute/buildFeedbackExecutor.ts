@@ -103,6 +103,28 @@ export function readIdentityFacts(stateDir: string, readVault: () => string[] | 
   return { profileAccounts, ownedIdentities, vaultNames: readVault(), unreadableSources };
 }
 
+/**
+ * The executor's "update pending" admission brake (§4 step 1): true only when an update restart is
+ * actually coming, i.e. autoApply is on and an update is pending. With autoApply off a pending
+ * version never restarts the server on its own, so treating it as pending refused every tick for as
+ * long as auto-apply stayed paused (2026-10-23: no attempt for hours while an operator pause held).
+ * A failed install keeps `pendingUpdate` set and retries next cycle, so a pending version older than
+ * {@link UPDATE_PENDING_BRAKE_MAX_MS} is no longer treated as an imminent restart: without that bound
+ * a persistently failing install would refuse every tick forever. A missing detection time keeps the
+ * brake (the safe direction).
+ */
+export const UPDATE_PENDING_BRAKE_MAX_MS = 6 * 60 * 60_000;
+
+export function executorUpdatePending(
+  status: { config?: { autoApply?: boolean }; pendingUpdate?: string | null; pendingUpdateDetectedAt?: string | null } | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (status?.config?.autoApply !== true || status.pendingUpdate == null) return false;
+  const detected = status.pendingUpdateDetectedAt ? Date.parse(status.pendingUpdateDetectedAt) : NaN;
+  if (!Number.isFinite(detected)) return true;
+  return now - detected < UPDATE_PENDING_BRAKE_MAX_MS;
+}
+
 export function buildFeedbackExecutor(input: {
   config: InstarConfig;
   drainStore: FeedbackDrainStore;
