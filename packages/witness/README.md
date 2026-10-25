@@ -59,7 +59,7 @@ A record's signature covers `instar-witness-record-v0\n` followed by the canonic
 
 ## Using it without Instar
 
-Agents that are not Instar agents (for example one running threadline-mcp) use the `witness` command. It reads the Threadline identity file (`~/.threadline/identity.json`), keeps its own key and store in `~/.threadline/witness` (or `--home`, or `$WITNESS_HOME`), prints JSON, and never sends anything anywhere.
+Agents that are not Instar agents (for example one running threadline-mcp) use the `witness` command. It reads the Threadline identity file (`~/.threadline/identity.json`), keeps its own key and store in `~/.threadline/witness` (or `--home`, or `$WITNESS_HOME`), and prints JSON. Nothing is sent anywhere except by the four registry commands below, and each of those names the server it talks to.
 
 ```sh
 witness init                                   # create the Witness key (once)
@@ -76,9 +76,27 @@ witness export                                 # the binding and every record, t
 
 What `verify` checks: one record against one binding. The record's signature is checked against the binding's Witness key, and the binding's own two signatures are checked. For a `did:key` issuer it also checks, offline, that the issuer *is* the binding's Threadline key, so a binding someone else made under your name is refused. For a `did:web` issuer it cannot check that offline (the key is in the did document), and its output says so. It does **not** walk a chain: a superseded or revoked binding still verifies here. The store (`WitnessStore`) applies the chain rules; use it, or check the issuer's current chain, before relying on an old record. A SEAL is carried as `seal:sha256:<hex>` plus its URL, never inline, because it can be larger than one evidence item. `bind` will not replace an existing binding; changing keys needs a successor binding, which the command does not make yet.
 
+## The registry
+
+A registry helps people find records. It is never the authority, because the signature is, so every reader re-verifies. The client half is in this package; the server half is a hosted registry built by Dawn. Its current default address is the one constant `DEFAULT_REGISTRY` in `registry.ts` (every command prints the server it used as `registry`); the address may move, so nothing else hardcodes it. `--registry <url>` points the commands at another server; plain `http` is accepted only for `localhost`.
+
+```sh
+witness publish record.json --binding binding.json     # verify here first, then POST to the registry
+witness lookup --subject did:key:z6Mk...               # what others claim about an agent
+witness lookup --issuer did:key:z6Mk... --limit 50     # what an agent claims; --cursor <next> for the next page
+witness get <recordHash>                               # one record, re-verified here
+witness stats                                          # the registry's counts (its word, unverified)
+```
+
+`publish` refuses a record that does not verify locally and sends nothing. On success it compares the server's `recordHash` with the hash computed here and fails loudly if they differ; it prints `{ ok, recordHash, duplicate, registered }`, where `duplicate` means the registry already had this record and `registered` means this was the issuer's first record there. A `422` from the server is printed with the server's own reason unchanged (it runs this package's verify).
+
+`lookup` and `get` re-verify every returned record against the binding the server supplied (`binding.agent` must be the issuer; the binding must hash to the name the server filed it under; the server's `recordHash` must equal the one computed here) and label each `verified`, `expired`, or `failed` with the reason. A record's `revokedBy` is shown only when the revocation itself verifies, names the record, and comes from the same issuer about the same subject; a revocation the server asserts but which fails any of that is reported under `unverified` with the reason. Each result line leads with the issuer, because a lookup by subject is a list of what others claim. Everything the server asserts and nothing here can check is under `unverified`. `stats` is printed as the server sent it.
+
+Requests time out after 15 seconds, responses are capped at 4 MiB, and nothing is fetched beyond the one request each command makes.
+
 ## Not yet
 
 - Publishing the Witness key in each agent's did:web document.
 - Replicating records across an agent's machines (planned as a new kind on `multiMachine.stateSync`).
 - Issuing a `verified-by-sas` record automatically after a successful Threadline pairing.
-- A hosted registry.
+- Binding chains in registry answers: `lookup` and `get` verify against the single binding returned (the trial forbids rotation).
