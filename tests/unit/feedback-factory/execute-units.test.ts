@@ -21,7 +21,7 @@ import { approvedAtHead, approvedSha, approverIndependence, codeownersOutsideApp
 import { effectChecks, evaluateSessionCanary, findSessionTranscript, linkEffectChecks, prepareCanaryFixture, prepareSessionLinkProbe, runRunnerCanary, sessionCanaryPrompt, sessionReadTargets, transcriptChecks, verdictOf, canaryStamp, canaryLinkPaths, SESSION_CANARY_STEPS } from '../../../src/feedback-factory/execute/confinementCanary.js';
 import { readCallLines } from '../../fixtures/feedbackExecuteHarness.js';
 import { resolveSandboxRuntime, runCapped, shortTmpDir, treeBytes, SandboxRuntimeRunner, type ConfinedRunner } from '../../../src/feedback-factory/execute/ConfinedRunner.js';
-import { DepsCache } from '../../../src/feedback-factory/execute/depsCache.js';
+import { DepsCache, rebuildFailureTail, FIX_SCRIPT_SIBLINGS } from '../../../src/feedback-factory/execute/depsCache.js';
 import { removeAttemptTree, sweepTrash } from '../../../src/feedback-factory/execute/attemptFs.js';
 import { isCredentialEnvName } from '../../../src/core/credentialEnvNames.js';
 import { claudeHeadlessExtraFlags } from '../../../src/core/frameworkSessionLaunch.js';
@@ -296,6 +296,30 @@ describe('canary judgement', () => {
   });
   const confinedOk = (c: string) => (/^(git |node -e .*better-sqlite3|npm run lint|npx vitest)/.test(c) ? 0 : 1);
 
+  it('every confined probe gets vitest/esbuild caches inside the attempt temp, never the denied agent home', async () => {
+    const p = paths(tmp());
+    const fx = await prepareCanaryFixture(p, { secretsDir: path.join(p.agentHome, '.instar', 'canary'), configPath: path.join(p.agentHome, '.instar', 'config.json') });
+    const envs: Array<Record<string, string>> = [];
+    const capture: ConfinedRunner = {
+      available: () => ({ ok: true, version: '0.0.77' }),
+      run: async (cmd) => { envs.push(cmd.env); return { exitCode: confinedOk(cmd.command), signal: null, stdout: '', stderr: '', timedOut: false, outputCapped: false }; },
+    };
+    try {
+      await runRunnerCanary({ paths: p, fixture: fx, runner: capture, fullGate: { lintCommand: 'npm run lint', smokeTests: ['tests/a.test.ts'] } });
+      expect(envs.length).toBeGreaterThan(0);
+      // vitest and esbuild write caches next to the nearest package root, which resolves ABOVE the
+      // workspace into the agent home — denied by the confinement. Without the redirect the
+      // base-unit-smoke probe dies with EPERM and latches the whole executor for 24h.
+      for (const env of envs) {
+        expect(env.VITEST_CACHE_DIR).toBe(path.join(p.tmpDir, 'vitest'));
+        expect(env.ESBUILD_CACHE_DIR).toBe(path.join(p.tmpDir, 'esbuild'));
+        expect(env.TMPDIR).toBe(p.tmpDir);
+        expect(env.VITEST_CACHE_DIR.startsWith(p.agentHome + '/')).toBe(true);
+        expect(env.VITEST_CACHE_DIR.startsWith(p.tmpDir)).toBe(true);
+      }
+    } finally { await fx.close(); }
+  });
+
   it('all must-fail probes refused and all must-succeed probes passing → ok; a broken runner (everything fails) is NOT ok', async () => {
     const p = paths(tmp());
     const fx = await prepareCanaryFixture(p, { secretsDir: path.join(p.agentHome, '.instar', 'canary'), configPath: path.join(p.agentHome, '.instar', 'config.json') });
@@ -538,5 +562,186 @@ describe('dependency cache', () => {
     expect(fs.readdirSync(path.join(root, 'deps'))).toHaveLength(0);
     const noLock = new DepsCache({ ...(cache as unknown as { opts: ConstructorParameters<typeof DepsCache>[0] }).opts, readAtCommit: () => null });
     expect(await noLock.ensure('/src', 'a'.repeat(40))).toEqual({ ok: false, reason: 'lockfile-missing-at-base' });
+  });
+});
+
+describe('confined native rebuild: a writable HOME and a self-diagnosing failure', () => {
+  /** A cache whose install plants a native module the agent home does not have, forcing the rebuild path. */
+  const forcingRebuild = (root: string, run: NonNullable<ConstructorParameters<typeof DepsCache>[0]>['runner']['run']) => new DepsCache({
+    root: path.join(root, 'deps'), agentHome: path.join(root, 'home'), trashRoot: path.join(root, '.instar', 'trash'),
+    runner: { available: () => ({ ok: true, version: '0.0.77' }), run },
+    readAtCommit: (_s, _sha, f) => (f === 'package.json' ? '{"name":"x"}' : f === 'package-lock.json' ? '{"lockfileVersion":3}' : null),
+    listAtCommit: () => [],
+    install: async (dir) => {
+      const mod = path.join(dir, 'node_modules', 'better-sqlite3');
+      fs.mkdirSync(mod, { recursive: true });
+      fs.writeFileSync(path.join(mod, 'package.json'), '{"name":"better-sqlite3","version":"12.8.0"}');
+    },
+    hasPnpm: () => false, testRunnerHoldersFile: path.join(root, 'h.json'),
+  });
+
+  it('points HOME at the attempt temp (never the real home) so node-gyp can write its devdir', async () => {
+    const root = tmp();
+    let seen: Record<string, string> | null = null;
+    const r = await forcingRebuild(root, async (cmd) => {
+      seen = cmd.env;
+      return { exitCode: 0, signal: null, stdout: '', stderr: '', timedOut: false, outputCapped: false };
+    }).ensure('/src', 'a'.repeat(40));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(seen).not.toBeNull();
+    const env = seen as unknown as Record<string, string>;
+    // The whole bug: HOME stayed on the real (confinement-denied) home, so `gyp configure` hit EPERM.
+    expect(env.HOME).toBe(path.join(r.dir, '.tmp', 'home'));
+    expect(env.HOME).not.toBe(os.homedir());
+    expect(env.TMPDIR).toBe(path.join(r.dir, '.tmp'));
+    expect(fs.existsSync(env.HOME)).toBe(true); // created, or node-gyp cannot use it
+  });
+
+  it('a failed rebuild carries the real cause into deps-unavailable instead of discarding it', async () => {
+    const root = tmp();
+    const stderr = [
+      'npm error prebuild-install warn install EPERM: operation not permitted, access \'/Users/x/.npm\'',
+      'npm error gyp ERR! configure error',
+      'npm error gyp ERR! stack Error: EPERM: operation not permitted, open \'/Users/x/Library/Caches/node-gyp/24.14.1/installVersion\'',
+      'npm error gyp ERR! not ok',
+      'npm error Log files were not written due to an error writing to the directory: /Users/x/.npm/_logs',
+      'npm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal',
+    ].join('\n');
+    const r = await forcingRebuild(root, async () => ({ exitCode: 1, signal: null, stdout: '', stderr, timedOut: false, outputCapped: false })).ensure('/src', 'a'.repeat(40));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toContain('deps-install-failed');
+    expect(r.reason).toContain('native rebuild failed (exit 1)');
+    expect(r.reason).toContain('installVersion'); // the fatal line, not the preceding warn
+    expect(r.reason).not.toContain('loglevel=verbose'); // npm's epilogue is never the diagnosis
+    expect(r.reason.length).toBeLessThanOrEqual(400);
+  });
+
+  it('rebuildFailureTail prefers the fatal line over a warn, bounds length, and falls back to the last line', () => {
+    const fatal = rebuildFailureTail({
+      stderr: 'prebuild-install warn install EPERM: access \'/h/.npm\'\ngyp ERR! stack Error: EACCES: permission denied, open \'/h/cache\'\nnpm error done',
+      stdout: '',
+    });
+    expect(fatal).toContain('EACCES');
+    expect(fatal).not.toContain('warn');
+    // No signal line at all → the last line still tells the operator something.
+    expect(rebuildFailureTail({ stderr: 'something odd\nlast line here', stdout: '' })).toBe(': last line here');
+    expect(rebuildFailureTail({ stderr: '', stdout: '' })).toBe('');
+    expect(rebuildFailureTail({ stderr: `EPERM ${'x'.repeat(500)}`, stdout: '' }).length).toBeLessThanOrEqual(152);
+  });
+});
+
+describe('confined native rebuild: the fix script and its siblings', () => {
+  /** A cache whose base SHA carries the fix script and, optionally, its siblings. */
+  const withScripts = (root: string, siblingsPresent: boolean, run: NonNullable<ConstructorParameters<typeof DepsCache>[0]>['runner']['run']) => new DepsCache({
+    root: path.join(root, 'deps'), agentHome: path.join(root, 'home'), trashRoot: path.join(root, '.instar', 'trash'),
+    runner: { available: () => ({ ok: true, version: '0.0.77' }), run },
+    readAtCommit: (_s, _sha, f) => {
+      if (f === 'package.json') return '{"name":"x"}';
+      if (f === 'package-lock.json') return '{"lockfileVersion":3}';
+      if (f === 'scripts/fix-better-sqlite3.cjs') return "require('./resolve-node-binary.cjs');\n";
+      if (f.startsWith('scripts/')) return siblingsPresent ? '// sibling\n' : null;
+      return null;
+    },
+    listAtCommit: () => [],
+    install: async (dir) => {
+      const mod = path.join(dir, 'node_modules', 'better-sqlite3');
+      fs.mkdirSync(mod, { recursive: true });
+      fs.writeFileSync(path.join(mod, 'package.json'), '{"name":"better-sqlite3","version":"12.8.0"}');
+    },
+    hasPnpm: () => false, testRunnerHoldersFile: path.join(root, 'h.json'),
+  });
+
+  it('copies every declared sibling next to the fix script, so its relative require resolves', async () => {
+    const root = tmp();
+    let cmd = '';
+    const r = await withScripts(root, true, async (c) => { cmd = c.command; return { exitCode: 0, signal: null, stdout: '', stderr: '', timedOut: false, outputCapped: false }; })
+      .ensure('/src', 'a'.repeat(40));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(cmd).toContain('node scripts/fix-better-sqlite3.cjs');
+    expect(fs.existsSync(path.join(r.dir, 'scripts', 'fix-better-sqlite3.cjs'))).toBe(true);
+    for (const sibling of FIX_SCRIPT_SIBLINGS) {
+      expect(fs.existsSync(path.join(r.dir, 'scripts', sibling)), `${sibling} must be copied`).toBe(true);
+    }
+  });
+
+  it('a sibling missing at the base SHA SKIPS the fix script instead of running it to a certain failure', async () => {
+    const root = tmp();
+    let cmd = '';
+    const r = await withScripts(root, false, async (c) => { cmd = c.command; return { exitCode: 0, signal: null, stdout: '', stderr: '', timedOut: false, outputCapped: false }; })
+      .ensure('/src', 'a'.repeat(40));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // Running it without its sibling exits 1 on the first line; the rebuild is what makes the binary.
+    expect(cmd).not.toContain('fix-better-sqlite3.cjs');
+    expect(cmd).toContain('npm rebuild');
+    expect(fs.existsSync(path.join(r.dir, 'scripts', 'fix-better-sqlite3.cjs'))).toBe(false);
+  });
+
+  it('RATCHET: every relative require in the real fix script is declared in FIX_SCRIPT_SIBLINGS', () => {
+    const script = fs.readFileSync(path.join(process.cwd(), 'scripts', 'fix-better-sqlite3.cjs'), 'utf-8');
+    const required = [...script.matchAll(/require\(['"]\.\/([^'"]+)['"]\)/g)].map((m) => m[1]);
+    expect(required.length, 'the script requires at least one sibling (else this ratchet is vacuous)').toBeGreaterThan(0);
+    const missing = required.filter((r) => !(FIX_SCRIPT_SIBLINGS as readonly string[]).includes(r));
+    expect(missing, `siblings required but not declared (they will not be copied): ${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('the failure tail names the failing half of the chain, not the successful half', () => {
+    // The real shape: `npm rebuild ... && node scripts/fix-better-sqlite3.cjs`. npm succeeds and
+    // leaves an upbeat trailing stdout line; the script then dies on stderr.
+    const t = rebuildFailureTail({
+      stderr: "node:internal/modules/cjs/loader:1215\n  throw err;\nError: Cannot find module './resolve-node-binary.cjs'\n    at Module._resolveFilename (node:internal/modules/cjs/loader:1212:15)\n",
+      stdout: 'rebuilt dependencies successfully\n',
+    });
+    expect(t).toContain('Cannot find module');
+    expect(t).not.toContain('rebuilt dependencies successfully');
+    // With nothing diagnostic anywhere, stderr's last line still beats stdout's cheerful one.
+    const q = rebuildFailureTail({ stderr: 'something went sideways\n', stdout: 'rebuilt dependencies successfully\n' });
+    expect(q).toBe(': something went sideways');
+  });
+});
+
+describe('canary: a failing probe names what it observed', () => {
+  const probePaths = (root: string) => {
+    const agentHome = path.join(root, 'home');
+    const workspace = path.join(agentHome, '.worktrees', 'feedback-y-a1');
+    for (const d of [path.join(workspace, '.git'), `${workspace}-publish`, `${workspace}-tmp`]) fs.mkdirSync(d, { recursive: true });
+    return { workspace, publishClone: `${workspace}-publish`, tmpDir: `${workspace}-tmp`, depsCache: path.join(agentHome, '.worktrees', '.feedback-deps', 'y'), agentHome, testRunnerHoldersFile: path.join(root, 'h.json'), homeDir: root };
+  };
+
+  /** Drive evaluateSessionCanary over a hand-written report and return the git-status probe. */
+  const gitProbe = async (outputs: Record<string, string> | null) => {
+    const root = tmp();
+    const p = probePaths(root);
+    const fx = await prepareCanaryFixture(p, { secretsDir: path.join(p.agentHome, '.instar', 'canary'), configPath: path.join(p.agentHome, '.instar', 'config.json') });
+    try {
+      const reportPath = path.join(p.tmpDir, `canary-report-${fx.nonce}.json`);
+      if (outputs) fs.writeFileSync(reportPath, JSON.stringify({ attempted: [9], outputs }));
+      const probes = evaluateSessionCanary(p, fx, reportPath, null);
+      return probes.find((x) => x.probe === 'session-git-status')!;
+    } finally { await fx.close(); }
+  };
+
+  it('a MISSING outputs["9"] still fails, but the detail says it was absent rather than implying git broke', async () => {
+    const r = await gitProbe({ '1': 'ok' });
+    expect(r.ok).toBe(false);                       // verdict unchanged
+    expect(r.detail).toContain('absent');           // and now diagnosable
+    expect(r.detail).not.toContain('fatal:');
+  });
+
+  it('a genuine git failure fails and the detail quotes it', async () => {
+    const r = await gitProbe({ '9': 'fatal: not a git repository' });
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('not a git repository');
+  });
+
+  it('clean git output passes, and the measured macOS xcrun cache noise does NOT fail it', async () => {
+    expect((await gitProbe({ '9': '' })).ok).toBe(true);
+    // Measured in the real sandbox: git exits 0 but prints this. It must not read as a failure.
+    const noisy = await gitProbe({ '9': "git: error: couldn't create cache file '/var/folders/x/T/xcrun_db-A' (errno=Operation not permitted)" });
+    expect(noisy.ok).toBe(true);
+    expect(noisy.detail).toContain('xcrun_db');
   });
 });

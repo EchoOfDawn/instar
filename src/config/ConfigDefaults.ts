@@ -754,6 +754,13 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
       // A fully-calm week is silent by default (no "all healthy" heartbeat — the
       // exact noise burnDetection was killed for).
       digestSendOnCalmWeeks: false,
+      // Standard A/B. `enabled` is deliberately OMITTED so the dev-agent gate
+      // governs it (resolveDevAgentGate): LIVE on a development agent — where
+      // the durable owner/deadline/proof record starts accruing real evidence
+      // immediately — and DARK fleet-wide. `dryRun` ships true regardless, so
+      // even on a dev agent the record fills while R7 stays out of the digest
+      // until the dry-run canary is deliberately cleared.
+      darkFlagInventory: { dryRun: true },
       incubationWindows: { lowRisk: 3, standard: 7, highRisk: 7 },
       proofOfLifeMinActivations: 1,
       rules: {
@@ -1003,6 +1010,24 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
       dryRun: true,
       queuedDarkAfterMs: 7200000,  // 2 h — below the 6 h `stale` window so the sender hears first
       cooldownMs: 43200000,        // 12 h per peer
+    },
+    // Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9, rollout step 5).
+    // SHIPS ON for every agent (Justin, 2026-10-20: "why is encryption shipped off? Please
+    // change it such that it ships on."): ordinary chat to a peer paired by invite is always
+    // encrypted to its pinned key. `enabled: true` is written so /guards and the config file
+    // show the truth; `dryRun` is deliberately OMITTED (omitted = enforce, see
+    // resolveEncryptToPinnedMode) so the shipped posture lives in code, not in every agent's
+    // file. applyDefaults add-missing → existing agents with no value get it on update; an
+    // operator's explicit `enabled: false` (off) or `dryRun: true` (watch) is never overwritten.
+    encryptToPinned: {
+      enabled: true,
+    },
+    // Refuse-downgrade (same spec, D6, rollout step 6). ON at WATCH for every agent: marks are
+    // recorded and would-refuse plaintext is counted per peer on /health; refusing needs an
+    // explicit `dryRun: false`. `dryRun` is OMITTED (omitted = watch) so a later move to
+    // enforce is a code default, not a migration. Why watch: refuseDowngrade.ts header.
+    refuseDowngrade: {
+      enabled: true,
     },
   },
   // Topic-intent auto-capture loop (rung 0 of continuous-working-awareness).
@@ -2212,6 +2237,12 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
       },
     },
     proactiveSwap: {
+      // Q3-safe default-login rescue — DEV-GATED: enabled deliberately omitted.
+      // A dev agent logs the exact default-slot flip but writes no credential
+      // until a deliberate dryRun:false promotion. Fleet remains dark.
+      defaultSlotRepoint: {
+        dryRun: true,
+      },
       // Login-loss swap trigger — DEV-GATED: enabled deliberately omitted.
       // A dev agent evaluates the exact intent but performs no session kill
       // until a deliberate dryRun:false promotion. Fleet remains dark.

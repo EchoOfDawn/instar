@@ -1,4 +1,7 @@
+import { registerLocalVerifyRoutes } from '../localVerify/localVerifyRoutes.js';
 import { mountOriginDisplayPreferences } from './originDisplayPreferences.js';
+import { resolveSessionPlatform } from './sessionPlatform.js';
+import { readSystemTopicIds } from '../messaging/SystemTopicAdoption.js';
 import { withUnknownProducerOrigin } from '../messaging/telegram-origin/OriginDeterministicSend.js';
 /**
  * HTTP API routes — health, status, sessions, jobs, events.
@@ -208,13 +211,17 @@ import {
   type PeerPresenceRead,
 } from '../threadline/peerDark.js';
 import { buildTopicProfileOptions, validateDashboardProfileChoice, seedTopicProfileAtCreation, claimDashboardCreatedTopic, settleDashboardCreatedTopic, frameworkLabel } from '../core/dashboardTopicProfile.js';
+import { hasMachinePick, resolveCreateMachineChoice, safeMachineLabel, type CreateMachineChoice, type DashboardCreateStart } from '../core/dashboardMachineChoice.js';
 import { reviewWithinBudget } from './outboundGateBudget.js';
 import { resolveToneRecipientClass } from './toneRecipientClass.js';
 import { RULE_DISPOSITIONS, buildDegradedToneResult, resolveToneGateOperatorConfig, fingerprintAutomatedTemplate } from '../core/MessagingToneGate.js';
 import type { WriteOperation, WriteToken } from '../core/StateWriteAuthority.js';
 import { writeLifelineRestartSignal } from '../core/version-skew.js';
 import { LifelineIngressGuard } from './LifelineIngressGuard.js';
-import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX } from '../threadline/PairingInviteTelegram.js';
+import { PairingInviteTelegram, CALLBACK_PREFIX as PAIRING_CALLBACK_PREFIX, resolveApprovalOwner } from '../threadline/PairingInviteTelegram.js';
+import { PairingTopicStore } from '../threadline/PairingTopicStore.js';
+import { ConnectEnableController, readConnectEnableStatus } from '../threadline/connectEnable.js';
+import { shouldOwnTelegramPoll } from '../lifeline/telegramPollOwnership.js';
 import { sharedLifelineIngressSecretHolder } from '../core/LifelineIngressSecret.js';
 import { TelegramCallbackDedupe } from './TelegramCallbackDedupe.js';
 import { readSessionClocks } from '../core/SessionClockReader.js';
@@ -238,7 +245,8 @@ import {
 } from '../monitoring/guardAcceptedFallbacks.js';
 import { GUARD_MANIFEST } from '../monitoring/guardManifest.js';
 import { GuardRegistry } from '../monitoring/GuardRegistry.js';
-import { isPeerUrlAllowedForCredentials } from './peerUrlGuard.js';
+import { isPeerUrlAllowedForCredentials, type PeerEndpointKind } from './peerUrlGuard.js';
+import { poolPeerFetch } from './poolPeerFetch.js';
 import { persistDiskTopicSessionBinding, resolveSessionSpawnTopicBinding } from './sessionSpawnTopicBinding.js';
 import { classifyMachineEmptyState } from './poolEmptyState.js';
 import { decorateWithRopeCondition } from './poolRopeCondition.js';
@@ -288,6 +296,7 @@ import {
   type EvidencePointer,
 } from '../core/UnjustifiedStopGate.js';
 import { StopGateDb, dayKeyFor, type EvalMode } from '../core/StopGateDb.js';
+import { summarizeJobFailures, JOB_FAILURE_WINDOW_MS } from './jobFailureCurrency.js';
 import { randomUUID as cryptoRandomUUID } from 'node:crypto';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -341,6 +350,8 @@ const execFile = promisify(execFileCb);
  * requiring operator intervention.
  */
 const CONTINUE_CEILING = 2;
+
+
 const APPRENTICESHIP_CYCLE_CHANNEL_SET = new Set<string>(APPRENTICESHIP_CYCLE_CHANNELS);
 const FOLLOW_THROUGH_OPT_OUT_REASON_MAX_CHARS = 2_000;
 
@@ -570,6 +581,17 @@ import {
   relayUnknownSenderTrustCounters,
   resolveRelayUnknownSenderTrustMode,
 } from '../threadline/relayUnknownSenderTrust.js';
+import {
+  encryptToPinnedCounters,
+  encryptToPinnedModeName,
+  resolveEncryptToPinnedMode,
+} from '../threadline/encryptToPinned.js';
+import {
+  refuseDowngradeCounters,
+  refuseDowngradeModeName,
+  downgradeRefusals,
+  resolveRefuseDowngradeMode,
+} from '../threadline/refuseDowngrade.js';
 import { isRelayChainLoop } from '../messaging/MessageRouter.js';
 import { buildResentNotice, isValidMessageId } from '../threadline/InboundIdLedger.js';
 import { recordDuplicateAck, projectInboundRow } from '../threadline/inboundIdLedgerWiring.js';
@@ -1088,6 +1110,8 @@ export interface RouteContext {
     retry?: (episodeId: string) => Promise<import('../core/SubscriptionReloginStore.js').SubscriptionReloginEpisode>;
     /** The agent-session helper's code route (spec skill-driven-signin-repair). Absent ⇒ 503. */
     helperSubmit?: (episodeId: string, token: string, body: unknown) => { status: number; body: Record<string, unknown> };
+    /** The last-resort model's live state (spec relogin-last-resort-model); never a key. */
+    lastResortStatus?: () => import('../core/ReloginLastResortProvider.js').ReloginLastResortStatus | { available: false };
     close?: () => void;
   } | null;
   /** Provider identity proof seam; production lazily uses CredentialIdentityOracle. */
@@ -1159,6 +1183,10 @@ export interface RouteContext {
   /** GreenPrAutoMerger (green-pr-automerge-enforcement). Null on installs with no
    *  analyzable instar repo + safe-merge, or when disabled in config. */
   greenPrAutoMerger: import('../monitoring/GreenPrAutoMerger.js').GreenPrAutoMerger | null;
+  /** local-verify (spec local-verify-merge-authority §2); null → routes 503. */
+  localVerify?: import('../localVerify/LocalVerifyService.js').LocalVerifyService | null;
+  /** The `instar/local-verify` status reconcile loop (local-verify-merge-authority §3); null → GET /local-verify/status 503. */
+  localVerifyStatus?: import('../localVerify/StatusReconciler.js').StatusReconciler | null;
   /** GuardLatchStore — the pool-visible rollback/enable/pool-armed latches. */
   guardLatchStore: import('../monitoring/GuardLatchStore.js').GuardLatchStore | null;
   messageRouter: MessageRouter | null;
@@ -1202,6 +1230,20 @@ export interface RouteContext {
     spawnForTopic?: (topicId: number, name: string) => Promise<import('../core/dashboardTopicProfile.js').SpawnForTopicResult>;
     /** §3.3 2b — the pool seam, evaluated at call time. Absent ⇒ `dark`. */
     sessionPoolLocalClaim?: () => import('../core/dashboardTopicProfile.js').SessionPoolLocalClaimAnswer;
+    /** dashboard-new-session-machine-choice §3.4 step 3 — place a new topic on a
+     *  REMOTE machine and start it there (checked deliverMessage). Absent ⇒ a
+     *  remote machine pick answers `machine-choice-unavailable`. */
+    startTopicOnMachine?: (topicKey: string, targetMachineId: string, start: import('../core/dashboardMachineChoice.js').DashboardCreateStart, pin?: () => Promise<boolean> | boolean) => Promise<import('../core/dashboardMachineChoice.js').StartTopicOnMachineResult>;
+    /** §3.2 — is placement-pin replication (`ws13PinReplicate`) live here? A
+     *  machine pick requires it. Absent ⇒ false. */
+    pinReplicationLive?: () => boolean;
+    /** §3.2 — the start seam's inner function is bound (false during the boot
+     *  window before the router block ran). Absent ⇒ trust `startTopicOnMachine`. */
+    startSeamWired?: () => boolean;
+    /** §3.4 step 0 — ONE signed read-class mesh probe (`session-status`) to the
+     *  target, so the pre-flight covers the plane the start will use. Absent ⇒
+     *  no probe. */
+    probeMachineReachable?: (machineId: string) => Promise<boolean>;
   } | null;
   /** Playwright Profile Registry (docs/specs/playwright-profile-registry.md) —
    *  optional factory override. Production constructs the registry per-request
@@ -1845,7 +1887,26 @@ export interface RouteContext {
   kickWorkingSetOnMachine?: ((machineId: string, topic: number) => void) | null;
   /** Every OTHER registered, non-revoked machine with a known URL — for pool-wide
    *  aggregation (GET /sessions?scope=pool). Null/absent (single-machine/dark). */
-  resolvePeerUrls?: (() => Array<{ machineId: string; url: string }>) | null;
+  resolvePeerUrls?:
+    | (() => Array<{
+        machineId: string;
+        url: string;
+        kind: PeerEndpointKind;
+        ropeRefusals?: Array<{ url: string; kind: PeerEndpointKind; reason?: string }>;
+      }>)
+    | null;
+  /**
+   * The rope-health feedback arm of the pool-read selection fix
+   * (docs/specs/peer-credential-guard-tailscale-coherence.md §3.4(b)).
+   *
+   * Reports each pool dial's outcome to the SAME `PeerEndpointResolver` the
+   * lease transport and recovery prober feed, so a rope that is admissible but
+   * dead stops being selected. Without it, selection settles on the highest-
+   * priority admissible rope forever even when it never answers — measured on
+   * 2026-10-22 as a dead LAN rope chosen over a healthy tunnel. Absent/null on
+   * a single machine (no peers, nothing to learn).
+   */
+  recordRopeResult?: import('./poolPeerFetch.js').RopeResultRecorder | null;
   /** WS4.4(f) global pool-cache unification (MULTI-MACHINE-SEAMLESSNESS-SPEC
    *  §WS4.4 clause (f)): the ONE shared per-peer poll cache that every
    *  pool-scope surface routes its per-peer fetch through, so a dashboard
@@ -3360,10 +3421,33 @@ export function createRoutes(ctx: RouteContext): Router {
   // Pairing by invite, Telegram surface (docs/specs/a2a-pairing-invite-link.md §6.1). Buttons
   // are offered only when the lifeline is this agent's Telegram ingress AND its guard enforces;
   // otherwise every prompt points at the dashboard (PIN) instead.
+  let pairingTopicStore: PairingTopicStore | null = null;
+  if (ctx.pairingInvites && ctx.telegram) {
+    pairingTopicStore = new PairingTopicStore(ctx.config.stateDir, undefined, (problem) => DegradationReporter.getInstance().report({
+      feature: 'Threadline.pairingTopics',
+      primary: 'remember which Telegram topic each pairing invite belongs to (threadline/pairing-topics.json)',
+      fallback: 'pairing notices go to the Lifeline topic instead',
+      reason: problem,
+      impact: 'pairing messages may appear in the Lifeline topic rather than where the invite was made',
+    }));
+  }
   const pairingInviteTelegram = ctx.pairingInvites && ctx.telegram
     ? new PairingInviteTelegram({
-      flow: ctx.pairingInvites.flow,
+      // Operator acts go through the handshake (spec §11): both sides are told how a pairing ended.
+      flow: ctx.pairingInvites.handshake,
       events: ctx.pairingInvites.events,
+      topics: pairingTopicStore ?? undefined,
+      ownOpenInvite: (iid) => {
+        const inv = ctx.pairingInvites!.store.getInternal(iid);
+        return inv && inv.state === 'open' ? { exp: inv.exp } : null;
+      },
+      reportUndelivered: (what, reason) => DegradationReporter.getInstance().report({
+        feature: 'Threadline.pairingNotices',
+        primary: 'tell the operator, in the topic where the invite was made or forwarded, how a pairing is going',
+        fallback: 'the message was not shown; the pairing state itself is recorded and unaffected',
+        reason: `${what}: ${reason}`,
+        impact: 'the operator may not know that a pairing finished, failed or timed out until they check the dashboard Threadline tab',
+      }),
       send: async (topicId, text, buttons) => {
         if (buttons && buttons.length) {
           if (await ctx.telegram!.sendPairingPrompt(topicId, text, buttons) !== null) return;
@@ -3372,13 +3456,44 @@ export function createRoutes(ctx: RouteContext): Router {
         await ctx.telegram!.sendToTopic(topicId, text);
       },
       answer: (id, text) => ctx.telegram!.answerCallback(id, text),
-      ownerUserId: () => ctx.telegram!.getOwnerUserId(),
+      // A configured owner wins (the Telegram block's ownerUserId / promptGate.ownerId, else the
+      // agent's monitoring.promptGate.ownerId, which the adapter itself never reads). With none,
+      // only a single VERIFIED operator binding from authenticated inbound Telegram counts —
+      // never an asserted record, a replicated one, or "whoever messaged" (resolveApprovalOwner),
+      // and only while exactly one person has EVER been verified here (bindings are latest-only).
+      // Scoped to pairing on purpose: getOwnerUserId() also addresses owner DMs and consent prompts.
+      ownerUserId: () => resolveApprovalOwner(
+        ctx.telegram!.getOwnerUserId() ?? ctx.config.monitoring?.promptGate?.ownerId,
+        Object.values(ctx.topicOperatorStore?.allBindings() ?? {}),
+        ctx.topicOperatorStore?.everVerifiedOperatorUids() ?? null,
+      ),
       chatId: () => ctx.telegram!.getChatId(),
       operatorTopicId: () => ctx.telegram!.getLifelineTopicId(),
-      enforcing: () => lifelineIngressGuard.mode() === 'enforce'
-        && (ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true,
+      // Buttons whenever a tap can be proven, not only in enforce: a new agent is in observe
+      // for its first day or more, and that is when its owner pairs it (spec §6.1, r5).
+      // A polling server (no lifeline) reads taps straight from Telegram; they reach pairing through
+      // the adapter's handler below, so polling is no longer a reason to drop the buttons (§6.1 r7).
+      enforcing: () => lifelineIngressGuard.tapsProvable()
+        && ((ctx.telegram as unknown as { isPolling?: boolean }).isPolling !== true || ctx.telegram!.hasPairingHandler?.() === true),
+      whyNoButtons: () => {
+        const why = (ctx.telegram as unknown as { isPolling?: boolean }).isPolling === true && ctx.telegram!.hasPairingHandler?.() !== true
+          ? 'this agent reads Telegram directly, not through its listener'
+          : lifelineIngressGuard.tapsUnprovableReason();
+        return why ? `${why} (Instar ${ctx.config.version || 'unknown version'})` : null;
+      },
+      // Invites that were waiting for approval when the server restarted: told once each (spec §8).
+      restartNotices: ctx.pairingInvites.markers
+        ? { list: () => ctx.pairingInvites!.markers!.notices(), markNotified: (id: string) => ctx.pairingInvites!.markers!.markTelegramNotified(id) }
+        : undefined,
+      // The expiry in that notice is in the owner's own time zone when their user profile has one.
+      timeZone: async (owner) => {
+        if (owner === undefined) return undefined;
+        const { UserManager } = await import('../users/UserManager.js');
+        return new UserManager(ctx.config.stateDir).resolveFromTelegramUserId(owner)?.preferences?.timezone;
+      },
     })
     : null;
+  ctx.telegram?.setPairingHandler?.(pairingInviteTelegram ?? null);
   ctx.guardRegistry?.register('telegramIngress.lifelineSecret', () => lifelineIngressGuard.guardStatus());
   // One inline-button tap has one effect, however many times it is delivered.
   // Proven taps go to the durable store; a tap accepted without proof (only
@@ -4979,14 +5094,26 @@ export function createRoutes(ctx: RouteContext): Router {
     const maxSessions = ctx.config.sessions?.maxSessions ?? 10;
     const sessionExhausted = sessionCount >= maxSessions;
 
-    let totalFailures = 0;
-    if (ctx.scheduler) {
-      const jobs = ctx.scheduler.getJobs();
-      for (const j of jobs) {
-        const st = ctx.state.getJobState(j.slug);
-        if (st) totalFailures += st.consecutiveFailures;
-      }
-    }
+    // Job-failure counting is CURRENCY-BOUNDED: `consecutiveFailures` is durable
+    // state that never self-clears, so without a bound one old failure pins /health
+    // "degraded" for the rest of the process lifetime. A disabled job is the acute
+    // case — it can never run, so its count can never come down. Both exclusions are
+    // REPORTED (see `staleJobFailures` below), never dropped. See
+    // ./jobFailureCurrency.ts for the incident this was earned from.
+    const jobFailures = ctx.scheduler
+      ? summarizeJobFailures(
+          ctx.scheduler.getJobs().map((j) => {
+            const st = ctx.state.getJobState(j.slug);
+            return {
+              slug: j.slug,
+              enabled: j.enabled,
+              failures: st?.consecutiveFailures ?? 0,
+              lastRun: st?.lastRun ?? null,
+            };
+          }),
+        )
+      : { current: 0, stale: [], staleTotal: 0 };
+    const totalFailures = jobFailures.current;
 
     // Only RECENT degradations count toward health status + the reported count/summary.
     // Events are append-only and never self-clear, so a single old transient fallback
@@ -5054,6 +5181,16 @@ export function createRoutes(ctx: RouteContext): Router {
       base.sessions = { current: sessionCount, max: maxSessions };
       base.schedulerRunning = ctx.scheduler !== null;
       base.consecutiveJobFailures = totalFailures;
+      // What the currency bound excluded, so the information is MOVED rather than
+      // lost: a disabled-but-failing job stays visible to anyone reading /health
+      // without pinning the health verdict. Absent when there is nothing excluded.
+      if (jobFailures.stale.length > 0) {
+        base.staleJobFailures = {
+          total: jobFailures.staleTotal,
+          windowHours: JOB_FAILURE_WINDOW_MS / (60 * 60 * 1000),
+          jobs: jobFailures.stale,
+        };
+      }
 
       // Cross-Machine Seamlessness (spec §11) — the Phase-1 "feature is alive"
       // surface. Always present with valid fields (never null/503), even on a
@@ -5140,6 +5277,32 @@ export function createRoutes(ctx: RouteContext): Router {
             } catch { return null; /* @silent-fallback-ok — evidence only */ }
           })(),
         },
+        // Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9): the live mode
+        // (off | watch | enforce) and the process-wide counters. AUTHED only.
+        encryptToPinned: (() => {
+          const mode = resolveEncryptToPinnedMode(
+            {
+              enabled: ctx.liveConfig?.get<boolean | undefined>('threadline.encryptToPinned.enabled', undefined),
+              dryRun: ctx.liveConfig?.get<boolean | undefined>('threadline.encryptToPinned.dryRun', undefined),
+            },
+            ctx.config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
+          );
+          return { ...mode, mode: encryptToPinnedModeName(mode), ...encryptToPinnedCounters };
+        })(),
+        // Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6, step 6): the live
+        // mode (off | watch | enforce) and the process-wide counters. AUTHED only.
+        refuseDowngrade: (() => {
+          const mode = resolveRefuseDowngradeMode(
+            {
+              enabled: ctx.liveConfig?.get<boolean | undefined>('threadline.refuseDowngrade.enabled', undefined),
+              dryRun: ctx.liveConfig?.get<boolean | undefined>('threadline.refuseDowngrade.dryRun', undefined),
+            },
+            ctx.config as { developmentAgent?: boolean; threadline?: { refuseDowngrade?: { enabled?: boolean; dryRun?: boolean } } },
+          );
+          // `refusals`: one record per peer whose plaintext was refused, with the named reason,
+          // the remedy and the notices sent back (Echo, 2026-10-20: never a silent drop).
+          return { ...mode, mode: refuseDowngradeModeName(mode), ...refuseDowngradeCounters, refusals: downgradeRefusals.snapshot() };
+        })(),
       };
       // Inbound-id ledger counters (spec "Migration parity" → counters): in
       // memory, surfaced on the AUTHED /health beside the relay verdicts.
@@ -9776,7 +9939,7 @@ export function createRoutes(ctx: RouteContext): Router {
         failed.push({ machineId: machine.machineId, error: 'offline' });
         return;
       }
-      if (!isPeerUrlAllowedForCredentials(url, extraAllowlist).ok) {
+      if (!isPeerUrlAllowedForCredentials({ url, kind: 'last-known-url' }, extraAllowlist).ok) {
         // Credentials are never attached to a rejected URL.
         failed.push({ machineId: machine.machineId, error: 'url-rejected' });
         return;
@@ -10387,7 +10550,7 @@ export function createRoutes(ctx: RouteContext): Router {
           failed.push({ machineId: m.machineId, reason: 'offline' });
           return;
         }
-        const verdict = isPeerUrlAllowedForCredentials(m.lastKnownUrl, extraAllowlist);
+        const verdict = isPeerUrlAllowedForCredentials({ url: m.lastKnownUrl, kind: 'last-known-url' }, extraAllowlist);
         if (!verdict.ok) {
           // The Bearer token was NEVER attached (spec §3(c)) — visible, named.
           failed.push({ machineId: m.machineId, reason: 'url-rejected' });
@@ -10784,28 +10947,9 @@ export function createRoutes(ctx: RouteContext): Router {
         }
       }
 
-      // Add platform indicator and display name
-      if (ctx.telegram) {
-        const topicId = ctx.telegram.getTopicForSession?.(s.tmuxSession);
-        if (topicId) {
-          result.platform = 'telegram';
-          result.platformId = topicId;
-          const topicName = ctx.telegram.getTopicName?.(topicId);
-          if (topicName && !/^topic-\d+$/.test(topicName)) result.platformName = topicName;
-        }
-      }
-      if (!result.platform && ctx.slack) {
-        const channelId = ctx.slack.getChannelForSession(s.tmuxSession);
-        if (channelId) {
-          result.platform = 'slack';
-          result.platformId = channelId;
-          const registry = ctx.slack.getChannelRegistry();
-          if (registry[channelId]?.channelName) result.platformName = registry[channelId].channelName;
-        }
-      }
-      if (!result.platform) {
-        result.platform = 'headless';
-      }
+      // Add platform indicator and display name (shared with the dashboard
+      // WebSocket list so local and pooled rows can never disagree).
+      Object.assign(result, resolveSessionPlatform(s.tmuxSession, ctx.telegram, ctx.slack));
 
       return result;
     });
@@ -10835,7 +10979,7 @@ export function createRoutes(ctx: RouteContext): Router {
       const peerQuery = includeAll ? '?include=all' : explicitStatus ? `?status=${explicitStatus}` : '';
       await Promise.all(peers.map(async (p) => {
         try {
-          const r = await fetch(`${p.url}/sessions${peerQuery}`, {
+          const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/sessions${peerQuery}`, {
             headers: { Authorization: `Bearer ${ctx.config.authToken}` },
             signal: AbortSignal.timeout(5000),
           });
@@ -11176,7 +11320,57 @@ export function createRoutes(ctx: RouteContext): Router {
   /** §3.6 — seeds made from the default since boot (the sheet's count). */
   let newTopicDefaultSeedsSinceBoot = 0;
 
-  // §3.1 — what the dropdowns may offer on THIS machine.
+  // dashboard-new-session-machine-choice §3.4 step 0 — the TARGET's verdict on a
+  // door/model choice for a topic it is about to start (the parent's validator,
+  // against THIS machine's doors). Read-only; the intent header marks it as part
+  // of a create.
+  // @write-domain:none
+  router.post('/topic-profile/validate-choice', (req, res) => {
+    if (req.headers['x-instar-request'] !== '1') {
+      res.status(403).json({ error: 'validate-choice requires the X-Instar-Request: 1 intent header' });
+      return;
+    }
+    const tp = ctx.topicProfile;
+    if (!tp) {
+      res.status(503).json({ ok: false, code: 'topic-profile-unavailable', error: 'Topic profiles not wired on this server' });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const valid = validateDashboardProfileChoice(dashboardChoiceDeps(tp), { framework: body.framework, model: body.model });
+    if (!valid.ok) {
+      res.status(400).json({ ok: false, code: valid.code, error: valid.reason });
+      return;
+    }
+    res.json({ ok: true, framework: valid.framework, model: valid.model });
+  });
+
+  // §3.1 — what the dropdowns may offer on THIS machine. With ?machine=<id> for a
+  // peer (dashboard-new-session-machine-choice §3.4 step 0): that machine's doors
+  // and models, keeping THIS machine's new-topic default.
+  router.get('/topic-profile/options', async (req, res, next) => {
+    const machine = typeof req.query.machine === 'string' ? req.query.machine.trim() : '';
+    if (!machine || machine === ctx.meshSelfId) { next(); return; }
+    const peer = (ctx.resolvePeerUrls?.() ?? []).find((p) => p.machineId === machine);
+    if (!peer) {
+      res.status(404).json({ error: `No reachable machine "${machine}"` });
+      return;
+    }
+    try {
+      const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, peer, `/topic-profile/options`, {
+        headers: { Authorization: `Bearer ${ctx.config.authToken}`, 'X-Instar-AgentId': ctx.config.projectName },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!r.ok) {
+        res.status(502).json({ error: `That machine answered HTTP ${r.status}` });
+        return;
+      }
+      const remote = (await r.json()) as Record<string, unknown>;
+      const local = ctx.topicProfile?.newTopicDefault?.read() ?? null;
+      res.json({ ...remote, machine, newTopicDefault: { ...(local ?? { framework: null, model: null }), seedsSinceBoot: newTopicDefaultSeedsSinceBoot } });
+    } catch (err) {
+      res.status(502).json({ error: `Couldn't reach that machine: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  });
   router.get('/topic-profile/options', (_req, res) => {
     const tp = ctx.topicProfile;
     if (!tp) {
@@ -11882,7 +12076,7 @@ export function createRoutes(ctx: RouteContext): Router {
     const nickname = ctx.machinePoolRegistry?.getCapacity(machineId)?.nickname ?? machine.nickname;
     const extraAllowlist = (ctx.config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)
       ?.peerUrlAllowlist;
-    if (!isPeerUrlAllowedForCredentials(machine.lastKnownUrl, extraAllowlist).ok) {
+    if (!isPeerUrlAllowedForCredentials({ url: machine.lastKnownUrl, kind: 'last-known-url' }, extraAllowlist).ok) {
       // The pool Bearer token NEVER travels to a non-allowlisted URL —
       // stronger here than on the read fan-out because this verb is
       // destructive (§2.1 shipping dependency).
@@ -11975,9 +12169,127 @@ export function createRoutes(ctx: RouteContext): Router {
     const resolvedPlatform = platform || (headless ? 'headless' : (ctx.telegram ? 'telegram' : (ctx.slack ? 'slack' : 'headless')));
     const tp = ctx.topicProfile;
 
+    // dashboard-new-session-machine-choice §3.2 — a machine pick is a placement
+    // write, validated BEFORE anything is created. Automatic (absent / '' /
+    // 'auto') skips every rule here and behaves exactly as before.
+    let machineChoice: CreateMachineChoice = { kind: 'auto' };
+    let remoteStart: DashboardCreateStart | null = null;
+    const machineNotices: string[] = [];
+    if (hasMachinePick(body.machine)) {
+      if (req.headers['x-instar-request'] !== '1') {
+        res.status(403).json({ error: 'Choosing a machine requires the X-Instar-Request: 1 intent header' });
+        return;
+      }
+      if (resolvedPlatform !== 'telegram' || !ctx.telegram) {
+        res.status(400).json({
+          ok: false,
+          code: 'machine-needs-telegram',
+          error: resolvedPlatform !== 'telegram'
+            ? `Choosing a machine needs a Telegram topic — "${resolvedPlatform}" sessions don't support it`
+            : 'Choosing a machine needs a Telegram topic, and Telegram is not connected on this server',
+        });
+        return;
+      }
+      const seamAnswer = tp?.sessionPoolLocalClaim?.() ?? { kind: 'dark' as const };
+      if (seamAnswer.kind === 'dark' || !ctx.topicPinStore) {
+        res.status(400).json({ ok: false, code: 'machine-choice-unavailable', reason: 'pool-dark', error: 'Choosing a machine needs the multi-machine session pool, which is not running on this agent. Use Automatic.' });
+        return;
+      }
+      // not-authoritative falls through to the existing placement pre-check below.
+      if (seamAnswer.kind === 'ready') {
+        if (!tp?.pinReplicationLive?.() || !ctx.replicatedRecordEmitter) {
+          res.status(400).json({ ok: false, code: 'machine-choice-unavailable', reason: 'pin-replication-dark', error: 'Choosing a machine needs machine pins to be shared between machines (multiMachine.seamlessness.ws13PinReplicate), which is off on this agent. Use Automatic.' });
+          return;
+        }
+        const caps = ctx.machinePoolRegistry?.getCapacities() ?? [];
+        const choice = resolveCreateMachineChoice({ machine: body.machine, selfMachineId: ctx.meshSelfId ?? null, capacities: caps });
+        if (choice.kind === 'error') {
+          res.status(choice.status).json({ ok: false, code: choice.code, error: choice.error, ...(choice.known ? { known: choice.known } : {}) });
+          return;
+        }
+        if (choice.kind === 'remote') {
+          const cap = caps.find((c) => c.machineId === choice.machineId);
+          if (cap && cap.clockSkewStatus === 'suspect-clock-removed') {
+            res.status(409).json({ ok: false, code: 'machine-clock-suspect', error: `${choice.nickname}'s clock is out of step with the other machines right now, so it can't take new topics. Pick another machine or Automatic.` });
+            return;
+          }
+          if (!tp.startTopicOnMachine || tp.startSeamWired?.() === false) {
+            res.status(400).json({ ok: false, code: 'machine-choice-unavailable', reason: 'start-not-wired', error: 'This server cannot start topics on other machines yet. Use Automatic.' });
+            return;
+          }
+          if (cap?.seamlessnessFlags?.dashboardCreateReceive !== true) {
+            res.status(409).json({ ok: false, code: 'machine-needs-update', error: `${choice.nickname} can't start dashboard topics yet (it needs the latest Instar version, the session pool and Telegram). Pick another machine or Automatic.` });
+            return;
+          }
+          if (choice.quotaBlocked) machineNotices.push('machine-quota-blocked');
+          // §3.4 step 0 — the mesh plane the start will ride is probed FIRST (one
+          // signed read-class `session-status`), so a target reachable over HTTP
+          // but not over the mesh is refused here, never pinned in `unknown`.
+          if (tp.probeMachineReachable) {
+            let reachable = false;
+            try { reachable = await tp.probeMachineReachable(choice.machineId); } catch { /* @silent-fallback-ok: refused below with 502 machine-unreachable */ reachable = false; }
+            if (!reachable) {
+              res.status(502).json({ ok: false, code: 'machine-unreachable', reason: 'mesh', step: 'validate-on-target', error: `Couldn't reach ${choice.nickname} over the machine-to-machine link (the one the start uses), so the topic was not created. Check its tunnel or local-network link, then try again.` });
+              return;
+            }
+          }
+          // §3.4 step 0 — the door/model is validated on the TARGET.
+          const def = hasPreference ? null : (tp.newTopicDefault?.read() ?? null);
+          const want = hasPreference
+            ? { framework: body.framework, model: body.model, source: 'dashboard-create' as const }
+            : def ? { framework: def.framework, model: def.model ?? null, source: 'new-topic-default' as const } : null;
+          let validated: { framework: string; model: string | null } | null = null;
+          if (want) {
+            const peer = (ctx.resolvePeerUrls?.() ?? []).find((p) => p.machineId === choice.machineId);
+            if (!peer) {
+              res.status(502).json({ ok: false, code: 'machine-unreachable', step: 'validate-on-target', error: `Couldn't reach ${choice.nickname} to check the door and model, so the topic was not created.` });
+              return;
+            }
+            let verdict: { ok?: boolean; framework?: string; model?: string | null; code?: string; error?: string } = {};
+            try {
+              const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, peer, `/topic-profile/validate-choice`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${ctx.config.authToken}`, 'X-Instar-AgentId': ctx.config.projectName, 'Content-Type': 'application/json', 'X-Instar-Request': '1' },
+                body: JSON.stringify({ framework: want.framework, model: want.model }),
+                signal: AbortSignal.timeout(5000),
+              });
+              if (r.status === 401 || r.status === 403) {
+                // The peer did not accept this machine's API token: the pool's
+                // Bearer read plane (every ?scope=pool view) fails to it the same
+                // way. Refuse by name — never start on an unchecked door.
+                res.status(502).json({ ok: false, code: 'machine-unreachable', reason: 'peer-auth', step: 'validate-on-target', error: `${choice.nickname} did not accept this machine's credentials for the door check (HTTP ${r.status}; its pool views fail the same way), so the topic was not created. The machines need matching API tokens for cross-machine reads.` });
+                return;
+              }
+              verdict = (await r.json().catch(() => ({}))) as typeof verdict;
+              if (!r.ok && verdict.ok === undefined) throw new Error(`HTTP ${r.status}`);
+            } catch (err) {
+              res.status(502).json({ ok: false, code: 'machine-unreachable', step: 'validate-on-target', error: `Couldn't reach ${choice.nickname} to check the door and model (${err instanceof Error ? err.message : String(err)}), so the topic was not created.` });
+              return;
+            }
+            if (verdict.ok === true && typeof verdict.framework === 'string') {
+              validated = { framework: verdict.framework, model: typeof verdict.model === 'string' ? verdict.model : null };
+            } else if (want.source === 'dashboard-create') {
+              res.status(400).json({ ok: false, code: verdict.code ?? 'choice-refused-on-target', step: 'validate-on-target', error: `${choice.nickname} can't run that choice: ${verdict.error ?? 'refused'}` });
+              return;
+            } else {
+              machineNotices.push('default-not-available-on-target');
+            }
+          }
+          remoteStart = {
+            framework: validated?.framework ?? null,
+            model: validated?.model ?? null,
+            source: validated ? want!.source : null,
+            machineNickname: choice.nickname,
+          };
+        }
+        machineChoice = choice;
+      }
+    }
+
     // §3.3 step 1 — a preference is a profile write: intent header, Telegram
-    // only, validated BEFORE anything is created.
-    if (hasPreference) {
+    // only, validated BEFORE anything is created. A remote machine pick was
+    // validated on the target above.
+    if (hasPreference && machineChoice.kind !== 'remote') {
       if (req.headers['x-instar-request'] !== '1') {
         res.status(403).json({ error: 'Choosing a door/model requires the X-Instar-Request: 1 intent header' });
         return;
@@ -12031,7 +12343,7 @@ export function createRoutes(ctx: RouteContext): Router {
         topicId = topic.topicId;
         reused = topic.reused === true;
       } catch (err) {
-        if (hasPreference) {
+        if (hasPreference || machineChoice.kind !== 'auto') {
           res.status(502).json({ ok: false, step: 'create-topic', error: `Telegram topic creation failed: ${err instanceof Error ? err.message : String(err)}` });
           return;
         }
@@ -12040,8 +12352,159 @@ export function createRoutes(ctx: RouteContext): Router {
 
       if (topicId !== undefined) {
         const key = String(topicId);
-        if (reused && hasPreference) {
-          res.status(409).json({ ok: false, code: 'topic-exists', topicId, step: 'create-topic', error: 'A topic with this name already exists — switch it from its session view.' });
+        if (reused && (hasPreference || machineChoice.kind !== 'auto')) {
+          res.status(409).json({ ok: false, code: 'topic-exists', topicId, step: 'create-topic', error: machineChoice.kind !== 'auto' ? 'A topic with this name already exists — a machine choice never moves an existing topic. Use "move this to <machine>" in that topic instead.' : 'A topic with this name already exists — switch it from its session view.' });
+          return;
+        }
+
+        // dashboard-new-session-machine-choice §3.3/§3.4 step 3d — pin the new
+        // topic to the chosen machine (the ONE-HLC pin funnel, same as POST
+        // /pool/transfer). Written AFTER ownership is placed (never for a refused
+        // start), so an ownership reconciler adopting a replicated pin can never race
+        // the placement. A pin failure after the placement is reported, never fatal —
+        // ownership already routes the topic.
+        const pinChosenMachine = async (machineId: string): Promise<boolean> => {
+          try {
+            const { setPinWithOneHlc } = await import('../core/TopicPinMutation.js');
+            setPinWithOneHlc(
+              { pinStore: ctx.topicPinStore!, emitter: ctx.replicatedRecordEmitter ?? null },
+              key,
+              machineId,
+              true,
+              { kind: 'agent', sessionRef: 'dashboard-create' },
+            );
+            return true;
+          } catch {
+            // @silent-fallback-ok: surfaced to the operator as the machine-pin-not-written notice
+            machineNotices.push('machine-pin-not-written');
+            return false;
+          }
+        };
+
+        // §3.4 — another machine: no local claim, seed or spawn.
+        if (machineChoice.kind === 'remote' && remoteStart) {
+          const target = machineChoice;
+          // step 2 — the lease may have moved since validation.
+          const again = tp?.sessionPoolLocalClaim?.() ?? { kind: 'dark' as const };
+          if (again.kind !== 'ready') {
+            // Nothing was placed, so a pin here cannot race a placement: write it so
+            // the new lease holder places the topic's first message on the target.
+            const pinned = await pinChosenMachine(target.machineId);
+            res.status(409).json({
+              ok: false, code: 'placement-not-authoritative-here', topicId, step: 'place', pinned,
+              error: pinned
+                ? `The topic was created and pinned to ${target.nickname}, but this machine stopped placing new topics before it could start it. Send the topic a message: it starts on ${target.nickname}.`
+                : `The topic was created, but this machine stopped placing new topics before it could start it on ${target.nickname}, and the pin could not be written. Send the topic a message, then move it with "move this to ${target.nickname}".`,
+            });
+            return;
+          }
+          // step 3 — place → checked deliver → settle → pin (3a–3d).
+          const label = safeMachineLabel(target.nickname, target.machineId);
+          const started = await tp!.startTopicOnMachine!(key, target.machineId, { ...remoteStart, machineNickname: label }, () => pinChosenMachine(target.machineId));
+          if (!started.ok && started.code === 'topic-owned-elsewhere') {
+            res.status(409).json({ ok: false, code: 'topic-owned-elsewhere', topicId, step: 'place', reason: started.reason, error: 'This topic is already owned by a machine — nothing was started.' });
+            return;
+          }
+          if (!started.ok && started.code === 'start-superseded') {
+            // step 3c — another machine took the topic during the deliver round
+            // trip: its placement stands; nothing pinned or posted from here.
+            const ownerCap = started.ownerNow ? (ctx.machinePoolRegistry?.getCapacities() ?? []).find((c) => c.machineId === started.ownerNow) : undefined;
+            const ownerLabel = ownerCap ? safeMachineLabel(ownerCap.nickname, ownerCap.machineId) : (started.ownerNow ?? 'another machine');
+            const sameTarget = started.ownerNow === target.machineId;
+            const whatHappened = started.statusNow === 'missing'
+              ? `The topic's ownership record disappeared while it was being started on ${target.nickname}, so this start is not asserted over it and the topic is not pinned to ${target.nickname}. Send the topic a message: placement starts it afresh.`
+              : started.ownerNow == null || started.statusNow === 'released'
+              ? `The topic's ownership record was released while it was being started on ${target.nickname} (another placement moved it on), so this start is not asserted over it and the topic is not pinned to ${target.nickname}. Send the topic a message: placement starts it afresh.`
+              : sameTarget
+                ? `The topic's ownership record moved on to a newer placement on ${target.nickname} while this start was in flight, so this start is not asserted over it and no pin was written here. Send the topic a message: it goes to ${target.nickname} under that newer placement.`
+                : `${ownerLabel} took ownership of the topic while it was being started on ${target.nickname}, so it is not pinned to ${target.nickname}. Send the topic a message: it goes to ${ownerLabel}.`;
+            res.status(202).json({
+              ok: true, session: null, name: topicName, topicId, slackChannelId: null, platform: resolvedPlatform,
+              headless: false, reused: false,
+              machine: { machineId: target.machineId, nickname: target.nickname },
+              started: started.delivered === 'rejected' ? 'refused' : started.delivered === 'accepted' ? 'requested' : 'unknown',
+              ownership: 'superseded',
+              ownerNow: { machineId: started.ownerNow, nickname: ownerCap?.nickname ?? null, status: started.statusNow, epoch: started.epochNow },
+              profileRequested: remoteStart.framework ? { framework: remoteStart.framework, model: remoteStart.model } : null,
+              profileValidatedOn: remoteStart.framework ? target.machineId : null,
+              notices: machineNotices,
+              error: `${whatHappened}${started.delivered === 'rejected' || sameTarget ? '' : ` If ${target.nickname} also started a session, the duplicate is closed automatically.`}`,
+            });
+            return;
+          }
+          if (!started.ok && started.code === 'start-failed') {
+            // step 3 rejected — released and NOT pinned (a refusing target is never
+            // pinned); the topic is free for ordinary placement on its next message.
+            if (!started.settled) machineNotices.push('ownership-not-confirmed');
+            res.status(502).json({
+              ok: false, code: 'start-remote-failed', step: 'start-remote', topicId, released: started.released,
+              notices: machineNotices,
+              error: started.settled
+                ? `${target.nickname} refused to start the session (${started.error}). The topic exists but is not pinned: send it a message and it starts wherever placement puts it, or pick ${target.nickname} again once it accepts starts. The chosen door and model were not applied.`
+                : `${target.nickname} refused to start the session (${started.error}), and this machine could not confirm the topic's ownership record. The topic exists and is not pinned. If your messages in it go unanswered, move it with "move this to ${target.nickname}". The chosen door and model were not applied.`,
+            });
+            return;
+          }
+          // step 3e — the creator's one line, once the start was handed over (or
+          // may have been): it describes the placement THIS machine just made and
+          // the door/model REQUESTED; the target posts only corrections.
+          const doorText = remoteStart.framework
+            ? ` Requested: ${frameworkLabel(remoteStart.framework)}${remoteStart.model ? ` · ${remoteStart.model}` : ''}.`
+            : '';
+          const line = started.ok
+            ? `This topic is assigned to ${label}; its session is starting there.${doorText}`
+            : `This topic is assigned to ${label}. No confirmation came back that its session started — send a message here and it goes to ${label}.${doorText}`;
+          try {
+            await (tp!.discloseCreationSeed?.(key, line) ?? Promise.resolve(undefined));
+          } catch {
+            machineNotices.push('machine-notice-not-sent');
+          }
+          const settled = (started as { settled?: boolean }).settled !== false;
+          if (!settled) {
+            machineNotices.push('ownership-not-confirmed');
+            res.status(202).json({
+              ok: true, session: null, name: topicName, topicId, slackChannelId: null, platform: resolvedPlatform,
+              headless: false, reused: false,
+              machine: { machineId: target.machineId, nickname: target.nickname },
+              started: started.ok ? 'requested' : 'unknown',
+              ownership: 'not-confirmed',
+              profileRequested: remoteStart.framework ? { framework: remoteStart.framework, model: remoteStart.model } : null,
+              profileValidatedOn: remoteStart.framework ? target.machineId : null,
+              notices: machineNotices,
+              error: `The start was sent to ${target.nickname}, but this machine could not confirm the topic's ownership record. If your messages in the topic go unanswered, move it with "move this to ${target.nickname}".`,
+            });
+            return;
+          }
+          if (!started.ok) {
+            // start-unknown — no definitive answer; ownership is kept on the target.
+            res.status(202).json({
+              ok: true, session: null, name: topicName, topicId, slackChannelId: null, platform: resolvedPlatform,
+              headless: false, reused: false,
+              machine: { machineId: target.machineId, nickname: target.nickname },
+              started: 'unknown',
+              detail: started.error,
+              profileRequested: remoteStart.framework ? { framework: remoteStart.framework, model: remoteStart.model } : null,
+              profileValidatedOn: remoteStart.framework ? target.machineId : null,
+              notices: machineNotices,
+              error: `No confirmation came back from ${target.nickname}, so the session may or may not have started there. Send the topic a message: it goes to ${target.nickname} either way. If the start never arrived, it begins on that machine's default door and model.`,
+            });
+            return;
+          }
+          res.status(201).json({
+            ok: true,
+            session: null,
+            name: topicName,
+            topicId,
+            slackChannelId: null,
+            platform: resolvedPlatform,
+            headless: false,
+            reused: false,
+            machine: { machineId: target.machineId, nickname: target.nickname },
+            started: 'requested',
+            profileRequested: remoteStart.framework ? { framework: remoteStart.framework, model: remoteStart.model } : null,
+            profileValidatedOn: remoteStart.framework ? target.machineId : null,
+            notices: machineNotices,
+          });
           return;
         }
 
@@ -12066,6 +12529,7 @@ export function createRoutes(ctx: RouteContext): Router {
             return;
           }
         }
+        if (machineChoice.kind === 'self' && !reused) await pinChosenMachine(machineChoice.machineId);
 
         // Step 3 — seed (explicit pick, else the new-topic default). Never on reuse.
         let seed: Awaited<ReturnType<typeof seedTopicProfileAtCreation>> | null = null;
@@ -12156,7 +12620,7 @@ export function createRoutes(ctx: RouteContext): Router {
             source: resolved.sources,
             label: frameworkLabel(resolved.framework),
           },
-          notices: resolved.notices,
+          notices: machineNotices.length ? [...resolved.notices, ...machineNotices] : resolved.notices,
           seed: seed
             ? (seed.outcome === 'seeded'
               ? { outcome: 'seeded', framework: seed.framework, model: seed.model, modelDropped: seed.modelDropped }
@@ -12164,6 +12628,7 @@ export function createRoutes(ctx: RouteContext): Router {
             : null,
           placement: settled,
           switchableAfterFirstMessage: true,
+          ...(machineChoice.kind === 'self' ? { machine: { machineId: machineChoice.machineId, nickname: machineChoice.nickname }, started: 'here' } : {}),
         });
         return;
       }
@@ -12945,7 +13410,7 @@ export function createRoutes(ctx: RouteContext): Router {
         if (!m.lastKnownUrl) { failed.push({ machineId: m.machineId, reason: 'no-known-url' }); return; }
         if (capacity && capacity.online === false) { failed.push({ machineId: m.machineId, reason: 'offline' }); return; }
         const extraAllowlist = (ctx.config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
-        const verdict = isPeerUrlAllowedForCredentials(m.lastKnownUrl, extraAllowlist);
+        const verdict = isPeerUrlAllowedForCredentials({ url: m.lastKnownUrl, kind: 'last-known-url' }, extraAllowlist);
         if (!verdict.ok) { failed.push({ machineId: m.machineId, reason: 'url-rejected' }); return; }
         peersQueried++;
         try {
@@ -14047,6 +14512,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       } : null,
       // Why the last readiness call failed: the exact check, a scrubbed excerpt, the candidates.
       lastReadinessFailure: ctx.feedbackDrain.store.lastReadinessDiagnosis(),
+      // Progress age (spec line 270): failed ticks in a row, when that run started, last success.
+      readinessProgress: authority ? ctx.feedbackDrain.store.readinessProgress(authority.authorityId, authority.generation) : null,
       consumerPromotion: (() => {
         const promotion = ctx.feedbackDrain!.promotion.read();
         return promotion ? { live: ctx.feedbackDrain!.promotion.isLive(), approvedBatchBound: promotion.approvedBatchBound, approvedAt: promotion.approvedAt, revoked: promotion.revokedAt !== null } : null;
@@ -15491,6 +15958,20 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     res.json({ ok: true, enabled: true });
   });
 
+  // ── local-verify (local-verify-merge-authority §2) ─────────────────────
+  // The server runs the full suite on a PR's merge tree and keeps the result.
+  // 503 when not constructed; a standby answers 409 naming the lease holder.
+  registerLocalVerifyRoutes(router, {
+    service: () => ctx.localVerify ?? null,
+    status: () => ctx.localVerifyStatus ?? null,
+    lease: ctx.coordinator
+      ? {
+          holdsLease: () => ctx.coordinator!.holdsLease(),
+          holderMachineId: () => ctx.coordinator!.getSyncStatus().leaseHolder ?? null,
+        }
+      : undefined,
+  });
+
   // ── Green-PR auto-merge (green-pr-automerge-enforcement) ──────────────
   // The watcher is null on installs with no analyzable instar repo + safe-merge,
   // or when disabled in config → routes 503. The GuardLatchStore may exist even
@@ -16224,7 +16705,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         try {
           // The actual peer fetch — called WITHOUT scope=pool (no recursion).
           const fetchPeerJobs = async () => {
-            const r = await fetch(`${p.url}/jobs`, {
+            const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/jobs`, {
               headers: { Authorization: `Bearer ${ctx.config.authToken}` },
               signal: AbortSignal.timeout(JOBS_PEER_TIMEOUT_MS),
             });
@@ -17411,7 +17892,11 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       return;
     }
 
-    const { name, color, firstMessage } = req.body;
+    const { name, color, firstMessage, kind } = req.body;
+    if (kind !== undefined && kind !== 'issue' && kind !== 'conversation') {
+      res.status(400).json({ error: '"kind" must be "issue" or "conversation" when given' });
+      return;
+    }
     if (!name || typeof name !== 'string' || name.trim().length < 1) {
       res.status(400).json({ error: '"name" is required (non-empty string)' });
       return;
@@ -17441,7 +17926,10 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const iconColor = typeof color === 'number' ? color : 9367192;
 
     try {
-      const topic = await ctx.telegram.findOrCreateForumTopic(name.trim(), iconColor, { origin: 'user' });
+      // An issue topic goes to the agent's issues group when one is configured
+      // (docs/specs/telegram-issues-group.md); otherwise the main group, as before.
+      const space = kind === 'issue' && ctx.telegram.hasIssuesGroup?.() === true ? 'issues' : 'main';
+      const topic = await ctx.telegram.findOrCreateForumTopic(name.trim(), iconColor, { origin: 'user', space });
 
       // Send initial message if provided — goes through sendToTopic so it's
       // properly logged to JSONL + TopicMemory. This ensures new sessions
@@ -17458,6 +17946,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         created: !topic.reused,
         reused: topic.reused,
         messageSent,
+        group: space,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -17993,6 +18482,10 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
           /* @silent-fallback-ok — §2.4(5) acked-audit is observe-only; never affects delivery */
         }
       }
+      // Pairing (docs/specs/a2a-pairing-invite-link.md §11.8): an invite the agent just posted here
+      // belongs to this topic, so its pairing notices come back here, and the owner is offered
+      // "It's one of my agents" (§11.6). After the send, never blocking or changing it.
+      if (pairingInviteTelegram && PairingInviteTelegram.carriesInvite(text)) void pairingInviteTelegram.noteOutboundInvite(text, topicId);
       res.json({ ok: true, topicId, messageId: sendResult?.messageId, destinationStoreConfirmed });
     } catch (err) {
       // The send failed → release the in-flight reservation so the legitimate
@@ -18194,6 +18687,14 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       }
     });
   }
+
+  // GET /telegram/system-topics — this machine's record of the agent-wide system
+  // topics (📢 Updates, 🔔 Attention, 🩺 Agent Health). A standby reads the lease
+  // holder's record here and adopts it instead of minting its own topics
+  // (src/messaging/SystemTopicAdoption.ts). Read-only.
+  router.get('/telegram/system-topics', (_req, res) => {
+    res.json({ topics: readSystemTopicIds((key) => ctx.state.get(key)), holdsLease: !ctx.state.readOnly });
+  });
 
   // POST /telegram/post-update — route an update/announcement message to the
   // Agent Updates topic, deterministically.
@@ -18660,7 +19161,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         }
         try {
           const fetchPeer = async () => {
-            const r = await fetch(`${p.url}/threadline/pairing`, {
+            const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/threadline/pairing`, {
               headers: { Authorization: `Bearer ${ctx.config.authToken}` },
               signal: AbortSignal.timeout(PAIRING_PEER_TIMEOUT_MS),
             });
@@ -18738,6 +19239,54 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     else res.status(failStatus).json({ error: r.reason });
   };
 
+  // Switch the agent network and pairing on, at the operator's request, with no restart asked of
+  // the operator (upgrades/side-effects/threadline-enable-without-restart.md). Bearer: it only opts
+  // THIS agent in, as the operator would by editing config. Writes threadline.relayEnabled and
+  // threadline.verifiedPairing.enabled, then requests the server's existing supervised restart (the
+  // flag the auto-updater writes) when one is needed, safe and allowed (connectEnable.ts). The asking
+  // session survives the restart and waits. Idempotent: call again to read the state; `ready` once
+  // pairing works. Body: { sessionId?: string } (the asking session, excluded from the deferral check).
+  let connectEnable: ConnectEnableController | null = null;
+  // Read-only: is a deferred request still waiting, and did one give up (with why)? Bearer.
+  router.get('/threadline/pairing/enable', (req, res) => {
+    if (!pairingRouteAuthorized(req, res)) return;
+    const ready = verifiedPairingRouteEnabled() && !!ctx.pairingInvites;
+    res.json({ ready, ...(connectEnable ? connectEnable.status() : { deferred: false, deferredSince: null, last: readConnectEnableStatus(ctx.config.stateDir) }) });
+  });
+  router.post('/threadline/pairing/enable', (req, res) => {
+    if (!pairingRouteAuthorized(req, res)) return;
+    if (!connectEnable) {
+      connectEnable = new ConnectEnableController({
+        stateDir: ctx.config.stateDir,
+        isReady: () => verifiedPairingRouteEnabled() && !!ctx.pairingInvites,
+        bootRelayEnabled: () => ctx.config.threadline?.relayEnabled === true,
+        bootPairingEnabled: () => verifiedPairingRouteEnabled(),
+        ownsRelayAfterRestart: () => shouldOwnTelegramPoll(ctx.config as never),
+        blockers: (exclude) => ctx.autoUpdater?.getRestartBlockers((n) => exclude.includes(n)) ?? [],
+      });
+    }
+    // A session id is a short token; anything longer is not one, and is ignored rather than cut.
+    const rawSid = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+    const sid = rawSid.length <= 200 ? rawSid : '';
+    const exclude: string[] = [];
+    if (sid) {
+      exclude.push(sid);
+      try {
+        for (const s of ctx.sessionManager.listRunningSessions()) {
+          if (s.id === sid || s.name === sid || s.tmuxSession === sid) exclude.push(s.name, s.tmuxSession);
+        }
+      } catch { /* @silent-fallback-ok — no session list: only the given id is excluded */ }
+    }
+    try {
+      const r = connectEnable.request(exclude);
+      console.log(`[connect-enable] ${r.state}: ${r.reason}`);
+      res.status(r.state === 'unavailable-here' || r.state === 'not-ready-after-restart' ? 409
+        : r.state === 'restart-unavailable' ? 503 : r.state === 'ready' ? 200 : 202).json(r);
+    } catch (err) {
+      res.status(500).json({ error: `could not switch pairing on: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  });
+
   // Make an invite. Body: { ttlMinutes?: number (max 1440), bindFp?: string }.
   router.post('/threadline/pairing/invites', (req, res) => {
     const pi = invitesOrRefuse(req, res);
@@ -18760,7 +19309,19 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         return;
       }
     }
-    sendFlowResult(res, pi.flow.createInvite({ ttlMs, bindFp }), 503);
+    // Optional: the Telegram topic this invite belongs to, so its pairing messages go there
+    // (spec §11.8). Posting the invite in a topic records it too.
+    let topicId: number | undefined;
+    if (body.topicId !== undefined && body.topicId !== null && body.topicId !== '') {
+      topicId = Number(body.topicId);
+      if (!Number.isSafeInteger(topicId) || topicId <= 0) {
+        res.status(400).json({ error: 'topicId must be a positive Telegram topic id' });
+        return;
+      }
+    }
+    const made = pi.handshake.createInvite({ ttlMs, bindFp });
+    if (made.ok && topicId !== undefined) pairingInviteTelegram?.noteInviteTopic(String(made.iid), topicId, String(made.exp));
+    sendFlowResult(res, made, 503);
   });
 
   // This agent's invites (never their secrets) and the invites waiting for this operator's approval.
@@ -18776,7 +19337,27 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       .filter((p) => typeof p.fingerprint === 'string' && /^[0-9a-f]{32}$/.test(p.fingerprint) && p.fingerprint !== ownFp
         && (!p.relayFirstContact || p.pairingState !== undefined))
       .map((p) => ({ fp: p.fingerprint as string, name: p.agent, pairingState: p.pairingState ?? null }));
-    res.json({ invites: pi.store.list(), pendingAccepts: pi.flow.listPendingAccepts(), knownPeers });
+    // restartNotices: invites that were waiting for approval when the server restarted (their
+    // secret was in memory only, so they are gone). Secret-free: a hash id, claimed names, expiry.
+    let restartNotices: unknown[] = [];
+    try { restartNotices = (pi.markers?.notices() ?? []).map(({ id, claimedAgent, claimedOwner, exp }) => ({ id, claimedAgent, claimedOwner, exp })); } catch { restartNotices = []; }
+    res.json({ invites: pi.store.list(), pendingAccepts: pi.flow.listPendingAccepts(), knownPeers, restartNotices, handshake: pi.handshake.sessions() });
+  });
+
+  // Dismiss a restart notice. Bearer: dismissing a reminder grants nothing.
+  router.delete('/threadline/pairing/restart-notices/:id', (req, res) => {
+    const pi = invitesOrRefuse(req, res);
+    if (!pi) return;
+    const id = String(req.params.id || '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(id)) {
+      res.status(400).json({ error: 'id must be 64 hex characters' });
+      return;
+    }
+    if (!pi.markers?.dismiss(id)) {
+      res.status(404).json({ error: 'no such notice' });
+      return;
+    }
+    res.json({ ok: true, id });
   });
 
   // Revoke an open invite (making it useless). Bearer: revoking only removes an option.
@@ -18802,7 +19383,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       res.status(400).json({ error: 'send invite: the message or code you were sent' });
       return;
     }
-    sendFlowResult(res, await pi.flow.receiveInvite(text), 400);
+    sendFlowResult(res, await pi.handshake.receiveInvite(text), 400);
   });
 
   // Recipient's operator approves (PIN). Pins the inviter (not yet credential-eligible) and sends the accept.
@@ -18812,7 +19393,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!checkMandatePin(req, res)) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.approveAccept(iid));
+    sendFlowResult(res, pi.handshake.approveAccept(iid));
   });
 
   // Recipient declines. Bearer: declining only removes an option.
@@ -18821,7 +19402,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!pi) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.declineAccept(iid), 404);
+    sendFlowResult(res, pi.handshake.declineAccept(iid), 404);
   });
 
   // Inviter's operator finishes (PIN): pins the acceptor as verified and sends the signed finish.
@@ -18831,7 +19412,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!checkMandatePin(req, res)) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.approveFinish(iid));
+    sendFlowResult(res, pi.handshake.approveFinish(iid));
   });
 
   // Inviter's operator says the acceptor is not who they meant (PIN). Nothing is pinned; the invite stays used.
@@ -18841,7 +19422,18 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (!checkMandatePin(req, res)) return;
     const iid = iidParam(req, res);
     if (!iid) return;
-    sendFlowResult(res, pi.flow.rejectFinish(iid));
+    sendFlowResult(res, pi.handshake.rejectFinish(iid));
+  });
+
+  // Inviter's operator says this OPEN invite is for one of their own agents (PIN): when it is
+  // accepted, the agent finishes by itself (spec §11.6). An operator act, like Finish.
+  router.post('/threadline/pairing/invites/:iid/own-agent', (req, res) => {
+    const pi = invitesOrRefuse(req, res);
+    if (!pi) return;
+    if (!checkMandatePin(req, res)) return;
+    const iid = iidParam(req, res);
+    if (!iid) return;
+    sendFlowResult(res, pi.handshake.preauthorizeFinish(iid));
   });
 
   // List all pairings (read-only, no SAS words ever). 503 when the feature is off.
@@ -18994,6 +19586,9 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       case 'refused-failed':
         res.status(409).json({ error: 'this pairing was denied by an operator; clearing it requires the dashboard PIN (clearFailed: true)' });
         return;
+      case 'unacceptable-key':
+        res.status(409).json({ error: 'that agent\'s identity key is a weak or non-canonical key, so it cannot be paired' });
+        return;
       default:
         res.json({
           outcome: result.outcome,
@@ -19008,7 +19603,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
   // Operator confirm/deny of a pairing — PIN-GATED (FD7). The local human SAS
   // comparison is the load-bearing security event; the agent Bearer token CANNOT
   // confirm. checkMandatePin is the EXACT mechanism /mandate/issue uses.
-  router.post('/threadline/pairing/:peerFp/verify', (req, res) => {
+  router.post('/threadline/pairing/:peerFp/verify', async (req, res) => {
     if (!verifiedPairingRouteEnabled()) {
       res.status(503).json({ error: 'verified pairing not enabled' });
       return;
@@ -19126,7 +19721,50 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     } catch (err) {
       console.warn(`[pairing] receipt to ${peerFp.slice(0, 12)} not sent: ${err instanceof Error ? err.message : String(err)}`);
     }
-    res.json({ ok: true, peerFp, state: 'mutual-verified', receiptSent });
+    // ── Per-peer homebase topic (peer-conversation-homebase-topic §2.1) ──
+    // Downstream of the trust write and best-effort, exactly like the receipt above: a
+    // notice about a peer used to land in whatever topic its thread happened to start in
+    // (the 2026-10-21 `pp` incident), and the fix is a topic of its own. Creating a Telegram
+    // topic is an external side-effect, so a failure here must never fail or delay a
+    // confirmed pairing — every path returns a reason instead of throwing, and the peer
+    // simply has no homebase, which routes to existing behaviour.
+    // No `= null` initializer on purpose. The catch-block scanner reads each catch plus the
+    // following 19 lines, and a `| null = null` annotation matches its state-reset pattern,
+    // which made it flag the UNRELATED receipt catch above. `undefined` says "no homebase"
+    // just as well without the accidental match. (Keep this note free of the scanner's own
+    // vocabulary too — an explanation that uses those words re-trips the same check.)
+    let homebaseTopicId: number | undefined;
+    try {
+      const { ensurePeerHomebase, displayNameCollides, peerHomebaseEnabled } = await import('../threadline/peerHomebase.js');
+      const confirmed = trustManager.getProfileByFingerprint(peerFp);
+      const outcome = await ensurePeerHomebase(peerFp, confirmed?.agent ?? peerFp, {
+        enabled: peerHomebaseEnabled(ctx.config),
+        // A standby that created one would mint a fresh topic per boot — the failure that
+        // produced 41 duplicate "Updates" topics before the system-topic pattern existed.
+        holdsLease: !ctx.state.readOnly,
+        findOrCreateTopic: async (name) => {
+          if (!ctx.telegram) throw new Error('no telegram adapter');
+          const r = await ctx.telegram.findOrCreateForumTopic(name, undefined, {
+            // `user`: the operator asked for one topic per paired agent (§2.5 records his
+            // words). Pairing is human-gated, so the agent cannot grow the set on its own.
+            origin: 'user',
+            label: 'peer-homebase',
+          });
+          return { topicId: r.topicId, reused: r.reused };
+        },
+        findTopicByName: (name) => ctx.telegram?.findTopicIdByName(name),
+        renameTopic: async (topicId, name) => (ctx.telegram ? ctx.telegram.editForumTopic(topicId, name) : false),
+        nameCollides: (fp, name) => displayNameCollides(fp, name, trustManager.listProfiles()),
+        getRecorded: (fp) => trustManager.getHomebaseTopic(fp),
+        record: (fp, topicId) => trustManager.setHomebaseTopic(fp, topicId),
+        log: (m) => console.log(m),
+      });
+      if (outcome.created) homebaseTopicId = outcome.topicId;
+      else if (outcome.reason === 'already-recorded') homebaseTopicId = outcome.topicId;
+    } catch (err) {
+      console.warn(`[homebase] skipped for ${peerFp.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    res.json({ ok: true, peerFp, state: 'mutual-verified', receiptSent, ...(homebaseTopicId !== undefined ? { homebaseTopicId } : {}) });
   });
 
   // ── Negotiator lease state (Robustness Phase 1, FD-9) ──────────────────
@@ -19662,7 +20300,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const machine = (ctx.listPoolMachines?.() ?? []).find((m) => m.machineId === intent.targetMachineId);
     if (!machine || !machine.lastKnownUrl) return 'queued';
     const extraAllowlist = (ctx.config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
-    if (!isPeerUrlAllowedForCredentials(machine.lastKnownUrl, extraAllowlist).ok) return 'queued';
+    if (!isPeerUrlAllowedForCredentials({ url: machine.lastKnownUrl, kind: 'last-known-url' }, extraAllowlist).ok) return 'queued';
     try {
       const r = await fetch(`${machine.lastKnownUrl}/attention/${encodeURIComponent(intent.itemId)}`, {
         method: 'PATCH',
@@ -19746,7 +20384,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         }
         try {
           const qs = status ? `?status=${encodeURIComponent(status)}` : '';
-          const r = await fetch(`${p.url}/attention${qs}`, {
+          const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/attention${qs}`, {
             headers: { Authorization: `Bearer ${ctx.config.authToken}` },
             signal: AbortSignal.timeout(ATTENTION_PEER_TIMEOUT_MS),
           });
@@ -20877,6 +21515,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const sshEnrollment = ctx.mutualSshHealth ? ctx.mutualSshHealth() : null;
     res.json({
       enabled: !!ctx.machinePoolRegistry,
+      // dashboard-new-session-machine-choice §3.5 — the page labels its OWN server.
+      selfMachineId: ctx.meshSelfId ?? null,
       router: sync
         ? {
             holder: sync.leaseHolder,
@@ -21012,12 +21652,12 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       const remote: Array<Record<string, unknown>> = [];
       await Promise.all(
         peers.map(async (p) => {
-          if (!isPeerUrlAllowedForCredentials(p.url, jpExtraAllowlist).ok) {
+          if (!isPeerUrlAllowedForCredentials({ url: p.url, kind: p.kind }, jpExtraAllowlist).ok) {
             failed.push({ machineId: p.machineId, error: 'url-rejected' });
             return;
           }
           try {
-            const r = await fetch(`${p.url}/judgment-provenance?limit=${limit}${sinceHours ? `&sinceHours=${sinceHours}` : ''}`, {
+            const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/judgment-provenance?limit=${limit}${sinceHours ? `&sinceHours=${sinceHours}` : ''}`, {
               headers: { Authorization: `Bearer ${ctx.config.authToken}` },
               signal: AbortSignal.timeout(5000),
             });
@@ -21265,12 +21905,12 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       const remotePoints: Array<Record<string, unknown>> = [];
       await Promise.all(
         peers.map(async (p) => {
-          if (!isPeerUrlAllowedForCredentials(p.url, dqExtraAllowlist).ok) {
+          if (!isPeerUrlAllowedForCredentials({ url: p.url, kind: p.kind }, dqExtraAllowlist).ok) {
             failed.push({ machineId: p.machineId, error: 'url-rejected' });
             return;
           }
           try {
-            const r = await fetch(`${p.url}/decision-quality${sinceHours ? `?sinceHours=${sinceHours}` : ''}`, {
+            const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/decision-quality${sinceHours ? `?sinceHours=${sinceHours}` : ''}`, {
               headers: { Authorization: `Bearer ${ctx.config.authToken}` },
               signal: AbortSignal.timeout(5000),
             });
@@ -21408,12 +22048,12 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       let peersOk = 0;
       await Promise.all(
         peers.map(async (p) => {
-          if (!isPeerUrlAllowedForCredentials(p.url, bdExtraAllowlist).ok) {
+          if (!isPeerUrlAllowedForCredentials({ url: p.url, kind: p.kind }, bdExtraAllowlist).ok) {
             failed.push({ machineId: p.machineId, reason: 'url-rejected' });
             return;
           }
           const fetchPeerFindings = async (): Promise<{ findings?: unknown[] }> => {
-            const r = await fetch(`${p.url}/benchmark-divergence`, {
+            const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/benchmark-divergence`, {
               headers: { Authorization: `Bearer ${ctx.config.authToken}` },
               signal: AbortSignal.timeout(5000),
             });
@@ -22118,8 +22758,9 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     // the owner's session, land the target's claim (the queue-barrier release).
     //   · drain ok → proceed to pin+journal exactly as today (the place/claim
     //     repair below sees active@target and correctly no-ops).
-    //   · aborted-emergency-stop → 409 failed-needs-retry, NO pin — an abort
-    //     leaves nothing split (the topic stays whole on its current machine).
+    //   · aborted-emergency-stop / refused-close-failed → 409 failed-needs-retry,
+    //     NO pin — an abort leaves nothing split (the topic stays whole on its
+    //     current machine).
     //   · refused-*/no-handler/timeout/no-flag → DEGRADE to today's pin path
     //     (recorded in the response; the reconciler + closeout converge it).
     // The capability gate means an old peer is never sent a doomed order.
@@ -22156,6 +22797,21 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
             error: 'transfer aborted: emergency stop fired during the drain — the topic stays whole on its current machine',
             failedNeedsRetry: true,
             drain: drainLeg,
+          });
+          return;
+        }
+        // The owner could not close its session, so it aborted the transfer and
+        // kept ownership. Setting the pin now would re-place the topic on the
+        // target at the next message while the old session is still running —
+        // two live sessions on one conversation (2026-10-23). Stop here instead.
+        if (r.status === 'refused-close-failed') {
+          res.status(409).json({
+            error: `transfer aborted: the current machine could not close its session for this topic (${r.reason ?? 'close refused'}) — the topic stays whole on its current machine${drainRunSuspended ? '; its autonomous run was suspended for the move and stays suspended there' : ''}`,
+            failedNeedsRetry: true,
+            drain: drainLeg,
+            // Honest: the run was suspended BEFORE the close was attempted and is
+            // not un-suspended on abort (same as the emergency-stop abort).
+            autonomousRunSuspended: drainRunSuspended,
           });
           return;
         }
@@ -22285,7 +22941,11 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
               owner: r.record.ownerMachineId ?? '',
               ...(prevOwner ? { prevOwner } : {}),
               epoch: r.record.ownershipEpoch,
-              reason: 'user-move',
+              // A release replicates AS a release (status + normalized reason) —
+              // same contract as the server.ts emitPlacement funnel; without it this
+              // row materialized on peers as active(releaser) at the higher epoch.
+              reason: 'released',
+              status: 'released',
             });
           }
         } catch { /* observability never endangers the observed */ }
@@ -28359,7 +29019,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     if (ctx.fetchPasskeyPeerState) return ctx.fetchPasskeyPeerState(peer, timeoutMs);
     if (!peer.url) return { ok: false, reason: 'no-known-url' };
     const extraAllowlist = (ctx.config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
-    if (!isPeerUrlAllowedForCredentials(peer.url, extraAllowlist).ok) return { ok: false, reason: 'url-rejected' };
+    if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: 'last-known-url' }, extraAllowlist).ok) return { ok: false, reason: 'url-rejected' };
     try {
       const r = await fetch(`${peer.url.replace(/\/$/, '')}/passkeys/pool-state`, {
         headers: { Authorization: `Bearer ${ctx.config.authToken ?? ''}`, 'X-Instar-Machine-Id': passkeySelfMachineId() },
@@ -29216,11 +29876,11 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     const failed: Array<{ machineId: string; error: string }> = [];
     let remainingBytes = 256 * 1024;
     await Promise.all(peers.map(async (peer) => {
-      if (!isPeerUrlAllowedForCredentials(peer.url, extraAllowlist).ok) {
+      if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: peer.kind }, extraAllowlist).ok) {
         failed.push({ machineId: peer.machineId, error: 'url-rejected' }); return;
       }
       try {
-        const response = await fetch(`${peer.url}/completion-claim/audit?limit=${limit}&projection=pool`, {
+        const response = await poolPeerFetch(ctx.recordRopeResult ?? undefined, peer, `/completion-claim/audit?limit=${limit}&projection=pool`, {
           headers: { Authorization: `Bearer ${ctx.config.authToken}` }, signal: AbortSignal.timeout(250),
         });
         if (!response.ok) { failed.push({ machineId: peer.machineId, error: `HTTP ${response.status}` }); return; }
@@ -32035,11 +32695,11 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     for (let i = 0; i < peers.length; i += 4) {
       await Promise.all(peers.slice(i, i + 4).map(async p => {
         if (Date.now() - started > 2_500) { failures.push({ machineId: p.machineId, reason: 'deadline' }); return; }
-        if (!isPeerUrlAllowedForCredentials(p.url, extraAllowlist).ok) {
+        if (!isPeerUrlAllowedForCredentials({ url: p.url, kind: p.kind }, extraAllowlist).ok) {
           failures.push({ machineId: p.machineId, reason: 'omitted-cap' }); return;
         }
         try {
-          const response = await fetch(`${p.url}/blocker-lifecycle/${kind}?${query}&scope=local`, {
+          const response = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/blocker-lifecycle/${kind}?${query}&scope=local`, {
             headers: { Authorization: `Bearer ${ctx.config.authToken}` }, signal: AbortSignal.timeout(750),
           });
           if (response.status === 404) { failures.push({ machineId: p.machineId, reason: 'unsupported' }); return; }
@@ -32455,6 +33115,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
             expiresAt, verificationMethod, verificationPath,
             // Promise Beacon fields (PROMISE-BEACON-SPEC.md Phase 1)
             beaconEnabled, cadenceMs, nextUpdateDueAt,
+            checkInAt,
             softDeadlineAt, hardDeadlineAt, sessionEpoch,
             ownerMachineId, externalKey, beaconCreatedBySource,
             followThroughOptOutReason,
@@ -32491,6 +33152,29 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
     for (const [field, value] of deadlineFields) {
       if (value !== undefined && value !== null && !isIso8601(value)) {
         res.status(400).json({ error: `"${field}" must be a valid ISO 8601 timestamp` });
+        return;
+      }
+    }
+    // checkInAt — a promised MOMENT, validated more strictly than the deadline
+    // fields above, and deliberately NOT one of them (see below).
+    //
+    // The contract says "an absolute ISO instant — resolve 'Friday' to a real
+    // moment at creation time; never store a bare date". `isIso8601` would accept
+    // `2026-10-24`, which Date.parse reads as midnight UTC — a reminder promised
+    // for "Friday" would then fire at 5pm Thursday for an operator in Pacific
+    // time. So a date with no time component is REFUSED with the reason, rather
+    // than silently resolved to an hour nobody chose.
+    if (checkInAt !== undefined && checkInAt !== null) {
+      if (!isIso8601(checkInAt)) {
+        res.status(400).json({ error: '"checkInAt" must be a valid ISO 8601 timestamp' });
+        return;
+      }
+      if (!/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(checkInAt)) {
+        res.status(400).json({
+          error: '"checkInAt" must be an absolute instant with a time, not a bare date '
+            + '(a bare date resolves to midnight UTC, which is an hour nobody chose). '
+            + 'Resolve the promise to a real moment first, e.g. 2026-10-24T17:00:00Z',
+        });
         return;
       }
     }
@@ -32565,6 +33249,14 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         configPath, configExpectedValue, behavioralRule,
         expiresAt, verificationMethod, verificationPath,
         beaconEnabled: effectiveBeaconEnabled, cadenceMs, nextUpdateDueAt,
+        // NOT folded into `deadlineFields`, and NOT accepted as the single
+        // follow-through choice. The reconciler that acts on a dated check-in ships
+        // `dryRun: true`, so a commitment carrying ONLY a checkInAt would be
+        // recorded as "covered" by a mechanism that currently sends nothing — the
+        // exact dark-feature trap that let five fixes ship unannounced this morning.
+        // It is additive to beacon enrollment until that dryRun is deliberately
+        // flipped; `GET /commitments/check-in-reminder` reports the flag.
+        checkInAt,
         softDeadlineAt, hardDeadlineAt, sessionEpoch,
         ownerMachineId, externalKey, beaconCreatedBySource,
         ...(normalizedOptOutReason ? { followThroughOptOutReason: normalizedOptOutReason } : {}),
@@ -32761,7 +33453,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         if (cap && cap.online === false) { failed.push({ machineId: p.machineId, error: 'offline' }); return; }
         try {
           const fetchPeer = async () => {
-            const r = await fetch(`${p.url}/standdown`, {
+            const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/standdown`, {
               headers: { Authorization: `Bearer ${ctx.config.authToken}` },
               signal: AbortSignal.timeout(4000),
             });
@@ -33529,7 +34221,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       }> = [];
       await Promise.all(peers.map(async (p) => {
         try {
-          const r = await fetch(`${p.url}/subscription-pool`, {
+          const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/subscription-pool`, {
             headers: { Authorization: `Bearer ${ctx.config.authToken}` },
             signal: AbortSignal.timeout(5000),
           });
@@ -33673,6 +34365,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         credentialReadObservationWindows: {
           total: credentialReadObservationWindows.length,
           resolved: credentialReadObservationWindows.filter((row) => row.outcome === 'resolved-read-window').length,
+          escalated: credentialReadObservationWindows.filter((row) => row.outcome === 'escalated-to-needs-reauth').length,
           open: credentialReadObservationWindows.filter((row) => row.closedAt === null).length,
           evidenceMaturity: 'provisional-credential-read',
           floorPasses: 3,
@@ -33745,7 +34438,8 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         accountId, limit,
       }) ?? [];
       if (req.query.scope !== 'pool') {
-        res.json({ enabled: true, episodes: localEpisodes });
+        res.json({ enabled: true, episodes: localEpisodes,
+          lastResort: ctx.subscriptionRelogin!.lastResortStatus?.() ?? { available: false } });
         return;
       }
       const selfMachineId = ctx.meshSelfId ?? (ctx.config as { machineId?: string }).machineId ?? 'local';
@@ -33767,7 +34461,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       const suffix = query.size > 0 ? `?${query.toString()}` : '';
       await Promise.all((ctx.resolvePeerUrls?.() ?? []).map(async (peer) => {
         try {
-          const response = await fetch(`${peer.url}/subscription-relogin${suffix}`, {
+          const response = await poolPeerFetch(ctx.recordRopeResult ?? undefined, peer, `/subscription-relogin${suffix}`, {
             headers: { Authorization: `Bearer ${ctx.config.authToken}` },
             signal: AbortSignal.timeout(5_000),
           });
@@ -34176,7 +34870,7 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       const remote: Record<string, unknown>[] = [];
       await Promise.all(peers.map(async (p) => {
         try {
-          const r = await fetch(`${p.url}/subscription-pool/pending-logins`, {
+          const r = await poolPeerFetch(ctx.recordRopeResult ?? undefined, p, `/subscription-pool/pending-logins`, {
             headers: { Authorization: `Bearer ${ctx.config.authToken}` },
             signal: AbortSignal.timeout(5000),
           });
@@ -35539,46 +36233,19 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
       credSend(res, 400, { error: 'accountId (string) is required' });
       return;
     }
-    const assignments = cr.ledger.getAssignments();
-    const sourceSlot = assignments.find((a) => a.accountId === accountId)?.slot;
-    if (!sourceSlot) {
-      credSend(res, 400, { error: `unknown account — ${accountId} is not a known ledger tenant`, knownAccounts: assignments.filter((a) => a.accountId).map((a) => a.accountId) });
-      return;
-    }
-    // Resolve the canonical default slot from the ledger (the assignment whose slot is ~/.claude).
-    const { credentialSlotKey } = await import('../core/OAuthRefresher.js');
-    const defaultKey = credentialSlotKey('~/.claude');
-    const defaultSlot = assignments.find((a) => credentialSlotKey(a.slot) === defaultKey)?.slot;
-    if (!defaultSlot) {
-      credSend(res, 400, { error: 'no default (~/.claude) slot is in the ledger — cannot set-default' });
-      return;
-    }
-    if (sourceSlot === defaultSlot) {
-      credSend(res, 200, { enabled: true, outcome: 'noop', reason: `${accountId} is already the default-slot tenant` });
-      return;
-    }
-    const verdict = cr.levers.evaluateSwap(sourceSlot, defaultSlot, force === true);
-    if (!verdict.allowed) {
-      cr.audit.audit({ event: 'set-default-refused', accountId, code: verdict.code, reason: verdict.reason });
-      credSend(res, 429, { error: verdict.reason, code: verdict.code });
-      return;
-    }
-    cr.audit.audit({ event: 'set-default-invoked', accountId, sourceSlot, defaultSlot, forced: verdict.forced });
     try {
-      const result = await cr.swapExecutor.swap(sourceSlot, defaultSlot);
-      if (result.outcome === 'swapped') cr.levers.recordSwap(sourceSlot, defaultSlot, verdict.forced);
-      void cr.audit.attention({
-        id: `credential-set-default:${accountId}`,
-        title: 'The default credential account was flipped',
-        summary: `set-default → ${accountId} into ~/.claude: ${result.outcome}${verdict.forced ? ' (FORCED)' : ''}. ${result.reason}`,
-        category: 'credential-repointing',
-        priority: 'NORMAL',
-        sourceContext: 'credential-set-default',
-      });
-      cr.audit.audit({ event: 'set-default-result', accountId, outcome: result.outcome });
-      credSend(res, 200, { enabled: true, accountId, forced: verdict.forced, ...result });
+      const { setDefaultCredentialAccount } = await import('../core/CredentialSetDefault.js');
+      const result = await setDefaultCredentialAccount(cr, accountId, { force, sourceContext: 'credential-set-default' });
+      if (!result.ok) {
+        const knownAccounts = result.code === 'unknown-account'
+          ? cr.ledger.getAssignments().filter((a) => a.accountId).map((a) => a.accountId)
+          : undefined;
+        credSend(res, result.status, { error: result.reason, code: result.code, ...(knownAccounts ? { knownAccounts } : {}) });
+        return;
+      }
+      const { ok: _ok, ...body } = result;
+      credSend(res, 200, { enabled: true, ...body });
     } catch (err) {
-      cr.audit.audit({ event: 'set-default-error', accountId, error: err instanceof Error ? err.message : 'unknown' });
       credSend(res, 500, { error: err instanceof Error ? err.message : 'set-default failed' });
     }
   });
@@ -38317,11 +38984,33 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         res.status(403).json({ success: false, refused: true, reason: 'credential-requires-encrypted-path', error: 'Credential-share refused: credential-requires-encrypted-path.' });
         return;
       }
-      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } = pinnedForCredential
-        ? relayClient.sendCredentialToPinned(resolvedId, pinnedForCredential, message, relayLegThreadId, msgId, relayLegResend || undefined)
-        : relayLegResend
-          ? relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId, true)
-          : relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId);
+      let sent: { messageId: string; threadId: string };
+      try {
+        sent = pinnedForCredential
+          ? relayClient.sendCredentialToPinned(resolvedId, pinnedForCredential, message, relayLegThreadId, msgId, relayLegResend || undefined)
+          : relayLegResend
+            ? relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId, true)
+            : relayClient.sendAutoWithThread(resolvedId, message, relayLegThreadId, msgId);
+      } catch (err) {
+        // Encrypt-to-pinned (spec threadline-standalone-pairing D9): the peer must be sent
+        // encrypted to its pinned key and that send failed. Nothing went on the wire and
+        // nothing is retried in plaintext: a failed send, 502 like a relay refusal, so the
+        // >=400 finish handler releases any reply claim. A standby that forwarded this
+        // (relayForward) transcribes the 502 unchanged.
+        if ((err as { code?: unknown } | null)?.code !== 'encrypted-send-to-pinned-failed') throw err;
+        res.status(502).json({
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          reason: 'encrypted-send-to-pinned-failed',
+          accepted: false,
+          delivered: false,
+          resolvedAgent: resolvedId,
+          deliveryPath: 'relay',
+          deliveryOutcome: 'not sent: the encrypted send to this paired peer failed, and it is never sent in plaintext.',
+        });
+        return;
+      }
+      const { messageId: relayMsgId, threadId: effectiveRelayThreadId } = sent;
       // waitForReply: the reply listener is registered NOW, before any await, so
       // it runs concurrently with the verdict wait (no time comes off the reply
       // budget, and a fast reply can never land in a gap with no listener).

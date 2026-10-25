@@ -362,6 +362,49 @@ export class LifelineIngressGuard {
     return this.state.graduatedAt ? 'enforce' : 'observe';
   }
 
+  /**
+   * Can a button tap on this agent be PROVEN to come through the lifeline?
+   * True in enforce, and also in default observe once the lifeline has armed
+   * the guard with its secret: from then on observe already refuses any tap
+   * without the secret (see `refusingTaps`), so a verified tap means the same
+   * in both modes. False when bypassed, when no secret is held, and where the
+   * lifeline is not the Telegram ingress (nothing can carry the secret).
+   * Also false when observe is HELD by config (`enforce: false`). That is a
+   * choice to respect the owner's dry run, NOT a safety requirement: an armed
+   * held-observe guard refuses unproven taps too (Echo's review, 2026-10-21).
+   * Don't "fix" it without asking the owner what held observe should mean.
+   * E2E-PAIRING: EXEMPT — this comment block only; the behaviour's e2e is in 6879b7d1a.
+   * Pairing uses this, not `mode()`, to decide whether to offer buttons: a new
+   * agent spends its first day or more in observe, which is exactly when its
+   * owner pairs it (Justin, topic 61599, 2026-10-21).
+   */
+  tapsProvable(): boolean {
+    // Like health() and guardStatus(): with no lifeline ingress there is nothing to wait for, so
+    // arm now. Otherwise a fresh polling agent whose first act is pairing would read as unarmed.
+    const nowMs = this.now();
+    this.armIfNoLifeline(nowMs, new Date(nowMs).toISOString());
+    if (this.bypassed()) return false;
+    if (this.mode() === 'enforce') return true;
+    if (this.opts.explicitEnforce() === false) return false;
+    return this.state.armedBy === 'lifeline-proof' && this.holder.held;
+  }
+
+  /**
+   * Why `tapsProvable()` is false, in words an owner can act on; null when it
+   * is true. Pairing puts this in its "use the dashboard" message, so the
+   * owner sees the cause instead of having to ask someone to read /health
+   * (Justin's PP test, topic 61599, 2026-10-21: nobody could tell which case
+   * PP was in without access to its machine).
+   */
+  tapsUnprovableReason(): string | null {
+    if (this.tapsProvable()) return null;
+    if (this.bypassed()) return 'its Telegram listener protection is switched off in its config (bypass)';
+    if (this.opts.explicitEnforce() === false) return 'its Telegram listener protection is set to watch-only in its config';
+    if (this.state.armedBy === null) return 'its Telegram listener has not yet proven itself to the server (it may be an older listener, or not running)';
+    if (!this.holder.held) return 'it cannot read its Telegram listener secret right now';
+    return 'its Telegram listener cannot prove taps on this setup';
+  }
+
   /** Is the full rollback (`bypass: true`) set? */
   bypassed(): boolean {
     try {

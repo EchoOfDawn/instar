@@ -9,6 +9,7 @@ import { bindUnknownProducerTelegramSender, sendDeterministicTelegramNotice } fr
  *   topic message → find/spawn session → inject message → session replies via [telegram:N]
  */
 
+import { vitestConfigForTestPath } from '../localVerify/inventory.js';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import fs from 'node:fs';
@@ -60,6 +61,9 @@ import { probeTranscript } from '../monitoring/transcriptProber.js';
 import { SingleInstanceLock, installReleaseHandlers } from '../core/SingleInstanceLock.js';
 import { resolveDevAgentGate, resolveStateSyncStores } from '../core/devAgentGate.js';
 import { resolveRelayUnknownSenderTrustMode } from '../threadline/relayUnknownSenderTrust.js';
+import { resolveEncryptToPinnedMode, encryptToPinnedModeName } from '../threadline/encryptToPinned.js';
+import { resolveRefuseDowngradeMode } from '../threadline/refuseDowngrade.js';
+import { MarkedPairingInviteFlow } from '../threadline/PairingPendingAcceptMarkers.js';
 import { resolveAntiThrashKnobs, readingValidity } from '../core/SwapAntiThrash.js';
 import { shouldReleaseOnComplete, planClaimOnSpawn, ownershipNonce } from '../core/ownershipFollowsLiveWork.js';
 import { PrHandLease } from '../core/PrHandLease.js';
@@ -67,7 +71,8 @@ import { ConversationRegistry } from '../core/ConversationRegistry.js';
 import { slackReplyRelayReadiness } from '../core/SlackReplyRelayInstaller.js';
 import { claimSuspensionExcludesPin } from '../core/TopicClaimAnnotationStore.js';
 import { parseProfileTrigger, platformMessageIdFrom } from '../core/topicProfileIngress.js';
-import { NewTopicDefaultStore, evaluateSessionPoolLocalClaim, createSpawnForTopic, createDashboardPoolClaimOps } from '../core/dashboardTopicProfile.js';
+import { NewTopicDefaultStore, evaluateSessionPoolLocalClaim, createSpawnForTopic, createDashboardPoolClaimOps, seedTopicProfileAtCreation } from '../core/dashboardTopicProfile.js';
+import { parseDashboardCreatePayload, safeMachineLabel, createDashboardCreateStartRunner, type DashboardCreateStart } from '../core/dashboardMachineChoice.js';
 import {
   classifyProfileIntent,
   toProfilePatch,
@@ -110,7 +115,7 @@ import {
   LIFELINE_INGRESS_CALLER_SERVER_SELF,
 } from '../core/LifelineIngressSecret.js';
 import { configureSyncOpMarker, defaultInflightMarkerReader } from '../core/InFlightSyncOpMarker.js';
-import { StateManager } from '../core/StateManager.js';
+import { StateManager, SYSTEM_TOPIC_STATE_KEYS } from '../core/StateManager.js';
 import { StuckInputSentinel } from '../core/StuckInputSentinel.js';
 import { SessionRecoveryChannel } from '../core/SessionRecoveryChannel.js';
 import { JobScheduler } from '../scheduler/JobScheduler.js';
@@ -127,6 +132,7 @@ import { ClaudeCliIntelligenceProvider } from '../core/ClaudeCliIntelligenceProv
 import { wrapIntelligenceWithCircuitBreaker, getFeatureMetricsRecorder } from '../core/CircuitBreakingIntelligenceProvider.js';
 import { configureLlmCircuitBreaker, llmCircuitAvailable } from '../core/LlmCircuitBreaker.js';
 import { computeSelfQuotaState } from '../core/selfQuotaState.js';
+import { SessionStartFailureTracker } from '../core/startFailureTracker.js';
 import { isClaudeForbidden } from '../core/claudeForbiddenGuard.js';
 import { SUPPORTED_FRAMEWORKS } from '../core/TopicFrameworksStore.js';
 import type { IntelligenceFramework } from '../core/intelligenceProviderFactory.js';
@@ -164,7 +170,7 @@ import { readAcceptedFallbacks, scopeAcceptedFallbacks } from '../monitoring/gua
 import { createGuardPostureProbes } from '../monitoring/probes/GuardPostureProbe.js';
 import { GuardPostureStore } from '../core/GuardPostureStore.js';
 import { AttentionConditionStore } from '../core/AttentionConditionStore.js';
-import { isPeerUrlAllowedForCredentials } from '../server/peerUrlGuard.js';
+import { isPeerUrlAllowedForCredentials, type PeerEndpointKind } from '../server/peerUrlGuard.js';
 import { formatWatchdogUserMessage } from '../monitoring/watchdog-notifications.js';
 import { StallTriageNurse } from '../monitoring/StallTriageNurse.js';
 import { TriageOrchestrator } from '../monitoring/TriageOrchestrator.js';
@@ -179,7 +185,11 @@ import { isSlackSessionKey, reconstructSlackMessage } from '../core/SlackForward
 import { formatForwardedTopicContext } from '../core/ForwardedTopicContext.js';
 import { resolveAdvertisedMeshUrl, advertiseSelfMeshUrl, detectTailscaleIp, pickPrimaryLanIp, computeSelfMeshEndpoints, advertiseSelfMeshEndpoints, resolveMeshBindHost } from '../core/MeshUrlAdvertiser.js';
 import { PeerEndpointResolver } from '../core/PeerEndpointResolver.js';
-import { resolveMeshPeerUrl } from '../core/resolveMeshPeerUrl.js';
+import {
+  resolveMeshPeerUrl,
+  resolveMeshPeerPreferredSelection,
+  type RopeRefusal,
+} from '../core/resolveMeshPeerUrl.js';
 import { RelayRefusedError, isRelayRefusal, relayOutbound } from '../core/TelegramRelay.js';
 import { GitSyncManager } from '../core/GitSync.js';
 import { RegistrySyncDebouncer } from '../core/RegistrySyncDebouncer.js';
@@ -246,6 +256,7 @@ import { StaleProcessGuard } from '../core/StaleProcessGuard.js';
 import { cleanupGlobalInstalls } from '../core/GlobalInstallCleanup.js';
 import { ForegroundRestartWatcher } from '../core/ForegroundRestartWatcher.js';
 import { NotificationBatcher } from '../messaging/NotificationBatcher.js';
+import { admitNoticeToHub, recordHeldHubPost, resolveHubFilterMode } from '../messaging/attentionHubPolicy.js';
 import { formatLocalTimestamp } from '../utils/localTime.js';
 import type { NotificationTier, BatcherQuietHours } from '../messaging/NotificationBatcher.js';
 import { resolveTelegramStartupTopology, wireTelegramSendSide } from '../messaging/telegramSendSideComposition.js';
@@ -640,6 +651,32 @@ let _placementReplicationOn = false;
  *  over the authoritative ownership registry, built next to the router (they own
  *  the CAS, the journal emit and the router nonce). Null until the router exists. */
 let _dashboardPoolClaimOps: import('../core/dashboardTopicProfile.js').ReadyPoolClaimOps | null = null;
+/** dashboard-new-session-machine-choice §3.4 step 0 — ONE signed read-class mesh
+ *  probe (`session-status`) to a target before anything is created. */
+let _dashboardProbeMachine: ((machineId: string) => Promise<boolean>) | null = null;
+/** dashboard-new-session-machine-choice §3.4 step 3 — place a brand-new topic on a
+ *  REMOTE machine and start it there by ONE checked deliverMessage (never through
+ *  the router's inbound queue). Built next to the router (shares its ownership
+ *  registry, nonce stream and journal emit). Null until the router exists. */
+/** dashboard-new-session-machine-choice §3.4 step 4 — owner-side start (assigned
+ *  where telegram + sessionManager are in scope; a no-op until then). */
+/** Topics whose dashboard start (seed → spawn) is running on THIS machine. */
+const _dashboardStartsInFlight = new Set<number>();
+/** Forwarded messages currently waiting on an in-flight dashboard start (§3.4 4b).
+ *  Bounded: past the cap a message takes the inbound error path at once. */
+let _dashboardStartWaiters = 0;
+const DASHBOARD_START_WAITERS_MAX = 32;
+let _runDashboardCreateStart: (topicId: number, start: DashboardCreateStart) => Promise<void> = async (topicId) => {
+  console.warn(`  [dashboard-machine-choice] start for topic ${topicId} arrived before the owner-side runner was wired — ignored`);
+};
+let _dashboardStartOnMachine: ((sessionKey: string, target: string, start: import('../core/dashboardMachineChoice.js').DashboardCreateStart, pin?: () => Promise<boolean> | boolean) => Promise<import('../core/dashboardMachineChoice.js').StartTopicOnMachineResult>) | null = null;
+/** Hoisted late-bound reference to the topic-profile route context (it is
+ *  constructed after the owner-side deliverMessage handler is wired). */
+let _topicProfileCtxRef: {
+  store: import('../core/TopicProfileStore.js').TopicProfileStore;
+  seedDeps: () => import('../core/dashboardTopicProfile.js').CreationSeedDeps;
+  spawnForTopic?: (topicId: number, name: string) => Promise<import('../core/dashboardTopicProfile.js').SpawnForTopicResult>;
+} | null = null;
 // ── Durable Inbound Message Queue (docs/specs/durable-inbound-message-queue.md) ──
 // The custody engine (null = feature dark / gate failed / invariants violated —
 // every consumer treats null as "refused → today's fall-through").
@@ -747,7 +784,21 @@ let _ownershipReadForDrain: ((sessionKey: string) => import('../core/SessionOwne
 let _resolveRouterUrl: (() => string | null) | null = null;
 /** Every OTHER active machine with a known URL — backs GET /sessions?scope=pool
  *  (pool-wide session aggregation for the dashboard). Set in the same mesh block. */
-let _resolvePeerUrls: (() => Array<{ machineId: string; url: string }>) | null = null;
+let _resolvePeerUrls:
+  | (() => Array<{
+      machineId: string;
+      url: string;
+      kind: PeerEndpointKind;
+      /** Ropes the credential guard skipped before this one was chosen. */
+      ropeRefusals: RopeRefusal[];
+    }>)
+  | null = null;
+/** The feedback arm of that same fix: reports each pool dial's outcome into the ONE
+ *  shared PeerEndpointResolver, so an admissible-but-dead rope stops being selected.
+ *  Set in the same mesh block; null on a single machine (no peers to learn about). */
+let _recordRopeResult:
+  | import('../server/poolPeerFetch.js').RopeResultRecorder
+  | null = null;
 // a2a-single-agent-identity §1–§2 — late-bound seams (the pieces are constructed in
 // different blocks; every consumer reads these lazily).
 let _identityLeaseEligible: () => boolean = () => true;
@@ -787,7 +838,7 @@ async function annotatePeerHandoff(
         .map((p) => ({ ...p, cap: _machinePoolRegistryForAnnotation?.getCapacity(p.machineId) ?? null }))
         .filter((p) => p.cap?.online !== false)
         .map((p) => ({ machineId: p.machineId, url: p.url, routerReceivedAt: p.cap?.routerReceivedAt ?? null })),
-      isUrlAllowed: (url) => isPeerUrlAllowedForCredentials(url, (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist).ok,
+      isUrlAllowed: (url) => isPeerUrlAllowedForCredentials({ url, kind: 'last-known-url' }, (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist).ok,
       authToken: config.authToken ?? '',
       agentId: config.projectName,
       counters: {
@@ -1630,7 +1681,10 @@ async function respawnSessionForTopic(
 
   telegram.registerTopicSession(topicId, newSessionName, topicName);
   if (!options?.silent) {
-    await telegram.sendToTopic(topicId, `Session respawned.`);
+    // The respawn already succeeded. A held or failed notice must not turn it
+    // into a reported failure (the caller would respawn again: a duplicate session).
+    try { await telegram.sendToTopic(topicId, `Session respawned.`); }
+    catch (err) { console.warn(`[telegram→session] Respawned for topic ${topicId}, but the "Session respawned." notice was not sent: ${err instanceof Error ? err.message : String(err)}`); }
   }
   console.log(`[telegram→session] Respawned "${newSessionName}" for topic ${topicId}`);
 }
@@ -1651,6 +1705,7 @@ function wireTelegramCallbacks(
   // /interrupt — send Escape key to a tmux session
   telegram.onInterruptSession = async (sessionName: string): Promise<boolean> => {
     try {
+      // confined-write-allowed: operator /interrupt sends Escape only — a non-typing key that cancels (never accepts) a dialog
       execFileSync(detectTmuxPath()!, ['send-keys', '-t', `=${sessionName}:`, 'Escape'], {
         encoding: 'utf-8', timeout: 5000,
       });
@@ -1857,6 +1912,7 @@ function wireTelegramCallbacks(
 
           // Detect "press Enter to continue" prompt
           if (lower.includes('press enter') || lower.includes('press any key')) {
+            // confined-write-allowed: the setup-time login pane, never a confined session
             execFileSync(tmuxPath, ['send-keys', '-t', `=${loginSession}:`, 'Enter'], { timeout: 5000 });
             await new Promise(r => setTimeout(r, 2000));
 
@@ -3631,6 +3687,55 @@ function wireIMessageRouting(
  * Ensure the Agent Attention topic exists — the agent's direct line to the user.
  * Created once on first server start, persisted in state.
  */
+let _systemTopicAdoptionStarted = false;
+/**
+ * A standby converges its system topic ids onto the lease holder's (read from the
+ * holder's GET /telegram/system-topics with the shared bearer token) instead of
+ * minting its own. A no-op while this machine holds the lease, and on a single machine.
+ */
+async function wireSystemTopicAdoption(input: {
+  state: StateManager;
+  leaseHolder: () => string | null;
+  selfMachineId: string | null;
+  peerUrl: (machineId: string) => string | null;
+  authToken: string | undefined;
+  ensureOwn: () => Promise<void>;
+}): Promise<void> {
+  if (_systemTopicAdoptionStarted || !input.selfMachineId) return;
+  _systemTopicAdoptionStarted = true;
+  const { startSystemTopicAdoptionLoop } = await import('../messaging/SystemTopicAdoption.js');
+  startSystemTopicAdoptionLoop({
+    holdsLease: () => !input.state.readOnly,
+    leaseHolder: input.leaseHolder,
+    selfMachineId: input.selfMachineId,
+    fetchHolder: async (holder) => {
+      const url = input.peerUrl(holder);
+      if (!url) throw new Error(`no reachable address for ${holder.slice(0, 12)}`);
+      const res = await fetch(`${url.replace(/\/$/, '')}/telegram/system-topics`, {
+        headers: input.authToken ? { Authorization: `Bearer ${input.authToken}` } : {},
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    },
+    get: (key) => input.state.get(key),
+    adopt: (key, topicId) => input.state.adoptSystemTopicId(key, topicId),
+    ensureOwn: input.ensureOwn,
+    log: (line) => console.log(line),
+  });
+}
+
+function systemTopicsHooks(state: StateManager) {
+  return {
+    // A read-only StateManager is the standby signal (MultiMachineCoordinator sets it
+    // from the lease before Telegram boots); a single machine is never read-only.
+    canCreate: () => !state.readOnly,
+    getAgentHealthTopicId: () => state.get<number>(SYSTEM_TOPIC_STATE_KEYS.agentHealth) ?? null,
+    recordAgentHealthTopicId: (topicId: number) => state.set(SYSTEM_TOPIC_STATE_KEYS.agentHealth, topicId),
+    recordAttentionHubTopicId: (topicId: number) => state.set(SYSTEM_TOPIC_STATE_KEYS.attention, topicId),
+  };
+}
+
 async function ensureAgentAttentionTopic(
   telegram: TelegramAdapter,
   state: StateManager,
@@ -3638,6 +3743,12 @@ async function ensureAgentAttentionTopic(
   const existingTopicId = state.get<number>('agent-attention-topic');
   if (existingTopicId) {
     console.log(`  Agent Attention topic: ${existingTopicId}`);
+    return;
+  }
+  if (state.readOnly) {
+    // Standby: never mint a system topic (it could not save the id and would mint
+    // another next boot). The id is adopted from the lease holder instead.
+    console.log('  Agent Attention topic: none recorded yet — waiting to adopt the lease holder\'s');
     return;
   }
 
@@ -3725,18 +3836,26 @@ async function ensureAgentUpdatesTopic(
     console.log(`  Agent Updates topic: ${existingTopicId}`);
     return;
   }
+  if (state.readOnly) {
+    // Standby: never mint a system topic (see ensureAgentAttentionTopic).
+    console.log('  Agent Updates topic: none recorded yet — waiting to adopt the lease holder\'s');
+    return;
+  }
 
   try {
-    const topic = await telegram.createForumTopic(
+    // find-or-create: reuse an existing "Updates" topic by name before minting one.
+    const topic = await telegram.findOrCreateForumTopic(
       `${TOPIC_STYLE.INFO.emoji} Updates`,
       TOPIC_STYLE.INFO.color, // Blue — informational
       { origin: 'system', bounded: true, label: 'boot-updates' }, // bounded create-once boot topic
     );
     state.set('agent-updates-topic', topic.topicId);
-    await telegram.sendToTopic(topic.topicId,
-      `This is where I'll post updates about new features, version changes, and improvements.\n\nNothing urgent — just keeping you in the loop about what's new.`
-    );
-    console.log(pc.green(`  Created Agent Updates topic: ${topic.topicId}`));
+    if (!topic.reused) {
+      await telegram.sendToTopic(topic.topicId,
+        `This is where I'll post updates about new features, version changes, and improvements.\n\nNothing urgent — just keeping you in the loop about what's new.`
+      );
+    }
+    console.log(pc.green(`  ${topic.reused ? 'Reusing' : 'Created'} Agent Updates topic: ${topic.topicId}`));
   } catch (err) {
     console.error(`  Failed to create Agent Updates topic: ${err}`);
   }
@@ -4077,6 +4196,9 @@ export async function startServer(options: StartOptions): Promise<void> {
   // before. NOTE the key is TOP-LEVEL: `messaging` is an array of adapters, so a
   // key nested there is unreachable (same trap as `outboundAdvisory`).
   const nbCfg = (config as unknown as { notificationBatcher?: Record<string, unknown> }).notificationBatcher ?? {};
+  const attentionHubFilterMode = resolveHubFilterMode(
+    (config.messaging?.find((m) => m.type === 'telegram')?.config as { attentionHubFilter?: unknown } | undefined)?.attentionHubFilter,
+  );
   const notificationBatcher = new NotificationBatcher({
     enabled: (nbCfg.enabled as boolean | undefined) ?? true,
     summaryIntervalMinutes: (nbCfg.summaryIntervalMinutes as number | undefined) ?? 30,
@@ -4104,8 +4226,22 @@ export async function startServer(options: StartOptions): Promise<void> {
    * Interactive messages (session replies, user-facing responses) still use sendToTopic/sendToChannel directly.
    */
   function notify(tier: NotificationTier, category: string, message: string, topicId?: number, origin?: import('../messaging/NotificationBatcher.js').BatcherOrigin): void {
+    // Attention hub admission (src/messaging/attentionHubPolicy.ts): a notice
+    // bound for the user's Attention topic must carry user impact (lost
+    // messages, a reverted setting, a security event, exhausted quota). Routine
+    // automation status is logged instead — never posted to the hub or Slack.
+    const hubTopicId = _notifyState?.get<number>('agent-attention-topic') ?? 0;
+    if (!topicId || topicId === hubTopicId) {
+      const hubDecision = admitNoticeToHub(category, tier, attentionHubFilterMode);
+      if (!hubDecision.admit) {
+        recordHeldHubPost(path.join(config.stateDir, 'logs'), {
+          kind: 'notice', reason: hubDecision.reason, category, tier, title: message.split('\n')[0] ?? '',
+        });
+        return;
+      }
+    }
     // Telegram: via notification batcher
-    const resolvedTopicId = topicId ?? _notifyState?.get<number>('agent-attention-topic') ?? 0;
+    const resolvedTopicId = topicId ?? hubTopicId;
     if (resolvedTopicId) {
       notificationBatcher.enqueue({
         tier,
@@ -5106,6 +5242,11 @@ export async function startServer(options: StartOptions): Promise<void> {
     //    existing single-machine no-op. The generic record emitter is constructed below
     //    (it also needs the resolved stateSync flags).
     let replicatedPeerStreamReader: import('../core/ReplicatedPeerStreamReader.js').ReplicatedPeerStreamReader | undefined;
+    // Rollout step 5b (threadline-standalone-pairing D9/D11): late-bound replicated-pairing
+    // inheritance, attached in the threadline block below ONLY when
+    // multiMachine.stateSync.threadlinePairing.enabled is true. The peer-apply commit
+    // observer calls it when threadline-pairing-record entries land.
+    let _threadlinePairingWiring: import('../threadline/pairingReplicationWiring.js').PairingReplicationWiring | null = null;
     let replicatedRecordEmitter: import('../core/ReplicatedRecordEmitter.js').ReplicatedRecordEmitter | undefined;
     let replicatedHlcClock: import('../core/HybridLogicalClock.js').HybridLogicalClock | undefined;
     if (coherenceJournal && cjOwnMachineId) {
@@ -5139,6 +5280,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         journalSyncApplier?.setReplicatedRecordCommitObserver((senderMachineId, kind, entries) => {
           replicatedPeerStreamReader?.observeCommittedEntries(kind, entries);
           if (kind === 'ssh-direction-proof') for (const entry of entries) mutualSshRuntime?.handleJournalProof(entry.data, senderMachineId);
+          // Merge path for replicated pairings (step 5b): null unless the gate is on.
+          _threadlinePairingWiring?.onRecordsCommitted(kind);
         });
 
         // Author-side HLC clock — persisted under the journal dir (atomic temp+rename)
@@ -8037,6 +8180,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           // Single-alerts-topic routing: resolve the boot-created Attention hub
           // live from state so attention items land there (never per-item topics).
           getAttentionHubTopicId: () => state.get<number>('agent-attention-topic') ?? null,
+          // One agent-wide system-topic record: only the lease holder mints a system
+          // topic; a standby uses the ids it adopted from the holder.
+          systemTopics: systemTopicsHooks(state),
         },
         config.stateDir,
       );
@@ -8054,6 +8200,17 @@ export async function startServer(options: StartOptions): Promise<void> {
       ensureAgentUpdatesTopic(telegram, state).catch(err => {
         console.error(`[server] Failed to ensure Agent Updates topic: ${err}`);
       });
+      wireSystemTopicAdoption({
+        state,
+        leaseHolder: () => coordinator.getSyncStatus().leaseHolder ?? null,
+        selfMachineId: (() => { try { const m = coordinator.managers.identityManager; return m.hasIdentity() ? m.loadIdentity().machineId : null; } catch { return null; } })(), // @silent-fallback-ok — no identity ⇒ single machine, nothing to adopt
+        peerUrl: (machineId) => {
+          const entry = coordinator.managers.identityManager.getActiveMachines().find((m) => m.machineId === machineId)?.entry;
+          return entry ? resolveMeshPeerUrl(meshResolver, machineId, entry.endpoints, entry.lastKnownUrl) : null;
+        },
+        authToken: config.authToken,
+        ensureOwn: async () => { await ensureAgentAttentionTopic(telegram!, state); await ensureAgentUpdatesTopic(telegram!, state); },
+      }).catch(err => console.error(`[server] system topic adoption failed to start: ${err}`));
 
       // Wire Prompt Gate callbacks in send-only mode too — the lifeline forwards
       // callback queries via /internal/telegram-callback, and we need handlers for them
@@ -8132,6 +8289,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           // Single-alerts-topic routing: resolve the boot-created Attention hub
           // live from state so attention items land there (never per-item topics).
           getAttentionHubTopicId: () => state.get<number>('agent-attention-topic') ?? null,
+          // One agent-wide system-topic record: only the lease holder mints a system
+          // topic; a standby uses the ids it adopted from the holder.
+          systemTopics: systemTopicsHooks(state),
         },
         config.stateDir,
       );
@@ -8310,6 +8470,17 @@ export async function startServer(options: StartOptions): Promise<void> {
       ensureAgentUpdatesTopic(telegram, state).catch(err => {
         console.error(`[server] Failed to ensure Agent Updates topic: ${err}`);
       });
+      wireSystemTopicAdoption({
+        state,
+        leaseHolder: () => coordinator.getSyncStatus().leaseHolder ?? null,
+        selfMachineId: (() => { try { const m = coordinator.managers.identityManager; return m.hasIdentity() ? m.loadIdentity().machineId : null; } catch { return null; } })(), // @silent-fallback-ok — no identity ⇒ single machine, nothing to adopt
+        peerUrl: (machineId) => {
+          const entry = coordinator.managers.identityManager.getActiveMachines().find((m) => m.machineId === machineId)?.entry;
+          return entry ? resolveMeshPeerUrl(meshResolver, machineId, entry.endpoints, entry.lastKnownUrl) : null;
+        },
+        authToken: config.authToken,
+        ensureOwn: async () => { await ensureAgentAttentionTopic(telegram!, state); await ensureAgentUpdatesTopic(telegram!, state); },
+      }).catch(err => console.error(`[server] system topic adoption failed to start: ${err}`));
     }
 
     // Poll ownership changes only inbound getUpdates. Every constructed adapter
@@ -9998,6 +10169,35 @@ export async function startServer(options: StartOptions): Promise<void> {
               next_attempt_at: input.next_attempt_at,
             })
           : undefined,
+        // Last resort when there is no lifeline topic. The gateway already
+        // reaches whichever platform this agent actually uses, so a Slack-only
+        // agent stops dropping every unbound-session notice it produces
+        // (indra, 2026-10-20: repeated no-topic outcomes, nothing delivered).
+        // Reports whether a destination existed so the notifier can record the
+        // honest outcome instead of guessing.
+        fallbackNotify: (text) => {
+          const hasTelegramDest = Boolean(_notifyState?.get<number>('agent-attention-topic'));
+          const hasSlackDest = Boolean(_slackAdapter && _notifyState?.get<string>('slack-attention-channel'));
+          if (!hasTelegramDest && !hasSlackDest) return false;
+          notify('SUMMARY', 'session-reap', text, undefined, {
+            producerId: 'reap-notifier',
+            author: unknownAutomationAuthor('reap-reason-author-unavailable'),
+          });
+          return true;
+        },
+        raiseNoDestination: (detail) => {
+          try {
+            void telegram?.createAttentionItem({
+              id: 'reap-notice-no-destination',
+              title: 'Notices about interrupted work have nowhere to go',
+              summary: 'no lifeline topic and no fallback channel',
+              description: detail,
+              category: 'session',
+              priority: 'HIGH',
+              sourceContext: 'reap-notifier',
+            });
+          } catch { /* @silent-fallback-ok: reporting the gap must never throw */ }
+        },
         recordNotify: (e) => reapLog.recordNotify(e),
         quietHoursEndAt: (now) => notificationBatcher.quietHoursEndAt(now),
         summaryReleaseAt: (now) => notificationBatcher.nextSummaryReleaseAt(now),
@@ -10919,6 +11119,11 @@ export async function startServer(options: StartOptions): Promise<void> {
       }));
     }
 
+    // Consecutive session-startup deaths on THIS machine. Feeds the capacity
+    // heartbeat's placement-eligibility block, so a machine that cannot start
+    // work stops being handed conversations (spec: startFailureTracker.ts).
+    const startFailureTracker = new SessionStartFailureTracker();
+
     // A session whose process ended on its own (no reaper/operator/kill) lands in
     // the SAME reap-log as every other session end — `type:'exited'` with uptime
     // and the last startup-window pane tail. Before this, a self-exit was a
@@ -10949,6 +11154,41 @@ export async function startServer(options: StartOptions): Promise<void> {
         // @silent-fallback-ok — an audit write must never disturb the monitor loop.
         console.warn('[reap-log] recordExited failed (non-fatal):', err);
       }
+      // Placement eligibility: a session that died inside its startup window
+      // means this machine could not start work. Count it; past the threshold
+      // the capacity heartbeat reports the machine unable to start, placement
+      // stops sending it new conversations, and the operator is told ONCE.
+      // Before this, a machine whose every session died on arrival kept being
+      // chosen (Mac Mini, 2026-10-20: three deaths in 35 minutes, the
+      // conversation never moved, nothing raised).
+      if (e.reason === 'process-exited-during-startup') {
+        try {
+          const before = startFailureTracker.state().blocked;
+          startFailureTracker.recordStartFailure();
+          const after = startFailureTracker.state();
+          if (!before && after.blocked) {
+            console.warn(`[start-failure] this machine has failed to start ${after.consecutive} sessions in a row — dropping it from placement until one starts`);
+            void telegram?.createAttentionItem({
+              id: 'machine-cannot-start-sessions',
+              title: 'This machine cannot start sessions',
+              summary: `${after.consecutive} sessions in a row died during startup`,
+              description:
+                `${after.consecutive} sessions in a row have died while starting up on this machine, `
+                + 'so new conversations are no longer being sent here. They will go to another machine '
+                + 'instead. This clears itself the moment a session starts successfully. The usual '
+                + "causes are a login that has never answered Claude Code's folder-trust question, an "
+                + 'expired sign-in, or a missing executable.',
+              category: 'session',
+              priority: 'HIGH',
+              sourceContext: 'session-start-failure',
+            });
+          }
+        } catch { /* a placement signal must never disturb the monitor loop */ }
+      }
+    });
+    // The clearing signal: one successful start re-admits the machine.
+    sessionManager.on('sessionStartSucceeded', () => {
+      try { startFailureTracker.recordStartSuccess(); } catch { /* never disturb a launch */ }
     });
     sessionManager.on('sessionReaped', (e: { session: import('../core/types.js').Session; reason: string; disposition?: 'terminal' | 'recovery-bounce'; origin?: 'operator' | 'autonomous'; authorityScope?: 'lease-holder' | 'local-age-limit' | 'local-post-transfer-closeout' | 'operator'; midWork?: boolean; workEvidence?: string[]; via?: string; seenWorkingPastAgeLimit?: boolean }) => {
       // ── F7: schedule a post-grace reachability verify for the affected topic. Both a
@@ -11352,6 +11592,45 @@ export async function startServer(options: StartOptions): Promise<void> {
         try { return Math.floor(fs.statSync(path.join(config.projectDir, '.instar', 'autonomous-emergency-stop')).mtimeMs); }
         catch { return 0; }
       },
+      // A wedge that recovery genuinely gave up on used to end as one row in
+      // stuck-input-events.jsonl and nothing else — so a message typed into a
+      // session could sit unsubmitted indefinitely with no alarm anywhere
+      // (indra, 2026-10-20: 28 minutes, and the degradation record claimed it
+      // had recovered). Raise it once per wedge, and tell the conversation
+      // itself when we can resolve one, because the person waiting for a reply
+      // is the one who needs to know their words never arrived.
+      onUndeliverable: (info) => {
+        try {
+          void telegram?.createAttentionItem({
+            id: `stuck-input-undelivered:${info.tmuxSession}`,
+            title: 'A message is stuck unsent in a session',
+            summary: info.reason,
+            description:
+              `Session ${info.tmuxSession} has text sitting at its prompt that was never submitted, `
+              + `and every recovery attempt failed (${info.reason}). It has been there for `
+              + `${Math.round(info.stuckSinceMs / 1000)}s. Whoever sent it has not been answered.`,
+            category: 'session',
+            priority: 'HIGH',
+            sourceContext: 'stuck-input-sentinel',
+          });
+        } catch { /* observability must never throw into the sentinel */ }
+        try {
+          // Deterministic send — never the LLM-gated reply path, which can fail
+          // closed under exactly the conditions that produce a wedge.
+          let topicId: number | null = null;
+          for (const [tid, sessionName] of telegram?.getAllTopicSessions() ?? []) {
+            if (sessionName === info.tmuxSession) { topicId = tid; break; }
+          }
+          if (telegram && typeof topicId === 'number' && topicId > 0) {
+            void telegram.sendToTopic(
+              topicId,
+              'Your last message never reached me — it ended up sitting unsent in my own input and '
+              + 'I could not clear it. Nothing you sent was answered. Please send it again; I am '
+              + 'restarting that conversation on my side so the next one lands.',
+            );
+          }
+        } catch { /* a failed notice must not take the sentinel down */ }
+      },
     });
     stuckInputSentinel.start();
 
@@ -11494,6 +11773,14 @@ export async function startServer(options: StartOptions): Promise<void> {
         const topicId = _notifyState?.get<number>('agent-attention-topic') ?? 0;
         if (!topicId || observerNoticeInFlight.has(episode.episodeId)) return;
         observerNoticeInFlight.add(episode.episodeId);
+        // Self-healing infra status: held from the Attention hub (attentionHubPolicy).
+        if (!admitNoticeToHub('codex-lifecycle', 'IMMEDIATE', attentionHubFilterMode).admit) {
+          recordHeldHubPost(path.join(config.stateDir, 'logs'), {
+            kind: 'notice', reason: 'automated-status', category: 'codex-lifecycle', tier: 'IMMEDIATE',
+            title: `Codex delivery verification sustained-failure episode ${episode.episodeId}`,
+          });
+          return;
+        }
         void notificationBatcher.enqueue({
           tier: 'IMMEDIATE', category: 'codex-lifecycle', timestamp: new Date(), topicId,
           message: `Codex delivery verification has entered sustained-failure episode ${episode.episodeId}. `
@@ -12605,8 +12892,12 @@ export async function startServer(options: StartOptions): Promise<void> {
           // default when Updates is unset, preserving prior behavior for
           // agents without an Updates topic.
           const updatesTopicId = state.get<number>('agent-updates-topic') || undefined;
+          // A version-less request (a setting switched on, e.g. Threadline connect-enable or the
+          // money-layer enable) is not an update: never tell the person "update to vundefined".
           notify('IMMEDIATE', 'system',
-            `Applying update to v${request.targetVersion} — restarting now. Active sessions will resume automatically.`,
+            request.targetVersion
+              ? `Applying update to v${request.targetVersion} — restarting now. Active sessions will resume automatically.`
+              : `Restarting now to apply a setting change. Active sessions will resume automatically.`,
             updatesTopicId,
           );
         } else {
@@ -14683,6 +14974,9 @@ export async function startServer(options: StartOptions): Promise<void> {
       },
     });
     quotaPollerRef = quotaPoller;
+    // A session ended at Claude Code's "Login expired" screen is a signal to the poller, which
+    // alone decides whether that corroborates needs-reauth (and so opens the sign-in repair).
+    sessionManager.setLoginExpiredSink((input) => quotaPoller.noteCliLoginExpired(input));
     if (subscriptionPool.size() > 0) {
       quotaPoller.start();
       console.log(pc.green('  Subscription quota poller started'));
@@ -15078,12 +15372,41 @@ export async function startServer(options: StartOptions): Promise<void> {
     if (reloginCfg?.enabled === true && subscriptionLoginLedger && subscriptionPoolMachineId && sharedIntelligence) {
       try {
         const [{ createSubscriptionReloginRuntime, resolveReloginNavigation, takeFirstBackupCode, buildReloginHelperSessionPorts }, { PlaywrightProfileRegistry }, { SecretStore },
-          { secretKeyPaths }, { ClaudePasteBackController }, { createReloginBrowser }] = await Promise.all([
+          { secretKeyPaths }, { ClaudePasteBackController }, { createReloginBrowser }, { createReloginLastResort, withLastResort },
+          { createOneShotCompletion: createHeadlessOneShotCompletion }] = await Promise.all([
           import('../core/SubscriptionReloginRuntime.js'), import('../core/PlaywrightProfileRegistry.js'),
           import('../core/SecretStore.js'), import('../core/SecretSync.js'),
           import('../core/ClaudePasteBackController.js'), import('../core/PlainChromeReloginBrowser.js'),
+          import('../core/ReloginLastResortProvider.js'),
+          import('../providers/adapters/anthropic-headless/transport/oneShotCompletion.js'),
         ]);
         const vault = new SecretStore({ stateDir: config.stateDir, forceFileKey: config.secrets?.forceFileKey });
+        // Last-resort model (spec relogin-last-resort-model): the repair's own model calls go to
+        // the shared provider first; when that fails (on a single-subscription agent it runs on
+        // the dead login itself) and the operator placed a key under the repair-specific vault
+        // name, the lightweight tier over that key answers instead, within per-drive/day caps.
+        // The call rides the anthropic-headless adapter's one-shot (`claude -p`, key in the child
+        // env only, a dedicated empty config home so the dead ambient login is never picked up).
+        const reloginLastResort = createReloginLastResort({ config: reloginCfg.lastResort,
+          readSecret: (name) => vault.get(name),
+          claudePath: resolveFrameworkBinaryPath({ framework: 'claude-code',
+            frameworkBinaryPaths: config.sessions.frameworkBinaryPaths, claudePath: config.sessions.claudePath,
+            configuredFramework: config.sessions.framework }) ?? 'claude',
+          tmuxPath: detectTmuxPath() ?? 'tmux', stateDir: config.stateDir,
+          createCompletion: createHeadlessOneShotCompletion });
+        const reloginEvaluate = withLastResort(
+          (prompt, options) => sharedLlmQueue.enqueue('background', (signal) => sharedIntelligence!.evaluate(prompt, {
+            ...options, signal,
+            // Both callers set it; the fallback keeps the ledger row attributed if a new caller forgets.
+            attribution: options?.attribution ?? { component: 'subscription-relogin-supervisor' },
+          }), 1),
+          reloginLastResort,
+          (reason) => { console.warn(`[subscription-relogin] shared model failed (${reason}); answering on the last-resort model`); },
+          // A dead login that HANGS (rather than fails fast) must not cost a 30 s timeout per
+          // step: the primary gets a short budget, and once the last resort has answered a
+          // drive's call it stays preferred for that drive (sticky).
+          { primaryTimeoutMs: 15_000 },
+        ).evaluate;
         const profiles = new PlaywrightProfileRegistry({ stateDir: config.stateDir, projectDir: config.projectDir,
           listVaultNames: () => {
             try { return secretKeyPaths(vault.read()); }
@@ -15160,8 +15483,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               `closedSnapshot=${JSON.stringify(snapshot)}`,
               `allowedActions=${JSON.stringify(allowedActions)}`,
             ].join('\n');
-            const raw = await sharedLlmQueue.enqueue('background', (signal) => sharedIntelligence!.evaluate(prompt, {
-              model: 'fast', maxTokens: 20, temperature: 0, signal,
+            const raw = await reloginEvaluate(prompt, {
+              model: 'fast', maxTokens: 20, temperature: 0,
               attribution: { component: 'subscription-relogin-supervisor' },
               provenance: {
                 decisionPoint: DP_SUBSCRIPTION_RELOGIN_ACTION,
@@ -15169,7 +15492,7 @@ export async function startServer(options: StartOptions): Promise<void> {
                 optionsPresented: [...allowedActions],
                 promptId: 'subscription-relogin-action-v1',
               },
-            }), 1);
+            });
             const action = raw.trim() as import('../core/AnthropicReloginBrowserDriver.js').ReloginBrowserAction;
             if (!allowedActions.includes(action)) throw new Error('relogin-supervisor-invalid-action');
             return action;
@@ -15195,8 +15518,8 @@ export async function startServer(options: StartOptions): Promise<void> {
                 recentSteps: input.recentSteps })}`,
               `offered=${JSON.stringify(input.offered)}`,
             ].join('\n');
-            const raw = await sharedLlmQueue.enqueue('background', (signal) => sharedIntelligence!.evaluate(prompt, {
-              model: 'balanced', maxTokens: 20, temperature: 0, signal,
+            const raw = await reloginEvaluate(prompt, {
+              model: 'balanced', maxTokens: 20, temperature: 0,
               attribution: { component: 'subscription-relogin-supervisor' }, // same decision point: chooses one permitted browser action
               provenance: {
                 decisionPoint: DP_SUBSCRIPTION_RELOGIN_ACTION,
@@ -15204,9 +15527,10 @@ export async function startServer(options: StartOptions): Promise<void> {
                 optionsPresented: [...input.offered],
                 promptId: 'subscription-relogin-navigate-v1',
               },
-            }), 1);
+            });
             return raw.trim().split(/\s+/)[0] ?? '';
           },
+          ...(reloginLastResort ? { lastResort: reloginLastResort } : {}),
           onSuggested: notify ? (episode, key) => notify(episode, key, 'approval') : undefined,
           onOperatorOnly: notify ? (episode, key) => notify(episode, key, 'operator-only') : undefined,
           onTerminal: notify ? (episode, key) => notify(episode, key, 'terminal') : undefined,
@@ -15217,7 +15541,7 @@ export async function startServer(options: StartOptions): Promise<void> {
           slowRetry: reloginCfg.slowRetry,
         });
         subscriptionReloginRuntime.start();
-        console.log(pc.green(`  Assisted subscription re-login: ${reloginCfg.dryRun !== false ? 'observe' : (reloginCfg.mode ?? 'approval')} (navigation: ${resolveReloginNavigation(reloginCfg.navigation, config)}, browser: ${process.platform === 'darwin' ? 'normal' : 'automated'})`));
+        console.log(pc.green(`  Assisted subscription re-login: ${reloginCfg.dryRun !== false ? 'observe' : (reloginCfg.mode ?? 'approval')} (navigation: ${resolveReloginNavigation(reloginCfg.navigation, config)}, browser: ${process.platform === 'darwin' ? 'normal' : 'automated'}, last-resort model: ${reloginLastResort ? (reloginLastResort.available() ? reloginLastResort.config.model : `key ${reloginLastResort.config.keyName} not in vault`) : 'off'})`));
       } catch (error) {
         // @silent-fallback-ok — bootstrap refusal is logged and the runtime is explicitly darkened; routes return typed 503.
         console.warn(`[subscription-relogin] bootstrap refused: ${error instanceof Error ? error.message : String(error)}`);
@@ -15416,7 +15740,16 @@ export async function startServer(options: StartOptions): Promise<void> {
     }
 
     let presenceProxy: import('../monitoring/PresenceProxy.js').PresenceProxy | undefined;
-    if (sharedIntelligence && telegram) {
+    // The unanswered-message watcher (and everything wired alongside it) used to
+    // require a Telegram adapter to exist. Its Slack support is written and sits
+    // INSIDE this block, so a Slack-only agent got neither: the watcher was never
+    // constructed at all. The indra agent's log carries no "Presence Proxy wired
+    // to Slack" line in its entire history, which is why an operator message
+    // could sit unanswered for 28 minutes on 2026-10-20 with nothing raised.
+    // Every dep below already branches on the Slack synthetic-id map first and
+    // falls back to Telegram, so admitting a Slack-only agent is a gate change,
+    // not a redesign.
+    if (sharedIntelligence && (telegram || _slackAdapter)) {
       try {
         const { PresenceProxy, isBriefAck } = await import('../monitoring/PresenceProxy.js');
         const { execSync: shellExecSync } = await import('child_process');
@@ -15524,7 +15857,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             if (slackChId && _slackAdapter) {
               return _slackAdapter.getSessionForChannel(slackChId) ?? null;
             }
-            return telegram!.getSessionForTopic(topicId);
+            return telegram?.getSessionForTopic(topicId) ?? null;
           },
           isSessionAlive: (name) => sessionManager.isSessionAlive(name),
           sendMessage: async (topicId, text, metadata) => {
@@ -15621,7 +15954,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             const slackChId = slackProxyChannelMap.get(topicId);
             const sessionName = (slackChId && _slackAdapter)
               ? _slackAdapter.getSessionForChannel(slackChId)
-              : telegram!.getSessionForTopic(topicId);
+              : telegram?.getSessionForTopic(topicId) ?? null;
             return sessionName ? rateLimitSentinel.isRecoveryActive(sessionName) : false;
           },
           // Honest turn-receipts: when any recovery sentinel already owns this
@@ -15645,8 +15978,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         });
 
         // Hook into Telegram's onMessageLogged callback (always active, unlike EventBus which requires a feature flag)
-        const existingCallback = telegram.onMessageLogged;
-        telegram.onMessageLogged = (entry) => {
+        const existingCallback = telegram?.onMessageLogged;
+        if (telegram) telegram.onMessageLogged = (entry) => {
           // Call existing callback first (TopicMemory dual-write)
           if (existingCallback) {
             existingCallback(entry);
@@ -15668,8 +16001,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         // Human-as-Detector: observe inbound HUMAN messages for coherence-break
         // corrections — a correction the user had to make is evidence a guardian
         // failed. Chains the prior callback; best-effort (observe never throws).
-        const beforeHadCallback = telegram.onMessageLogged;
-        telegram.onMessageLogged = (entry) => {
+        const beforeHadCallback = telegram?.onMessageLogged;
+        if (telegram) telegram.onMessageLogged = (entry) => {
           if (beforeHadCallback) beforeHadCallback(entry);
           const missSignal = observeInboundMessage(humanAsDetectorLog, entry);
           // ── Usher precision, path (b): the user just had to correct me (a
@@ -15751,8 +16084,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               // Per-topic runaway guard beyond the pre-filter.
               rateCeiling: { maxPerWindow: 30, windowMs: 60_000 },
             });
-            const beforeCaptureCb = telegram.onMessageLogged;
-            telegram.onMessageLogged = (entry) => {
+            const beforeCaptureCb = telegram?.onMessageLogged;
+            if (telegram) telegram.onMessageLogged = (entry) => {
               if (beforeCaptureCb) beforeCaptureCb(entry);
               // Fire-and-forget — capture latency must never reach the delivery path.
               void captureLoop({
@@ -15792,8 +16125,8 @@ export async function startServer(options: StartOptions): Promise<void> {
                 },
                 rateCeiling: { maxPerWindow: 20, windowMs: 60_000 },
               });
-              const beforeUsherCb = telegram.onMessageLogged;
-              telegram.onMessageLogged = (entry) => {
+              const beforeUsherCb = telegram?.onMessageLogged;
+              if (telegram) telegram.onMessageLogged = (entry) => {
                 if (beforeUsherCb) beforeUsherCb(entry);
                 void usherLoop({
                   messageId: entry.messageId,
@@ -15944,8 +16277,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               const aspClassifier = buildAspInboundClassifier(config.stateDir, config.projectName);
               setAspClassifierRef(aspClassifier);
               if (aspClassifier) {
-                const beforeAspCb = telegram.onMessageLogged;
-                telegram.onMessageLogged = (entry) => {
+                const beforeAspCb = telegram?.onMessageLogged;
+                if (telegram) telegram.onMessageLogged = (entry) => {
                   if (beforeAspCb) beforeAspCb(entry);
                   aspClassifier.classify({
                     topicId: entry.topicId,
@@ -15966,8 +16299,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               console.warn('[instar] ASP inbound classifier not wired:', err);
             }
 
-            const beforeCorrectionCb = telegram.onMessageLogged;
-            telegram.onMessageLogged = (entry) => {
+            const beforeCorrectionCb = telegram?.onMessageLogged;
+            if (telegram) telegram.onMessageLogged = (entry) => {
               if (beforeCorrectionCb) beforeCorrectionCb(entry);
               // Layer 0 (SYNC, free) — classify on the seam. No signal → stop at
               // ~zero cost on the vast majority of messages.
@@ -16192,7 +16525,7 @@ export async function startServer(options: StartOptions): Promise<void> {
               });
             },
             captureSessionOutput: (name, lines) => sessionManager.captureOutput(name, lines),
-            getSessionForTopic: (topicId) => telegram!.getSessionForTopic(topicId),
+            getSessionForTopic: (topicId) => telegram?.getSessionForTopic(topicId) ?? null,
             isSessionAlive: (name) => sessionManager.isSessionAlive(name),
             // Double-spawn detector input (escalation §6): count live sessions
             // bound to a topic. Same resolution the ResumeQueue drainer uses.
@@ -16403,8 +16736,8 @@ export async function startServer(options: StartOptions): Promise<void> {
           // structurally-symmetric /resume endpoint. False-positive cost:
           // one extra heartbeat that re-pauses on next idle cycle.
           const KEEP_WATCHING_RE = /\bkeep[\s-]?watching\b/i;
-          const previousTelegramHook = telegram.onMessageLogged;
-          telegram.onMessageLogged = (entry) => {
+          const previousTelegramHook = telegram?.onMessageLogged;
+          if (telegram) telegram.onMessageLogged = (entry) => {
             if (previousTelegramHook) previousTelegramHook(entry);
             if (!entry.fromUser) return;
             if (!entry.topicId) return;
@@ -17374,6 +17707,9 @@ export async function startServer(options: StartOptions): Promise<void> {
       seenSetMaxThreads: _canonHist.seenSetMaxThreads,
     });
     threadLogForResume = threadLog;
+    // Late-bound: the trust manager the homebase backfill needs is built further down
+    // (Threadline bootstrap). Until then a contact is simply a no-op.
+    let _peerHomebaseBackfill: import('../threadline/peerHomebaseBackfill.js').PeerHomebaseBackfill | null = null;
     const threadMessageRecorder = new ThreadMessageRecorder({
       threadLog,
       conversationStore,
@@ -17383,6 +17719,10 @@ export async function startServer(options: StartOptions): Promise<void> {
       appendFailureAlertThreshold: _canonHist.appendFailureAlertThreshold,
       inlineMaxBytes: _canonHist.inlineMaxBytes,
     });
+    {
+      const { attachPeerContactHook } = await import('../threadline/peerHomebaseBackfill.js');
+      attachPeerContactHook(threadMessageRecorder, (peer) => _peerHomebaseBackfill?.onContact(peer));
+    }
     // SA5/E1: close-only canonical-log retention — a non-pinned conversation
     // transitioning INTO resolved/failed deletes its log (via SafeFsExecutor inside
     // ThreadLog.deleteThread); a COLD archive/LRU eviction never fires this seam.
@@ -17421,6 +17761,8 @@ export async function startServer(options: StartOptions): Promise<void> {
         return false;
       },
       sendKeys(tmuxSession: string, text: string): boolean {
+        // D3 (docs/specs/confined-spawn-subscription-reroute.md): no Instar writer types into a confined session.
+        if (sessionManager.isConfinedWriteRefused(tmuxSession)) return false;
         try {
           const target = `=${tmuxSession}:`;
           // Chunked — see src/core/tmuxLiteralSend.ts (`send-keys -l` payload
@@ -18299,7 +18641,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             const m = _listPoolMachines().find((x) => x.machineId === machineId);
             if (!m?.lastKnownUrl) return null;
             const extra = (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
-            if (!isPeerUrlAllowedForCredentials(m.lastKnownUrl, extra).ok) return null;
+            if (!isPeerUrlAllowedForCredentials({ url: m.lastKnownUrl, kind: 'last-known-url' }, extra).ok) return null;
             const r = await fetch(`${m.lastKnownUrl}/guards`, {
               headers: { Authorization: `Bearer ${config.authToken}` },
               signal: AbortSignal.timeout(5000),
@@ -18399,11 +18741,38 @@ export async function startServer(options: StartOptions): Promise<void> {
           },
           config as { developmentAgent?: boolean; threadline?: { relayUnknownSenderTrust?: { enabled?: boolean; dryRun?: boolean } } },
         ),
+        // Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9). Read live per
+        // send. Ships ON for every agent (Justin 2026-10-20): omitted means enforce; an explicit
+        // `enabled: false` is off and `dryRun: true` is watch.
+        getEncryptToPinnedMode: () => resolveEncryptToPinnedMode(
+          {
+            enabled: liveConfig.get<boolean | undefined>('threadline.encryptToPinned.enabled', undefined),
+            dryRun: liveConfig.get<boolean | undefined>('threadline.encryptToPinned.dryRun', undefined),
+          },
+          config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
+        ),
+        // Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6, step 6). Read live
+        // per inbound message. Ships at WATCH for every agent: `enabled` omitted means on,
+        // `dryRun` omitted means true (record marks, count would-refuse plaintext, deliver).
+        getRefuseDowngradeMode: () => resolveRefuseDowngradeMode(
+          {
+            enabled: liveConfig.get<boolean | undefined>('threadline.refuseDowngrade.enabled', undefined),
+            dryRun: liveConfig.get<boolean | undefined>('threadline.refuseDowngrade.dryRun', undefined),
+          },
+          config as { developmentAgent?: boolean; threadline?: { refuseDowngrade?: { enabled?: boolean; dryRun?: boolean } } },
+        ),
       });
       threadlineHandshake = threadline.handshakeManager;
       threadlineShutdown = threadline.shutdown;
       threadlineRelayClient = threadline.relayClient;
       threadlinePairingInvites = threadline.pairingInvites;
+      // An invite waiting for the operator's approval lives only in memory (its secret never
+      // touches disk), so an update restart would lose it. Hold automatic update restarts while
+      // one waits, each until its invite expires (docs/specs/a2a-pairing-invite-link.md §8).
+      {
+        const invFlow = threadline.pairingInvites?.flow;
+        if (invFlow instanceof MarkedPairingInviteFlow) autoUpdater.setRestartHold('pairing-invite', () => invFlow.restartHolds());
+      }
       threadlineGetLastRelayEvent = threadline.getLastRelayEvent;
       _threadlineBoot = threadline;
       // A2A cross-machine route §1: the boot-time standby fact, threaded from
@@ -18451,6 +18820,74 @@ export async function startServer(options: StartOptions): Promise<void> {
         }
       }
 
+      // ── Per-peer homebase backfill (peer-conversation-homebase-topic) ──
+      // Homebases are created when a pairing becomes mutual-verified, so peers paired before
+      // the feature shipped never got one, and early ones carry the legacy
+      // "<peer> · Threadline · <fp>" name. One bounded, best-effort pass, delayed so the
+      // serving lease has settled; a standby does nothing (same rule as creation).
+      if (threadline.trustManager && telegram) {
+        const hbTrust = threadline.trustManager;
+        const hbTelegram = telegram;
+        const hbTimer = setTimeout(() => {
+          void (async () => {
+            try {
+              const { backfillPeerHomebases, displayNameCollides, peerHomebaseEnabled } = await import('../threadline/peerHomebase.js');
+              const peers = hbTrust.listProfiles();
+              const r = await backfillPeerHomebases(peers, {
+                enabled: peerHomebaseEnabled(config),
+                holdsLease: !state.readOnly,
+                findOrCreateTopic: async (name) => {
+                  const t = await hbTelegram.findOrCreateForumTopic(name, undefined, { origin: 'user', label: 'peer-homebase' });
+                  return { topicId: t.topicId, reused: t.reused };
+                },
+                findTopicByName: (name) => hbTelegram.findTopicIdByName(name),
+                renameTopic: (topicId, name) => hbTelegram.editForumTopic(topicId, name),
+                nameCollides: (fp, name) => displayNameCollides(fp, name, peers),
+                topicNameOf: (topicId) => hbTelegram.getTopicName(topicId),
+                getRecorded: (fp) => hbTrust.getHomebaseTopic(fp),
+                record: (fp, topicId) => hbTrust.setHomebaseTopic(fp, topicId),
+                log: (m) => console.log(m),
+              });
+              if (r.created || r.renamed || r.failed) {
+                console.log(`[homebase] backfill: created ${r.created}, renamed ${r.renamed}, failed ${r.failed}`);
+              }
+            } catch (err) {
+              console.warn(`[homebase] backfill skipped: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          })();
+        }, 90_000);
+        hbTimer.unref?.();
+      }
+
+      // ── Per-peer homebase on CONTACT ── the boot pass above runs once; a peer still missing a
+      // homebase (its creation failed, or the lease arrived later) gets one on its next message
+      // in either direction. Same create-once / lease-holder-only discipline; every failure is
+      // logged, retried after 10 minutes, and never blocks a message.
+      if (threadline.trustManager && telegram) {
+        const tm = threadline.trustManager;
+        const tg = telegram;
+        const { PeerHomebaseBackfill } = await import('../threadline/peerHomebaseBackfill.js');
+        const { peerHomebaseEnabled, displayNameCollides } = await import('../threadline/peerHomebase.js');
+        const asPeer = (p: { agent: string; fingerprint?: string; pairingState?: string } | null) =>
+          p && p.fingerprint && p.pairingState === 'mutual-verified' ? { fingerprint: p.fingerprint, name: p.agent } : null;
+        _peerHomebaseBackfill = new PeerHomebaseBackfill({
+          enabled: () => peerHomebaseEnabled(config),
+          holdsLease: () => !state.readOnly,
+          resolveMutualVerified: (key) => asPeer(tm.getProfileByFingerprint(key) ?? tm.getProfile(key)),
+          listMutualVerified: () => tm.listProfiles().map(asPeer).filter((p): p is { fingerprint: string; name: string } => p !== null),
+          findOrCreateTopic: async (name) => {
+            const r = await tg.findOrCreateForumTopic(name, undefined, { origin: 'user', label: 'peer-homebase' });
+            return { topicId: r.topicId, reused: r.reused };
+          },
+          findTopicByName: (name) => tg.findTopicIdByName(name),
+          renameTopic: (topicId, name) => tg.editForumTopic(topicId, name),
+          nameCollides: (fp, name) => displayNameCollides(fp, name, tm.listProfiles()),
+          getRecorded: (fp) => tm.getHomebaseTopic(fp),
+          record: (fp, topicId) => tm.setHomebaseTopic(fp, topicId),
+          log: (m) => console.log(m),
+        });
+      }
+
       // Secure A2A Verified Pairing §3.8 (FD11) — SEND-SIDE: attach the journal-backed
       // emitter to the trust manager's pairing-replication hooks so a local markMutualVerified
       // ALSO replicates the verified-IDENTITY RESULT to the agent's OWN machines, and a
@@ -18459,44 +18896,56 @@ export async function startServer(options: StartOptions): Promise<void> {
       // can never cross. Gated on the EXPLICIT `multiMachine.stateSync.threadlinePairing.enabled`
       // (default false ⇒ NOT attached ⇒ strict no-op, single-machine behavior). Attached only
       // when the journal-backed emitter exists (journal live) AND the store is enabled.
-      if (threadline.trustManager && replicatedRecordEmitter && cjOwnMachineId) {
-        const pairingStoreEnabled =
-          (config.multiMachine?.stateSync as { threadlinePairing?: { enabled?: boolean } } | undefined)
-            ?.threadlinePairing?.enabled === true;
-        if (pairingStoreEnabled) {
-          const emitter = replicatedRecordEmitter;
-          const {
-            THREADLINE_PAIRING_STORE_KEY,
-            deriveThreadlinePairingRecordKey,
-            buildThreadlinePairingRecordData,
-            buildThreadlinePairingTombstoneData,
-          } = await import('../core/ThreadlinePairingReplicatedStore.js');
-          threadline.trustManager.setPairingReplicationEmitter(
-            {
-              emitVerified: (result) =>
-                emitter.emit(
-                  THREADLINE_PAIRING_STORE_KEY,
-                  deriveThreadlinePairingRecordKey(result.peerFp),
-                  (hlc, origin, observed) =>
-                    buildThreadlinePairingRecordData({
-                      result: { ...result, state: 'mutual-verified' },
-                      hlc,
-                      origin,
-                      observed,
-                    }),
-                ),
-              emitRevoke: (peerFp, deletedAt) =>
-                emitter.emit(
-                  THREADLINE_PAIRING_STORE_KEY,
-                  deriveThreadlinePairingRecordKey(peerFp),
-                  (hlc, origin, observed) =>
-                    buildThreadlinePairingTombstoneData({ peerFp, hlc, origin, deletedAt, observed }),
-                ),
-            },
-            cjOwnMachineId,
-          );
-        }
+      //
+      // Rollout step 5b — the MERGE half lives in attachThreadlinePairingReplication too:
+      // replicated pairings are inherited (pin + method) and revokes forget inherited pins,
+      // run once at startup (after the invite-method migration) and again from the
+      // peer-apply commit observer above whenever threadline-pairing-record entries land.
+      // All of it is inside the module; this block only attaches it.
+      if (threadline.trustManager && replicatedRecordEmitter && cjOwnMachineId && replicatedPeerStreamReader) {
+        const { attachThreadlinePairingReplication } = await import('../threadline/pairingReplicationWiring.js');
+        _threadlinePairingWiring = attachThreadlinePairingReplication({
+          config,
+          trust: threadline.trustManager,
+          emitter: replicatedRecordEmitter,
+          ownOrigin: cjOwnMachineId,
+          registry: replicatedKindRegistry,
+          stores: _stateSyncStoresResolved,
+          streams: replicatedPeerStreamReader,
+          droppedOrigins: droppedOriginRegistry,
+          conflictStore,
+          log: (m) => console.log(pc.dim(`  [threadline-pairing] ${m}`)),
+        });
       }
+
+      // Rollout step 5b, item 7: enforce encrypt-to-pinned on a MULTI-machine agent needs
+      // pairing replication, or a machine that takes the relay over has no pin. Startup note only.
+      try {
+        const { encryptToPinnedMultiMachineNote, isThreadlinePairingReplicationEnabled } = await import('../threadline/pairingReplicationWiring.js');
+        const note = encryptToPinnedMultiMachineNote({
+          encryptToPinnedMode: encryptToPinnedModeName(resolveEncryptToPinnedMode(
+            {
+              enabled: liveConfig.get<boolean | undefined>('threadline.encryptToPinned.enabled', undefined),
+              dryRun: liveConfig.get<boolean | undefined>('threadline.encryptToPinned.dryRun', undefined),
+            },
+            config as { developmentAgent?: boolean; threadline?: { encryptToPinned?: { enabled?: boolean; dryRun?: boolean } } },
+          )),
+          activeMachineCount: coordinator.enabled ? coordinator.managers.identityManager.getActiveMachines().length : 1,
+          pairingReplicationEnabled: isThreadlinePairingReplicationEnabled(config),
+        });
+        if (note) {
+          console.warn(pc.yellow(`  [threadline] ${note}`));
+          // Encryption ships on (Justin 2026-10-20), so this now applies to every multi-machine
+          // agent that has not turned pairing replication on: surface it, not just log it.
+          DegradationReporter.getInstance().report({
+            feature: 'Threadline.encryptToPinned',
+            primary: 'every machine of this agent encrypts ordinary chat to peers paired by invite',
+            fallback: 'only the machine that made the pairing always encrypts; another machine that takes the relay uses the older rule',
+            reason: 'pairing replication (multiMachine.stateSync.threadlinePairing) is off on a multi-machine agent',
+            impact: note,
+          });
+        }
+      } catch { /* @silent-fallback-ok — an advisory startup note must never endanger boot */ }
 
       if (threadlineRelayClient) {
         // Wire relay message delivery through ThreadlineRouter (Phase 1).
@@ -18523,7 +18972,7 @@ export async function startServer(options: StartOptions): Promise<void> {
 
         const { runRelayInboundWithLedger } = await import('../threadline/inboundIdLedgerWiring.js');
         const { InboundMessageGate: InboundGateStatics } = await import('../threadline/InboundMessageGate.js');
-        threadlineRelayClient.on('gate-passed', async (decision: { message?: { from: string; content: unknown; threadId?: string; messageId?: string }; trustLevel?: string; reason?: string }) => {
+        threadlineRelayClient.on('gate-passed', async (decision: { message?: { from: string; content: unknown; threadId?: string; messageId?: string }; trustLevel?: string; reason?: string; notice?: string }) => {
           // Inbound-id ledger (docs/specs/a2a-inbound-id-ledger.md §1) — THE
           // COMMIT POINT: runRelayInboundWithLedger commits as the first statement
           // after the null-check and the probe exclusion, BEFORE every side effect
@@ -18538,7 +18987,10 @@ export async function startServer(options: StartOptions): Promise<void> {
               annotate: (ledger, senderKey, messageId) => annotatePeerHandoff(config, ledger, senderKey, messageId),
             },
             (ledgerTicket, ledgerNotice) => handleGatePassedRelayMessage(
-              decision as typeof decision & { message: NonNullable<typeof decision.message> }, ledgerTicket, ledgerNotice),
+              decision as typeof decision & { message: NonNullable<typeof decision.message> }, ledgerTicket,
+              // A server-constant label from the inbound path (encrypt-to-pinned: unverified
+              // plaintext under a paired peer's fingerprint) rides the same server-notice slot.
+              [decision.notice, ledgerNotice].filter((n): n is string => !!n).join('; ') || null),
           );
         });
 
@@ -19485,7 +19937,7 @@ export async function startServer(options: StartOptions): Promise<void> {
       const { resolvePeerDarkNoticeConfig, createPeerDarkAuditWriter, resolvePeerDarkAuditPath } = await import('../threadline/peerDark.js');
       const peerDarkCfg = resolvePeerDarkNoticeConfig(config as { developmentAgent?: boolean; threadline?: { peerDarkNotice?: Record<string, unknown> } });
       if ((a2aDelivCfg.enabled || peerDarkCfg.enabled) && a2aDeliveryTracker) {
-        const { A2ARedeliverySentinel, DEFAULT_A2A_REDELIVERY_CONFIG } = await import('../monitoring/A2ARedeliverySentinel.js');
+        const { A2ARedeliverySentinel, DEFAULT_A2A_REDELIVERY_CONFIG, createOutboxRedeliver } = await import('../monitoring/A2ARedeliverySentinel.js');
         const priorityMap: Record<string, 'URGENT' | 'HIGH' | 'NORMAL' | 'LOW'> = {
           high: 'HIGH', medium: 'NORMAL', low: 'LOW',
         };
@@ -19521,12 +19973,10 @@ export async function startServer(options: StartOptions): Promise<void> {
             // sentinel leaves it awaiting-ack and escalates at the cap, never
             // fabricating a send). Only under the legacy gate.
             redeliver: (a2aDelivCfg.enabled && threadlineRelayClient && listenerManager)
-              ? (entry) => {
-                  const stored = listenerManager!.readCanonicalOutboxEntry(entry.messageId);
-                  if (!stored) return false;
-                  threadlineRelayClient!.sendAuto(entry.peerFp, stored.text, entry.threadId ?? stored.threadId);
-                  return true;
-                }
+              ? createOutboxRedeliver({
+                  readOutboxEntry: (id) => listenerManager!.readCanonicalOutboxEntry(id),
+                  sendAuto: (fp, text, threadId) => threadlineRelayClient!.sendAuto(fp, text, threadId),
+                })
               : undefined,
             raiseAttention: telegram
               ? async (item) => {
@@ -20503,6 +20953,23 @@ export async function startServer(options: StartOptions): Promise<void> {
           loginLoss: {
             enabled: resolveDevAgentGate(proactiveCfg.loginLoss?.enabled, config),
             dryRun: proactiveCfg.loginLoss?.dryRun !== false,
+          },
+          defaultSlotRepoint: {
+            enabled:
+              resolveDevAgentGate(proactiveCfg.defaultSlotRepoint?.enabled, config) &&
+              resolveDevAgentGate(config.subscriptionPool?.credentialRepointing?.enabled, config) &&
+              !credentialEnvTokenGate.evaluate().refused,
+            dryRun: proactiveCfg.defaultSlotRepoint?.dryRun !== false,
+            setDefaultAccount: async (accountId) => {
+              const { setDefaultCredentialAccount } = await import('../core/CredentialSetDefault.js');
+              const result = await setDefaultCredentialAccount(credentialRepointing, accountId, {
+                sourceContext: 'proactive-default-slot',
+              });
+              return result.ok
+                ? { ok: result.outcome === 'swapped' || result.outcome === 'dry-run' || result.outcome === 'noop', outcome: result.outcome, reason: result.reason }
+                : { ok: false, outcome: result.code, reason: result.reason };
+            },
+            audit: (record) => credentialAuditEmit.audit(record),
           },
           // §4 — the in-flight work gate (proactive arm: defer, ceiling-drop).
           // The monitor owns the deferral lifecycle; the gate is stateless.
@@ -21818,10 +22285,12 @@ export async function startServer(options: StartOptions): Promise<void> {
     let guardLatchStore: import('../monitoring/GuardLatchStore.js').GuardLatchStore | null = null;
     {
       const gpCfg = config.monitoring?.greenPrAutoMerge as Record<string, unknown> | undefined;
-      const repoPath = process.cwd();
-      const safeMergePath = path.join(repoPath, 'scripts', 'safe-merge.mjs');
       if (gpCfg?.enabled) {
         const wiring = await import('../monitoring/greenPrAutomergeWiring.js');
+        // repoPath: the instar source checkout the watcher's git reads need.
+        // safeMergePath: the INSTALLED safe-merge (the trusted side), never the
+        // working checkout's copy (local-verify-merge-authority §2; ACT-150).
+        const { repoPath, safeMergePath } = wiring.resolveGreenPrPaths(process.cwd());
         if (wiring.isAnalyzableGreenPrRepo(repoPath, safeMergePath)) {
           const gpMachineId = coordinator.identity?.machineId ?? `m_host_${os.hostname()}`;
           const agentNamespace = wiring.resolveGreenPrAgentNamespace(
@@ -21881,6 +22350,121 @@ export async function startServer(options: StartOptions): Promise<void> {
         } else {
           console.log(pc.dim('  GreenPrAutoMerge enabled in config but no analyzable instar repo + safe-merge found — staying inert'));
         }
+      }
+    }
+
+    // ── local-verify (local-verify-merge-authority §2) ──────────────────
+    // The server runs the full suite on a PR's merge tree and keeps the result,
+    // so a merge can wait on a local run instead of GitHub Actions. Repo-gated
+    // and off unless monitoring.localVerify.enabled; null → routes 503.
+    let localVerifyService: import('../localVerify/LocalVerifyService.js').LocalVerifyService | null = null;
+    let localVerifyTimer: NodeJS.Timeout | null = null;
+    let localVerifyStatus: import('../localVerify/StatusReconciler.js').StatusReconciler | null = null;
+    {
+      const lvCfg = (config.monitoring as { localVerify?: { enabled?: boolean; operatorGhLogin?: string; postStatuses?: boolean } } | undefined)?.localVerify;
+      const gpCfg = config.monitoring?.greenPrAutoMerge as { expectedGhLogin?: string; repo?: string } | undefined;
+      const lvMachineId = coordinator.identity?.machineId ?? `m_host_${os.hostname()}`;
+      const lvHooks: import('../localVerify/localVerifyWiring.js').LocalVerifyHooks = {};
+      // Deduped attention for local-verify signals (main-red, status-stuck, mirror-pending, …).
+      lvHooks.signal = (key, detail) => {
+        if (!telegram) return;
+        const id = typeof detail.head === 'string' && key === 'local-verify:mirror-pending' ? `${key}:${detail.head}` : key;
+        void telegram.createAttentionItem({
+          id,
+          title: `local-verify: ${key.replace(/^local-verify:/, '')}`,
+          summary: JSON.stringify(detail).slice(0, 900),
+          category: 'degradation',
+          priority: ['local-verify:no-required-checks', 'local-verify:main-red', 'local-verify:required-but-not-posting'].includes(key) ? 'HIGH' : 'MEDIUM',
+        } as never).catch(() => { /* attention delivery is non-fatal */ });
+      };
+      const wiring = await import('../localVerify/localVerifyWiring.js');
+      if (lvCfg?.enabled) {
+        const built = wiring.buildLocalVerifyService({
+          config: lvCfg,
+          expectedGhLogin: gpCfg?.expectedGhLogin,
+          repo: 'JKHeadley/instar',
+          repoPath: process.cwd(),
+          stateDir: config.stateDir,
+          agentHome: path.dirname(config.stateDir),
+          machineId: lvMachineId,
+          hooks: lvHooks,
+        });
+        if (built.service) {
+          localVerifyService = built.service;
+          try {
+            await localVerifyService.boot();
+            const svc = localVerifyService;
+            // An automatic update restart waits for a running verify (a manual apply does not).
+            wiring.registerLocalVerifyRestartHold(autoUpdater, svc);
+            localVerifyTimer = setInterval(() => { void svc.tick().catch(() => { /* a failed tick retries next interval */ }); }, 30_000);
+            localVerifyTimer.unref();
+            console.log(pc.green('  local-verify enabled (server-run test verification for merges)'));
+          } catch (e) {
+            console.log(pc.red(`  local-verify NOT started — boot failed: ${(e as Error)?.message ?? e}`));
+            localVerifyService = null;
+          }
+        } else {
+          console.log(pc.dim(`  local-verify enabled in config but inert (${built.reason})`));
+        }
+      }
+      // The status reconcile loop (§3). Built on any instar source checkout with the
+      // agent's GitHub login: the Actions-floor mirror must stay on whenever GitHub
+      // requires the check, independent of monitoring.localVerify.enabled (with the
+      // verifier off, the loop does nothing unless the check is required). Posting
+      // is dry-run unless monitoring.localVerify.postStatuses is true.
+      if (gpCfg?.expectedGhLogin) {
+        try {
+          const st = await wiring.buildStatusReconciler({
+            repo: 'JKHeadley/instar',
+            repoPath: process.cwd(),
+            stateDir: config.stateDir,
+            machineId: lvMachineId,
+            expectedGhLogin: gpCfg.expectedGhLogin,
+            operatorGhLogin: lvCfg?.operatorGhLogin?.trim() || null,
+            service: localVerifyService,
+            localVerifyEnabled: () => liveConfig.get<boolean>('monitoring.localVerify.enabled', false) === true,
+            postStatuses: () => liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true,
+            configFloor: () => (liveConfig.get<string>('monitoring.greenPrAutoMerge.floor', 'actions') === 'local' ? 'local' : 'actions'),
+            watcherRepo: () => liveConfig.get<string>('monitoring.greenPrAutoMerge.repo', 'JKHeadley/instar'),
+            lease: coordinator.enabled
+              ? {
+                  holdsLease: () => coordinator.holdsLease(),
+                  leaseEpoch: () => coordinator.getSyncStatus().leaseEpoch,
+                  leaseHolder: () => coordinator.getSyncStatus().leaseHolder ?? null,
+                }
+              : { holdsLease: () => true, leaseEpoch: () => 0, leaseHolder: () => lvMachineId },
+            signal: lvHooks.signal,
+          });
+          if (st.reconciler) {
+            localVerifyStatus = st.reconciler;
+            const rec = st.reconciler;
+            lvHooks.onRecord = (r) => rec.onRecord(r.headSha);
+            lvHooks.onMainHealthChange = (snap) => { if (snap.state !== 'healthy') rec.withdrawAll(snap.state); };
+            rec.start(); // runs a pass now (boot), then every 60 s
+            console.log(pc.dim(`  local-verify status loop started (${liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true ? 'posting' : 'dry-run'})`));
+          } else {
+            console.log(pc.dim(`  local-verify status loop inert (${st.reason})`));
+          }
+        } catch (e) {
+          console.log(pc.red(`  local-verify status loop NOT started: ${(e as Error)?.message ?? e}`));
+        }
+      }
+      // The watcher reads local-verify late-bound (it is built first): the
+      // candidate pre-filter, the actions→local disarm and verify requests
+      // (local-verify-merge-authority §2/§3). The effective floor follows GitHub's
+      // real settings (the reconciler's floor gate); without a reconciler it is
+      // unmeasurable (null ⇒ actions). Main health is the service's machine state.
+      if (localVerifyService) {
+        const svc = localVerifyService;
+        const rec = localVerifyStatus;
+        greenPrAutoMerger?.attachLocalVerify({
+          effectiveFloor: () => (rec ? rec.effectiveFloor() : null),
+          mainHealth: () => svc.mainHealth().state,
+          hasRecord: (pr, head, base) => !!svc.getRecord(pr, head, base),
+          requestVerify: (pr) => svc.request(pr, { explicit: false }),
+          // Dry-run posting also suppresses the watcher's actions→local disarm write.
+          postStatuses: () => liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true,
+        });
       }
     }
 
@@ -22013,7 +22597,11 @@ export async function startServer(options: StartOptions): Promise<void> {
               // avoid it. (Live-test 2026-06-16: the Mini's circuit was open while its quota poll
               // said blocked:false → placement misrouted a session onto it; it died on arrival.)
               // Spec: docs/specs/placement-llm-circuit-aware-quota.md.
-              return computeSelfQuotaState(quotaTracker?.getState(), llmCircuitAvailable());
+              // Third cause: this machine cannot start a session at all.
+              return computeSelfQuotaState(
+                quotaTracker?.getState(), llmCircuitAvailable(), Date.now(),
+                startFailureTracker.state(),
+              );
             } catch { return undefined; /* unknown ≠ blocked */ }
           };
           // Platform/workspace reachability block riding the capacity heartbeat
@@ -22110,7 +22698,7 @@ export async function startServer(options: StartOptions): Promise<void> {
                 // WS1.1 capability advertisement (spec invariant 5): a bounded
                 // fixed-size summary, never an inventory. Reported live each
                 // heartbeat so a queue going dark withdraws the capability.
-                seamlessnessFlags: { ws11DeliverReceive: !!_inboundQueue, ws12DrainReceive: !!_drainRunner, ws44PoolLinks: !!_poolLink, ws44PoolCache: !!_poolPollCache, ws43JournalLease: resolveDevAgentGate(config.multiMachine?.seamlessness?.ws43JournalLease, config) && (config.multiMachine?.seamlessness?.ws43JournalLeaseDryRun ?? !resolveDevAgentGate(undefined, config)) !== true, stateSyncReceive: selfStateSyncReceive(), undatedActionStateOwnerMachineId: config.evolutionActions?.undatedResurfacer?.stateOwnerMachineId?.trim() || null },
+                seamlessnessFlags: { ws11DeliverReceive: !!_inboundQueue, ws12DrainReceive: !!_drainRunner, dashboardCreateReceive: _sessionPoolStage() !== 'dark' && !!telegram && !!_topicProfileCtxRef?.spawnForTopic, ws44PoolLinks: !!_poolLink, ws44PoolCache: !!_poolPollCache, ws43JournalLease: resolveDevAgentGate(config.multiMachine?.seamlessness?.ws43JournalLease, config) && (config.multiMachine?.seamlessness?.ws43JournalLeaseDryRun ?? !resolveDevAgentGate(undefined, config)) !== true, stateSyncReceive: selfStateSyncReceive(), undatedActionStateOwnerMachineId: config.evolutionActions?.undatedResurfacer?.stateOwnerMachineId?.trim() || null },
                 // Machine-coherence advert (machine-coherence-guard §3.2).
                 // Emission is UNCONDITIONAL (M3, normative): it ships live with
                 // the code, regardless of the sentinel's dev-gate/enabled/dryRun
@@ -22370,7 +22958,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             const entry = registry.machines?.[channelRoot];
             if (entry?.status === 'active' && !entry.revokedAt) {
               const url = entry.lastKnownUrl ?? entry.endpoints?.[0]?.url;
-              if (url && isPeerUrlAllowedForCredentials(url, (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist).ok) try {
+              if (url && isPeerUrlAllowedForCredentials({ url, kind: 'last-known-url' }, (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist).ok) try {
                 const requestNonce = randomBytes(32).toString('hex');
                 const body = { requestNonce };
                 const headers = machineAuthMod.signRequest(meshSelfId, meshIdMgr.loadSigningKey(), body);
@@ -23106,10 +23694,13 @@ export async function startServer(options: StartOptions): Promise<void> {
                   state.getCoherenceJournal()?.emitPlacement(topicNum, {
                     owner: rr.ownerMachineId ?? '',
                     epoch: rr.ownershipEpoch,
-                    reason: 'reconcile',
+                    reason: rr.status === 'released' ? 'released' : 'reconcile',
                     // Fix #3 (Finding INT2): a reconciler cooperative transfer emits the
                     // `transferring` intermediate so the target machine claims cross-machine.
-                    ...(rr.status === 'transferring'
+                    // A released record (none yields one today) replicates AS a release.
+                    ...(rr.status === 'released'
+                      ? { status: 'released' as const }
+                      : rr.status === 'transferring'
                       ? {
                           status: 'transferring' as const,
                           ...(rr.transferTo ? { transferTo: rr.transferTo } : {}),
@@ -23340,11 +23931,17 @@ export async function startServer(options: StartOptions): Promise<void> {
               owner: rec.ownerMachineId ?? '',
               ...(prevOwner ? { prevOwner } : {}),
               epoch: rec.ownershipEpoch,
-              reason,
+              // A released record replicates AS a release (reason normalized + explicit
+              // status) — otherwise every peer's applier materialized it as active
+              // ownership by the releasing machine at the higher epoch (the 2026-10-21
+              // 'pin never actuates / topic stuck on a machine that let it go' bug).
+              reason: rec.status === 'released' ? 'released' : reason,
               // Cross-machine convergence (Fix #3 / Finding INT2): carry the `transferring`
               // intermediate so the target's OwnershipApplier materializes it and the target's
               // reconciler claims (completing the handoff cross-machine). Absent for `active`.
-              ...(rec.status === 'transferring'
+              ...(rec.status === 'released'
+                ? { status: 'released' as const }
+                : rec.status === 'transferring'
                 ? {
                     status: 'transferring' as const,
                     ...(rec.transferTo ? { transferTo: rec.transferTo } : {}),
@@ -23630,6 +24227,31 @@ export async function startServer(options: StartOptions): Promise<void> {
           // double-gate on stage!=='dark' to be safe. Fire-and-forget: the durable receipt
           // is already recorded + ACKed before this runs.
           onAccepted: (cmd) => {
+            // dashboard-new-session-machine-choice §3.4 step 4 — a dashboard
+            // create placed on THIS machine. Evaluated FIRST: a brand-new topic has
+            // nothing for the working-set / profile-carrier pulls to fetch, and the
+            // seed below is its only profile writer. Fires only for a payload
+            // OBJECT (never a string) under a matching dashboard-create messageId.
+            {
+              const dcStart = parseDashboardCreatePayload(cmd.payload);
+              if (dcStart && typeof cmd.messageId === 'string' && cmd.messageId.startsWith(`dashboard-create:${cmd.session}:`)) {
+                const dcTopic = Number(cmd.session);
+                if (Number.isFinite(dcTopic)) {
+                  _dashboardStartsInFlight.add(dcTopic);
+                  void _runDashboardCreateStart(dcTopic, dcStart)
+                    .catch((err) => console.warn(`  [dashboard-machine-choice] start for topic ${dcTopic} failed: ${err instanceof Error ? err.message : String(err)}`))
+                    .finally(() => {
+                      _dashboardStartsInFlight.delete(dcTopic);
+                      // The start carries no user text: once it has RUN (its outcome is
+                      // audited and any failure posted in the topic), its receipt is
+                      // settled so the inbound queue never reports it as a lost user
+                      // message. A crash before this leaves it unsettled — reported.
+                      _inboundQueue?.markRemoteInjected(cmd.session, cmd.messageId);
+                    });
+                  return;
+                }
+              }
+            }
             // Working-set move trigger (WORKING-SET-HANDOFF §3.3) — fire-and-forget,
             // BEFORE the stage gate (the coordinator carries its own gates; dark ⇒ undefined).
             {
@@ -23719,38 +24341,91 @@ export async function startServer(options: StartOptions): Promise<void> {
             // prior one died) — spawn the moved session with the relayed context, under a
             // clean topic-derived name. NEVER reuse the prefixed getSessionForTopic value
             // as the spawn name (that is the double-prefix defect above).
-            const spawnName = `topic-${topicId}`;
-            // bug #2: fetch the prior conversation from the router (this machine's local
-            // history for the topic is empty) so the moved session continues with context
-            // instead of starting blank. Best-effort — on any failure we spawn without it.
-            void (async (): Promise<string> => {
-              let movedContext: string | undefined;
-              try {
-                const url = _resolveRouterUrl?.() ?? null;
-                if (url) {
-                  const resp = await fetch(`${url}/telegram/topics/${topicId}/messages?limit=50`, {
-                    headers: { 'Authorization': `Bearer ${config.authToken}` },
-                  });
-                  if (resp.ok) {
-                    const j = (await resp.json()) as { messages?: import('../core/ForwardedTopicContext.js').ForwardedHistoryMessage[] };
-                    movedContext = formatForwardedTopicContext(j.messages, tg.getTopicName?.(topicId) ?? undefined) || undefined;
+            // dashboard-new-session-machine-choice §3.4 step 4b — a dashboard
+            // start for this topic is spawning right now: wait (bounded) for its
+            // binding and inject, never spawn a second session.
+            const spawnForwarded = (): void => {
+              const spawnName = `topic-${topicId}`;
+              // bug #2: fetch the prior conversation from the router (this machine's local
+              // history for the topic is empty) so the moved session continues with context
+              // instead of starting blank. Best-effort — on any failure we spawn without it.
+              void (async (): Promise<string> => {
+                let movedContext: string | undefined;
+                try {
+                  const url = _resolveRouterUrl?.() ?? null;
+                  if (url) {
+                    const resp = await fetch(`${url}/telegram/topics/${topicId}/messages?limit=50`, {
+                      headers: { 'Authorization': `Bearer ${config.authToken}` },
+                    });
+                    if (resp.ok) {
+                      const j = (await resp.json()) as { messages?: import('../core/ForwardedTopicContext.js').ForwardedHistoryMessage[] };
+                      movedContext = formatForwardedTopicContext(j.messages, tg.getTopicName?.(topicId) ?? undefined) || undefined;
+                    }
                   }
+                } catch {
+                  // @silent-fallback-ok — cross-machine context relay is best-effort
                 }
-              } catch {
-                // @silent-fallback-ok — cross-machine context relay is best-effort
+                return spawnSessionForTopic(sessionManager, tg, spawnName, topicId, text, undefined, undefined, movedContext);
+              })()
+                .then((name) => {
+                  tg.registerTopicSession(topicId, name, spawnName);
+                  console.log(pc.green(`  [session-pool] owner-side resume for forwarded topic ${topicId} → ${name}`));
+                  // Loss window 6: the forwarded message reached a real session.
+                  _inboundQueue?.markRemoteInjected(cmd.session, cmd.messageId);
+                })
+                .catch((err) => {
+                  console.warn(`  [session-pool] owner-side resume failed for topic ${topicId}: ${err instanceof Error ? err.message : String(err)}`);
+                  _inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId, err instanceof Error ? err.message : String(err));
+                });
+            };
+            // dashboard-new-session-machine-choice §3.4 step 4b — a dashboard start
+            // for this topic is in flight (seeding or spawning): wait (bounded) for
+            // its binding and inject. If it never binds, fall through to the
+            // ordinary spawn — the message is never dropped and never spawns twice
+            // while the start is still running.
+            if (_dashboardStartsInFlight.has(topicId) || _spawningTopicsRegistryRef?.has(topicId)) {
+              if (_dashboardStartWaiters >= DASHBOARD_START_WAITERS_MAX) {
+                _inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId, 'dashboard-create-start-wait-capacity');
+                console.warn(`  [session-pool] forwarded message for topic ${topicId} not held: ${DASHBOARD_START_WAITERS_MAX} messages already waiting on in-flight starts — reported`);
+                return;
               }
-              return spawnSessionForTopic(sessionManager, tg, spawnName, topicId, text, undefined, undefined, movedContext);
-            })()
-              .then((name) => {
-                tg.registerTopicSession(topicId, name, spawnName);
-                console.log(pc.green(`  [session-pool] owner-side resume for forwarded topic ${topicId} → ${name}`));
-                // Loss window 6: the forwarded message reached a real session.
-                _inboundQueue?.markRemoteInjected(cmd.session, cmd.messageId);
-              })
-              .catch((err) => {
-                console.warn(`  [session-pool] owner-side resume failed for topic ${topicId}: ${err instanceof Error ? err.message : String(err)}`);
+              _dashboardStartWaiters++;
+              void (async () => {
+                try {
+                for (let i = 0; i < 60 && (_dashboardStartsInFlight.has(topicId) || _spawningTopicsRegistryRef?.has(topicId)); i++) {
+                  await new Promise((r) => setTimeout(r, 1000));
+                }
+                const bound = tg.getSessionForTopic(topicId);
+                if (bound && sessionManager.isSessionAlive(bound)) {
+                  if (!text) return;
+                  try {
+                    const injected = sessionManager.injectTelegramMessage(bound, topicId, text, tg.getTopicName?.(topicId) ?? undefined);
+                    if (injected !== false) {
+                      tg.trackMessageInjection(topicId, bound, text);
+                      _inboundQueue?.markRemoteInjected(cmd.session, cmd.messageId);
+                      return;
+                    }
+                    _inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId, 'inject-returned-false');
+                  } catch (err) {
+                    _inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId, err instanceof Error ? err.message : String(err));
+                  }
+                  return;
+                }
+                if (_dashboardStartsInFlight.has(topicId) || _spawningTopicsRegistryRef?.has(topicId)) {
+                  _inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId, 'dashboard-create-start-did-not-bind');
+                  console.warn(`  [session-pool] forwarded message for topic ${topicId} waited 60s on a dashboard start that is still running — reported, not spawned twice`);
+                  return;
+                }
+                spawnForwarded();
+                } finally {
+                  _dashboardStartWaiters--;
+                }
+              })().catch((err) => {
                 _inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId, err instanceof Error ? err.message : String(err));
               });
+              return;
+            }
+            spawnForwarded();
           },
         });
         // ── WS1.2 owner-side drain runner (MULTI-MACHINE-SEAMLESSNESS-SPEC) ──
@@ -24614,13 +25289,17 @@ export async function startServer(options: StartOptions): Promise<void> {
                 { timeoutMs: 50_000 },
               );
               if (res.ok) {
-                const r = (res.result ?? {}) as { ok?: boolean; status?: string; reason?: string; autonomousRunSuspended?: boolean; claimLanded?: boolean };
+                const r = (res.result ?? {}) as { ok?: boolean; status?: string; reason?: string; detail?: string; autonomousRunSuspended?: boolean; claimLanded?: boolean };
                 const status = typeof r.status === 'string' ? r.status : undefined;
                 const completed = r.ok === true && (status === 'drained' || status === 'drained-interrupted');
+                // The mesh handler spreads the runner's outcome, whose reason
+                // field is `detail` (e.g. `close-refused:active-subagent`) —
+                // read it so a remote refusal reaches the route's 409 by name.
+                const reason = typeof r.reason === 'string' ? r.reason : typeof r.detail === 'string' ? r.detail : undefined;
                 return {
                   ok: r.ok === true,
                   status,
-                  reason: typeof r.reason === 'string' ? r.reason : undefined,
+                  reason,
                   runSuspended: r.autonomousRunSuspended === true,
                   claimLanded: completed && r.claimLanded === true,
                 };
@@ -24639,12 +25318,46 @@ export async function startServer(options: StartOptions): Promise<void> {
           // routing and lease traffic. A freshly enrolled peer can have live
           // LAN/Tailscale endpoints without the legacy lastKnownUrl field; the
           // old filter silently omitted that online machine from every pool view.
+          // Carries the endpoint KIND alongside the url: the credential guard
+          // requires it (so a caller cannot forget it), and selection now prefers
+          // the best ADMISSIBLE rope rather than the best rope — the fix for pool
+          // reads dead-ending on an inadmissible highest-ranked candidate.
+          // Selection without feedback cannot converge, it can only be lucky: the
+          // highest-priority ADMISSIBLE rope is chosen forever even when it never
+          // answers. Reporting each pool dial into the SAME resolver the lease
+          // transport feeds is what makes a dead rope demote itself.
+          _recordRopeResult = (machineId, kind, ok, latencyMs, url) =>
+            meshResolver.recordResult(machineId, kind, ok, latencyMs, url);
           _resolvePeerUrls = () =>
             meshIdMgr
               .getActiveMachines()
               .filter((m) => m.machineId !== meshSelfId)
-              .map((m) => ({ machineId: m.machineId, url: peerUrl(m.machineId) }))
-              .filter((m): m is { machineId: string; url: string } => m.url != null);
+              .map((m) => {
+                const entry = m.entry;
+                const selection = resolveMeshPeerPreferredSelection(
+                  meshResolver,
+                  m.machineId,
+                  entry?.endpoints,
+                  entry?.lastKnownUrl,
+                  (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist,
+                );
+                return {
+                  machineId: m.machineId,
+                  url: selection?.selection.url ?? null,
+                  kind: selection?.selection.kind ?? null,
+                  // Which ropes the guard skipped on the way to this one — so a
+                  // caller can report them instead of them vanishing.
+                  ropeRefusals: selection?.refusals ?? [],
+                };
+              })
+              .filter(
+                (m): m is {
+                  machineId: string;
+                  url: string;
+                  kind: PeerEndpointKind;
+                  ropeRefusals: RopeRefusal[];
+                } => m.url != null && m.kind != null,
+              );
           // EVERY registered non-revoked machine — URL or not — so the /guards
           // pool view can account for each by name (no-known-url is a NAMED row,
           // never a silent omission — GUARD-POSTURE-ENDPOINT-SPEC §2.3).
@@ -25393,6 +26106,49 @@ export async function startServer(options: StartOptions): Promise<void> {
             emitPlacement,
             confirmLocal: (sk) => _confirmLocalSessionPoolClaim?.(sk) ?? false,
           });
+          // dashboard-new-session-machine-choice §3.4 step 3 — place → CHECKED
+          // deliver → claim (a failed deliver settles to `released`, never a
+          // resting `placing`). Same registry, nonce stream and journal as the router.
+          {
+            const dmcMod = await import('../core/dashboardMachineChoice.js');
+            // §3.4 step 0 — the pre-flight probes the SAME signed plane the start
+            // rides, with the read-class command any registered peer may answer.
+            _dashboardProbeMachine = async (machineId) => {
+              const url = peerUrl(machineId);
+              if (!url) return false;
+              try {
+                const res = await meshClient.send({ machineId, url }, { type: 'session-status' }, 0, { timeoutMs: 5000 });
+                return !!res.ok;
+              } catch {
+                // @silent-fallback-ok: unreachable ⇒ the route answers 502 machine-unreachable to the operator
+                return false;
+              }
+            };
+            _dashboardStartOnMachine = (sk, target, start, pin) => dmcMod.startTopicOnMachine({
+              readOwnership: (key) => {
+                const r = ownReg.read(key);
+                return r ? { status: r.status, ownerMachineId: r.ownerMachineId ?? null, ownershipEpoch: r.ownershipEpoch } : null;
+              },
+              cas: (key, action) => {
+                const prevOwner = ownReg.read(key)?.ownerMachineId;
+                const r = ownReg.cas(action, { sessionKey: key, sender: meshSelfId, nonce: `${meshSelfId}:dmc-${action.type}:${++routerNonce}` });
+                emitPlacement(key, r, action.type === 'release' ? 'released' : 'placed', prevOwner);
+                return { ok: r.ok, epoch: ownReg.read(key)?.ownershipEpoch ?? 0, ...(r.ok ? {} : { reason: (r as { reason?: string }).reason }) };
+              },
+              deliver: async (machineId, env) => {
+                const url = peerUrl(machineId);
+                if (!url) return { kind: 'rejected' as const, detail: `no peer url for ${machineId}` };
+                const res = await meshClient.send(
+                  { machineId, url },
+                  { type: 'deliverMessage', session: env.sessionKey, messageId: env.messageId, payload: env.payload, ownershipEpoch: env.ownershipEpoch } as import('../core/MeshRpc.js').MeshCommand,
+                  env.ownershipEpoch,
+                  { timeoutMs: 5000 }, // the "5 s mesh timeout" the spec's shared-race note quotes
+                );
+                return dmcMod.classifyDeliverReply(res);
+              },
+              nonce: () => `${Date.now().toString(36)}-${++routerNonce}`,
+            }, sk, target, start, pin);
+          }
           _sessionRouter = new routerMod.SessionRouter({
             selfMachineId: meshSelfId,
             placement: new placeMod.PlacementExecutor(undefined, {
@@ -26606,6 +27362,9 @@ export async function startServer(options: StartOptions): Promise<void> {
               catch { /* @silent-fallback-ok — audit is observability only */ }
             };
             const heldCollapser = new originForwardMod.HeldForwardItemCollapser({ now: Date.now });
+            // One gate for BOTH held paths (forward + direct): only a held session
+            // reply may post the delayed notice, once per topic per hold episode.
+            const heldNoticeGate = new originForwardMod.HeldNoticeGate({ now: Date.now });
             const raiseHeldItem = async (input: { topicId: number; holder: string | null; operationId: string; lastAttempt: string; reason: string }) => {
               const verdict = heldCollapser.record(input.topicId);
               const holderName = input.holder ? holderNickname(input.holder) : 'no machine currently holds the serving lease';
@@ -26663,16 +27422,13 @@ export async function startServer(options: StartOptions): Promise<void> {
                   formatMode: tgConfig().formatMode, send: sendToHolder(holder, 5_000), executionOwnerMachineId: holder }));
                 return Number.isSafeInteger(r.messageId);
               },
+              noticeGate: heldNoticeGate,
               audit: heldAudit, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now,
             });
             if (telegramOriginBoot && hasUsableBotToken && meshSelfId) {
               const runtime = telegramOriginBoot.runtime;
               telegram.holderForwardPolicy = {
-                decide: () => {
-                  if (!forwardSwitchOn() || _sessionPoolStage() === 'dark') return 'local';
-                  const route = originForwardMod.classifyLeaseRoute(forwardLease);
-                  return route.kind === 'self' ? 'local' : route.kind === 'peer' ? 'forward' : 'settling';
-                },
+                decide: () => originForwardMod.decideHolderForward({ switchOn: forwardSwitchOn(), poolStage: _sessionPoolStage(), route: originForwardMod.classifyLeaseRoute(forwardLease) }),
               };
               // §4.2 — recovery re-forwards the SAME operation; an outcome-unknown
               // attempt is resolved at the old holder's receipt, never re-sent blind.
@@ -26712,15 +27468,20 @@ export async function startServer(options: StartOptions): Promise<void> {
               // holder when one is reachable, otherwise the collapsed attention item.
               runtime.options.onLeaseHoldObserved = async row => {
                 const topicId = Number(row.destination.topicId);
-                heldAudit({ phase: 'direct-hold-observed', topicId: row.destination.topicId, operationId: row.operationId });
+                heldAudit({ ts: Date.now(), phase: 'direct-hold-observed', topicId: row.destination.topicId, operationId: row.operationId, producerKind: row.producerKind ?? null });
                 if (!Number.isSafeInteger(topicId)) return;
                 const route = originForwardMod.classifyLeaseRoute(forwardLease);
+                const gate = heldNoticeGate.decide({ topicId, producerKind: row.producerKind });
                 let noticeDelivered = false;
-                if (route.kind === 'peer' && forwardSwitchOn()) {
+                if (gate.send && route.kind === 'peer' && forwardSwitchOn()) {
                   try { noticeDelivered = await forwardDeps(runtime).notify!(route.holder, topicId); } catch { noticeDelivered = false; } // @silent-fallback-ok — an undelivered notice falls through to the attention item below
+                  if (noticeDelivered) heldNoticeGate.recordSent(topicId);
                 }
-                heldAudit({ phase: noticeDelivered ? 'notice-sent' : 'notice-not-sent', topicId, operationId: row.operationId, holder: route.kind === 'peer' ? route.holder : null });
-                if (!noticeDelivered) await raiseHeldItem({ topicId, holder: route.kind === 'peer' ? route.holder : null, operationId: row.operationId, lastAttempt: 'refused', reason: 'lease-not-held (direct path)' });
+                const suppressed = gate.send ? null : gate.reason;
+                heldAudit({ ts: Date.now(), phase: noticeDelivered ? 'notice-sent' : suppressed ? 'notice-suppressed' : 'notice-not-sent', topicId, operationId: row.operationId,
+                  holder: route.kind === 'peer' ? route.holder : null, ...(suppressed ? { suppressed } : {}) });
+                // The topic was already told about this hold episode: no second item either.
+                if (!noticeDelivered && suppressed !== 'already-noticed') await raiseHeldItem({ topicId, holder: route.kind === 'peer' ? route.holder : null, operationId: row.operationId, lastAttempt: 'refused', reason: 'lease-not-held (direct path)' });
               };
               runtime.options.onHeldForwardExpired = async row => {
                 const topicId = Number(row.destination.topicId);
@@ -26742,7 +27503,7 @@ export async function startServer(options: StartOptions): Promise<void> {
                     { topicId, chatId: tg.chatId, text, silent: opts?.silent, formatMode: tg.formatMode, kindMetadata: opts?.kindMetadata });
                   if (outcome.kind === 'local') throw new OriginForwardSettledLocallyError();
                   if (outcome.kind === 'sent') return { messageId: outcome.messageId, topicId, destinationStoreConfirmed: true as const };
-                  if (!outcome.noticeDelivered) void raiseHeldItem({ topicId, holder: outcome.holder, operationId: outcome.operationId, lastAttempt: outcome.lastAttempt, reason: outcome.reason });
+                  if (!outcome.noticeDelivered && outcome.noticeSuppressed !== 'already-noticed') void raiseHeldItem({ topicId, holder: outcome.holder, operationId: outcome.operationId, lastAttempt: outcome.lastAttempt, reason: outcome.reason });
                   throw new TelegramOriginHoldError(originForwardMod.HOLD_REASON_LEASE_NOT_HELD, outcome.operationId, 'held');
                 }
                 const holder = coordinator.getSyncStatus().leaseHolder;
@@ -27199,7 +27960,8 @@ export async function startServer(options: StartOptions): Promise<void> {
               resolve(r);
             };
             try {
-              const child = cp.spawn(vitestBin, ['run', args.testPath, '--reporter=dot'], {
+              // The failover check is an e2e file; the default config is the unit lane only.
+              const child = cp.spawn(vitestBin, ['run', '--config', vitestConfigForTestPath(args.testPath), args.testPath, '--reporter=dot'], {
                 cwd: sourceRoot,
                 stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
                 env: { ...process.env },
@@ -27261,7 +28023,7 @@ export async function startServer(options: StartOptions): Promise<void> {
       orchestrator: TopicProfileOrchestrator | null;
       carrier: import('../core/TopicProfileTransferCarrier.js').TopicProfileTransferCarrier | null;
     } & Pick<NonNullable<import('../server/routes.js').RouteContext['topicProfile']>,
-      'newTopicDefault' | 'audit' | 'discloseCreationSeed' | 'spawnForTopic' | 'sessionPoolLocalClaim'> | null =
+      'newTopicDefault' | 'audit' | 'discloseCreationSeed' | 'spawnForTopic' | 'sessionPoolLocalClaim' | 'startTopicOnMachine' | 'pinReplicationLive' | 'startSeamWired' | 'probeMachineReachable'> | null =
       (_topicProfileStore && _topicProfileResolver && _topicProfileWriteSurface && _topicProfileConfirmSlots)
         ? {
             store: _topicProfileStore,
@@ -27316,8 +28078,55 @@ export async function startServer(options: StartOptions): Promise<void> {
                 ops,
               });
             },
+            // dashboard-new-session-machine-choice §3.4 step 3 + §3.2.
+            startTopicOnMachine: (topicKey, target, start, pin) => {
+              const fn = _dashboardStartOnMachine;
+              if (!fn) return Promise.resolve({ ok: false as const, code: 'start-failed' as const, error: 'the session router is not wired on this machine', released: false, settled: true });
+              return fn(topicKey, target, start, pin);
+            },
+            startSeamWired: () => !!_dashboardStartOnMachine,
+            probeMachineReachable: (machineId) => (_dashboardProbeMachine ? _dashboardProbeMachine(machineId) : Promise.resolve(false)),
+            pinReplicationLive: () => resolveDevAgentGate(
+              (config as { multiMachine?: { seamlessness?: { ws13PinReplicate?: boolean } } }).multiMachine?.seamlessness?.ws13PinReplicate,
+              config,
+            ),
           }
         : null;
+    // dashboard-new-session-machine-choice §3.4 step 4 — the owner-side branch
+    // reaches the topic-profile context through this late-bound ref.
+    if (_topicProfileCtx) {
+      const tpc = _topicProfileCtx;
+      _topicProfileCtxRef = {
+        store: tpc.store,
+        seedDeps: () => ({
+          enabledFrameworks: () => config.enabledFrameworks ?? config.sessions?.enabledFrameworks,
+          doorAdmissibility: (fw) => tpc.resolver.doorAdmissibility(fw),
+          store: tpc.store,
+          regime: () => tpc.surface.currentRegime(),
+          audit: (event) => tpc.audit?.(event),
+          // The creating machine already posted the topic's line (§3.4 step 3e).
+          disclose: () => Promise.resolve(undefined),
+        }),
+        spawnForTopic: tpc.spawnForTopic,
+      };
+    }
+    _runDashboardCreateStart = createDashboardCreateStartRunner({
+      telegramReady: () => !!telegram,
+      getSessionForTopic: (t) => telegram?.getSessionForTopic(t) ?? null,
+      isSessionAlive: (n) => sessionManager.isSessionAlive(n),
+      topicName: (t) => telegram?.getTopicName?.(t) ?? null,
+      seedDeps: () => _topicProfileCtxRef?.seedDeps() ?? null,
+      seed: seedTopicProfileAtCreation,
+      spawnForTopic: () => _topicProfileCtxRef?.spawnForTopic ?? null,
+      notice: (t, text) => {
+        if (!telegram) return;
+        void sendDeterministicTelegramNotice(telegram, 'topic-profile-creation-seed', t, text).catch(() => {
+          /* @silent-fallback-ok: a held/failed fixed notice is recorded by origin egress (held-send record + one attention item); the audit row is the durable record */
+        });
+      },
+      audit: (event) => { appendTopicProfileAudit(config.stateDir, event); },
+      selfLabel: () => safeMachineLabel((_listPoolMachines?.() ?? []).find((m) => m.machineId === _meshSelfId)?.nickname ?? null, _meshSelfId ?? 'this machine'),
+    });
 
     // ── StrandedTopicSentinel (stranded-inbound-self-heal) — PURE SIGNAL ──────
     // Detects a topic whose owner machine is online-by-heartbeat but unable to
@@ -27870,7 +28679,7 @@ export async function startServer(options: StartOptions): Promise<void> {
           })),
           fetchPeerState: async (peer, timeoutMs) => {
             if (!peer.url) return { ok: false, reason: 'no-known-url' };
-            if (!isPeerUrlAllowedForCredentials(peer.url, (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist).ok) return { ok: false, reason: 'url-rejected' };
+            if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: 'last-known-url' }, (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist).ok) return { ok: false, reason: 'url-rejected' };
             try {
               const r = await fetch(`${peer.url.replace(/\/$/, '')}/passkeys/pool-state`, {
                 headers: { Authorization: `Bearer ${config.authToken ?? ''}`, 'X-Instar-Machine-Id': pkSelfId }, signal: AbortSignal.timeout(timeoutMs),
@@ -28129,12 +28938,12 @@ export async function startServer(options: StartOptions): Promise<void> {
       console.log(pc.yellow(`  Agent identity runtime: not wired (${err instanceof Error ? err.message : String(err)})`));
     }
 
-    const server = new AgentServer({ config, singleInstanceLock, agentIdentity: _agentIdentityDeps, terminateSessionAuthority: terminateWithAuthority, subscriptionEmailBinding: credentialLocationLedger, subscriptionEmailBarrier, subscriptionIdentityOracle, sessionManager, llmQueue: sharedLlmQueue, state, scheduler, telegram, telegramOrigin: telegramOriginBoot?.runtime, relationships, feedback, feedbackAnomalyDetector, dispatches, updateChecker, autoUpdater, autoDispatcher, quotaTracker, quotaManager, publisher, viewer, tunnel, evolution, watchdog, topicMemory, triageNurse, projectMapper, cartographerRoots: cartographerRoots ?? undefined, coherenceGate: scopeVerifier, contextHierarchy, canonicalState, operationGate, sentinel, adaptiveTrust, memoryMonitor, orphanReaper, coherenceMonitor, commitmentTracker, subscriptionPool, accountFollowMePeerViews: async () => { const nickById = new Map((_listPoolMachines?.() ?? []).map((m) => [m.machineId, m.nickname ?? m.machineId])); let peers = (_resolvePeerUrls?.() ?? []).map((p) => ({ machineId: p.machineId, nickname: nickById.get(p.machineId) ?? p.machineId, url: p.url })); if (peers.length === 0) { peers = (_listPoolMachines?.() ?? []).filter((m) => m.machineId !== _meshSelfId && !!m.lastKnownUrl).map((m) => ({ machineId: m.machineId, nickname: m.nickname ?? m.machineId, url: m.lastKnownUrl as string })); } if (peers.length === 0) return []; const { fetchPeerSubscriptionViews } = await import('../core/fetchPeerSubscriptionViews.js'); return fetchPeerSubscriptionViews({ peers: () => peers, fetchImpl: fetch as unknown as Parameters<typeof fetchPeerSubscriptionViews>[0]['fetchImpl'], authToken: config.authToken ?? '' }); }, quotaPoller, quotaAwareScheduler: _quotaAwareScheduler ?? undefined, proactiveSwapMonitor: _proactiveSwapMonitor ?? undefined, inUseAccountResolver, enrollmentWizard, accountFollowMeRevocation, credentialRepointing, semanticMemory, activitySentinel, rateLimitSentinel, releaseReadinessSentinel: releaseReadinessSentinel ?? undefined, greenPrAutoMerger: greenPrAutoMerger ?? undefined, guardLatchStore: guardLatchStore ?? undefined, messageRouter, summarySentinel, spawnManager, systemReviewer, capabilityMapper, selfKnowledgeTree, coverageAuditor, topicResumeMap: _topicResumeMap ?? undefined, topicProfile: _topicProfileCtx ?? undefined, sessionRefresh: _sessionRefresh ?? undefined, autonomyManager, trustElevationTracker, autonomousEvolution, coordinator: coordinator.enabled ? coordinator : undefined, meshBindActive: coordinator.managers.identityManager.hasIdentity() && config.multiMachine?.meshTransport?.enabled !== false, localSigningKeyPem, leaseTransport, peerEndpointRecorder, getSelfMeshEndpoints, onLeasePullRequest: () => leaseCoordinatorRef?.currentLease() ?? null, liveTailReceiver, handoffWireTransport, onHandoffBegin, onHandoffInitiate: handoffInitiate, handoffInProgress: handoffSentinelInProgress, messageLedger, currentInboundByTopic, replyMarkerTransport, onReplyMarker: messageLedger ? (marker: unknown) => { const m = marker as { dedupeKey: string; platform: string; replyIdempotencyKey: string; epoch: number; topic?: string | null }; messageLedger!.applyRemoteReplyMarker(m.dedupeKey, { platform: m.platform, replyIdempotencyKey: m.replyIdempotencyKey, epoch: m.epoch, topic: m.topic ?? null }); } : undefined, whatsapp: whatsappAdapter, slack: slackAdapter, imessage: imessageAdapter, conversationRegistry, conversationBindAuth, conversationFollowThrough, whatsappBusinessBackend, messageBridge, hookEventReceiver, worktreeMonitor, subagentTracker, instructionsVerifier, handshakeManager: threadlineHandshake, threadlineRouter, conversationStore, threadLog, threadMessageRecorder, warrantsReplyGate, collaborationSurfacer, threadResumeMap, topicLinkageHandler: topicLinkageHandler ?? undefined, threadlineRelayClient, pairingInvites: threadlinePairingInvites, getLastRelayEvent: threadlineGetLastRelayEvent, a2aRelayForward: _a2aRelayForwardCtx ?? undefined, threadlineReplyWaiters, listenerManager: listenerManager ?? undefined, a2aDeliveryTracker: a2aDeliveryTracker ?? undefined, relayVerdictCounters: threadlineRelayClient ? (() => ({ ...threadlineRelayClient!.relayVerdictCounters, expiredMismatchIgnored: a2aDeliveryTracker?.expiredMismatchIgnored ?? 0 })) : undefined, inboundIdLedger: _inboundIdLedger ?? undefined, inboundIdLedgerDaemonDeferred: () => _inboundIdLedgerDaemonDeferred, responseReviewGate, reviewCanaryBattery, messagingToneGate, outboundDedupGate, telemetryHeartbeat, pasteManager, featureRegistry, discoveryEvaluator, completionEvaluator, unifiedTrust, liveConfig, sharedStateLedger, ledgerSessionRegistry, worktreeManager, oidcEnrolledRepos: parallelDevConfig?.oidcEnrolledRepos, initiativeTracker, projectRoundRunner, projectDriftChecker, machineHeartbeat, machinePoolRegistry, ropeHealthMonitor, writeAdmission: writeAdmission ?? undefined, getInboundQueue: () => _inboundQueue, getMachineCoherence: () => _machineCoherenceSentinel, getSingleMachineFailoverGap: () => _singleMachineFailoverGap, getMissingLoginSession: () => _missingLoginSession, getSessionPoolFailoverRunner: () => _sessionPoolFailoverRunnerDriver?.status() ?? null, sessionPoolPromotionActivation: _sessionPoolPromotionActivation, meshRpcDispatcher, deliverA2aToMachine: _deliverA2aToMachine ?? undefined, workingSetPullCoordinator, workingSetArtifactManager, orchestratorPoller, commitmentReplicaStore, preferenceReplicaStore, replicatedRecordEmitter, conflictStore, rollbackUnmerge, droppedOriginRegistry, preferencesUnionReader, jevMemoryPicker, forwardCommitmentMutate, sessionOwnershipRegistry, sendDrain: _sendDrain ?? undefined, topicPinStore: _topicPinStore ?? undefined, topicPinSkewQuarantine: _topicPinSkewQuarantine ?? undefined, topicPinFoldView: _topicPinFoldView ?? undefined, ownershipReconciler: _ownershipReconciler ?? undefined, staleOwnerEngine: _staleOwnerEngine ?? undefined, duplicateReconciler: _duplicateReconciler ?? undefined, ownerDarkLadder: _ownerDarkLadder ?? undefined, spawnAdmission: _spawnAdmission ?? undefined, judgmentProvenance: _judgmentProvenance ?? undefined, leaseHandback: _leaseHandbackCtx ?? undefined, streamTicketStore: _streamTicketStore ?? undefined, poolStreamAllowRemoteInput: (config as { dashboard?: { poolStream?: { allowRemoteInput?: boolean } } }).dashboard?.poolStream?.allowRemoteInput ?? false, poolStreamConnector: _poolStreamConnector ?? undefined, secretSync: _secretSyncHandle ?? undefined, meshSelfId: _meshSelfId ?? undefined, resolveRouterUrl: _resolveRouterUrl ?? undefined, resolvePeerUrls: _resolvePeerUrls ?? undefined, guardRegistry, listPoolMachines: _listPoolMachines ?? undefined, deliverMandateToMachine: _deliverMandateToMachine ?? undefined, passkeyRevokeOutbox: _passkeyRevokeOutbox ? () => _passkeyRevokeOutbox! : undefined, passkeyPeerOnline: _passkeyPeerOnline, passkeyPoolReader: _passkeyPoolReader ? () => _passkeyPoolReader! : undefined, passkeyProofBrowser: async (profileDir: string) => { const { ChromeCdpReloginBrowser } = await import('../core/ChromeCdpReloginBrowser.js'); return new ChromeCdpReloginBrowser({ userDataDir: profileDir, passkeyMode: true, headless: true, launchTimeoutMs: 30_000, operationTimeoutMs: 20_000 }); }, poolLink: _poolLink ?? undefined, poolPollCache: _poolPollCache ?? undefined, sessionPoolE2EResultStore, proxyCoordinator, topicIntentStore, topicIntentArcCheck, usherSignalStore, intelligence: sharedIntelligence ?? undefined, telegramBridgeConfig, telegramBridge: telegramBridge ?? undefined, threadlineObservability, briefDeps, workingMemory, taskFlowRegistry, threadlineFlowBridge, sessionReaper, agentWorktreeReaper, externalHogSentinel, orphanedWorkSentinel, mcpProcessReaper, geminiLoopRunner, sleepController, agentActivityState, reapLog, resumeQueue, resumeDrainer, autonomousLivenessReconciler, enforcedTerminationStatus: () => enforcedTerminationWatchdog?.guardStatus() ?? null, prHandLease: prHandLease ?? undefined, standDownRegistry: _standDownRegistry ?? undefined, standDownAudit: _standDownAudit ?? undefined, operatorStopRecorder: recordOperatorStop, sleepWakeDetector, unjustifiedStopGate, stopGateDb, stopNotifier, liveTestGate, liveTestGateMode, liveTestRunnerCtx });    // Resolve the late-bound topic-operator getter (increment 2e): routing was
+    const server = new AgentServer({ config, singleInstanceLock, agentIdentity: _agentIdentityDeps, terminateSessionAuthority: terminateWithAuthority, subscriptionEmailBinding: credentialLocationLedger, subscriptionEmailBarrier, subscriptionIdentityOracle, sessionManager, llmQueue: sharedLlmQueue, state, scheduler, telegram, telegramOrigin: telegramOriginBoot?.runtime, relationships, feedback, feedbackAnomalyDetector, dispatches, updateChecker, autoUpdater, autoDispatcher, quotaTracker, quotaManager, publisher, viewer, tunnel, evolution, watchdog, topicMemory, triageNurse, projectMapper, cartographerRoots: cartographerRoots ?? undefined, coherenceGate: scopeVerifier, contextHierarchy, canonicalState, operationGate, sentinel, adaptiveTrust, memoryMonitor, orphanReaper, coherenceMonitor, commitmentTracker, subscriptionPool, accountFollowMePeerViews: async () => { const nickById = new Map((_listPoolMachines?.() ?? []).map((m) => [m.machineId, m.nickname ?? m.machineId])); let peers = (_resolvePeerUrls?.() ?? []).map((p) => ({ machineId: p.machineId, nickname: nickById.get(p.machineId) ?? p.machineId, url: p.url })); if (peers.length === 0) { peers = (_listPoolMachines?.() ?? []).filter((m) => m.machineId !== _meshSelfId && !!m.lastKnownUrl).map((m) => ({ machineId: m.machineId, nickname: m.nickname ?? m.machineId, url: m.lastKnownUrl as string })); } if (peers.length === 0) return []; const { fetchPeerSubscriptionViews } = await import('../core/fetchPeerSubscriptionViews.js'); return fetchPeerSubscriptionViews({ peers: () => peers, fetchImpl: fetch as unknown as Parameters<typeof fetchPeerSubscriptionViews>[0]['fetchImpl'], authToken: config.authToken ?? '' }); }, quotaPoller, quotaAwareScheduler: _quotaAwareScheduler ?? undefined, proactiveSwapMonitor: _proactiveSwapMonitor ?? undefined, inUseAccountResolver, enrollmentWizard, accountFollowMeRevocation, credentialRepointing, semanticMemory, activitySentinel, rateLimitSentinel, releaseReadinessSentinel: releaseReadinessSentinel ?? undefined, greenPrAutoMerger: greenPrAutoMerger ?? undefined, localVerify: localVerifyService ?? undefined, localVerifyStatus: localVerifyStatus ?? undefined, guardLatchStore: guardLatchStore ?? undefined, messageRouter, summarySentinel, spawnManager, systemReviewer, capabilityMapper, selfKnowledgeTree, coverageAuditor, topicResumeMap: _topicResumeMap ?? undefined, topicProfile: _topicProfileCtx ?? undefined, sessionRefresh: _sessionRefresh ?? undefined, autonomyManager, trustElevationTracker, autonomousEvolution, coordinator: coordinator.enabled ? coordinator : undefined, meshBindActive: coordinator.managers.identityManager.hasIdentity() && config.multiMachine?.meshTransport?.enabled !== false, localSigningKeyPem, leaseTransport, peerEndpointRecorder, getSelfMeshEndpoints, onLeasePullRequest: () => leaseCoordinatorRef?.currentLease() ?? null, liveTailReceiver, handoffWireTransport, onHandoffBegin, onHandoffInitiate: handoffInitiate, handoffInProgress: handoffSentinelInProgress, messageLedger, currentInboundByTopic, replyMarkerTransport, onReplyMarker: messageLedger ? (marker: unknown) => { const m = marker as { dedupeKey: string; platform: string; replyIdempotencyKey: string; epoch: number; topic?: string | null }; messageLedger!.applyRemoteReplyMarker(m.dedupeKey, { platform: m.platform, replyIdempotencyKey: m.replyIdempotencyKey, epoch: m.epoch, topic: m.topic ?? null }); } : undefined, whatsapp: whatsappAdapter, slack: slackAdapter, imessage: imessageAdapter, conversationRegistry, conversationBindAuth, conversationFollowThrough, whatsappBusinessBackend, messageBridge, hookEventReceiver, worktreeMonitor, subagentTracker, instructionsVerifier, handshakeManager: threadlineHandshake, threadlineRouter, conversationStore, threadLog, threadMessageRecorder, warrantsReplyGate, collaborationSurfacer, threadResumeMap, topicLinkageHandler: topicLinkageHandler ?? undefined, threadlineRelayClient, pairingInvites: threadlinePairingInvites, getLastRelayEvent: threadlineGetLastRelayEvent, a2aRelayForward: _a2aRelayForwardCtx ?? undefined, threadlineReplyWaiters, listenerManager: listenerManager ?? undefined, a2aDeliveryTracker: a2aDeliveryTracker ?? undefined, relayVerdictCounters: threadlineRelayClient ? (() => ({ ...threadlineRelayClient!.relayVerdictCounters, expiredMismatchIgnored: a2aDeliveryTracker?.expiredMismatchIgnored ?? 0 })) : undefined, inboundIdLedger: _inboundIdLedger ?? undefined, inboundIdLedgerDaemonDeferred: () => _inboundIdLedgerDaemonDeferred, responseReviewGate, reviewCanaryBattery, messagingToneGate, outboundDedupGate, telemetryHeartbeat, pasteManager, featureRegistry, discoveryEvaluator, completionEvaluator, unifiedTrust, liveConfig, sharedStateLedger, ledgerSessionRegistry, worktreeManager, oidcEnrolledRepos: parallelDevConfig?.oidcEnrolledRepos, initiativeTracker, projectRoundRunner, projectDriftChecker, machineHeartbeat, machinePoolRegistry, ropeHealthMonitor, writeAdmission: writeAdmission ?? undefined, getInboundQueue: () => _inboundQueue, getMachineCoherence: () => _machineCoherenceSentinel, getSingleMachineFailoverGap: () => _singleMachineFailoverGap, getMissingLoginSession: () => _missingLoginSession, getSessionPoolFailoverRunner: () => _sessionPoolFailoverRunnerDriver?.status() ?? null, sessionPoolPromotionActivation: _sessionPoolPromotionActivation, meshRpcDispatcher, deliverA2aToMachine: _deliverA2aToMachine ?? undefined, workingSetPullCoordinator, workingSetArtifactManager, orchestratorPoller, commitmentReplicaStore, preferenceReplicaStore, replicatedRecordEmitter, conflictStore, rollbackUnmerge, droppedOriginRegistry, preferencesUnionReader, jevMemoryPicker, forwardCommitmentMutate, sessionOwnershipRegistry, sendDrain: _sendDrain ?? undefined, topicPinStore: _topicPinStore ?? undefined, topicPinSkewQuarantine: _topicPinSkewQuarantine ?? undefined, topicPinFoldView: _topicPinFoldView ?? undefined, ownershipReconciler: _ownershipReconciler ?? undefined, staleOwnerEngine: _staleOwnerEngine ?? undefined, duplicateReconciler: _duplicateReconciler ?? undefined, ownerDarkLadder: _ownerDarkLadder ?? undefined, spawnAdmission: _spawnAdmission ?? undefined, judgmentProvenance: _judgmentProvenance ?? undefined, leaseHandback: _leaseHandbackCtx ?? undefined, streamTicketStore: _streamTicketStore ?? undefined, poolStreamAllowRemoteInput: (config as { dashboard?: { poolStream?: { allowRemoteInput?: boolean } } }).dashboard?.poolStream?.allowRemoteInput ?? false, poolStreamConnector: _poolStreamConnector ?? undefined, secretSync: _secretSyncHandle ?? undefined, meshSelfId: _meshSelfId ?? undefined, resolveRouterUrl: _resolveRouterUrl ?? undefined, resolvePeerUrls: _resolvePeerUrls ?? undefined, recordRopeResult: _recordRopeResult ?? undefined, guardRegistry, listPoolMachines: _listPoolMachines ?? undefined, deliverMandateToMachine: _deliverMandateToMachine ?? undefined, passkeyRevokeOutbox: _passkeyRevokeOutbox ? () => _passkeyRevokeOutbox! : undefined, passkeyPeerOnline: _passkeyPeerOnline, passkeyPoolReader: _passkeyPoolReader ? () => _passkeyPoolReader! : undefined, passkeyProofBrowser: async (profileDir: string) => { const { ChromeCdpReloginBrowser } = await import('../core/ChromeCdpReloginBrowser.js'); return new ChromeCdpReloginBrowser({ userDataDir: profileDir, passkeyMode: true, headless: true, launchTimeoutMs: 30_000, operationTimeoutMs: 20_000 }); }, poolLink: _poolLink ?? undefined, poolPollCache: _poolPollCache ?? undefined, sessionPoolE2EResultStore, proxyCoordinator, topicIntentStore, topicIntentArcCheck, usherSignalStore, intelligence: sharedIntelligence ?? undefined, telegramBridgeConfig, telegramBridge: telegramBridge ?? undefined, threadlineObservability, briefDeps, workingMemory, taskFlowRegistry, threadlineFlowBridge, sessionReaper, agentWorktreeReaper, externalHogSentinel, orphanedWorkSentinel, mcpProcessReaper, geminiLoopRunner, sleepController, agentActivityState, reapLog, resumeQueue, resumeDrainer, autonomousLivenessReconciler, enforcedTerminationStatus: () => enforcedTerminationWatchdog?.guardStatus() ?? null, prHandLease: prHandLease ?? undefined, standDownRegistry: _standDownRegistry ?? undefined, standDownAudit: _standDownAudit ?? undefined, operatorStopRecorder: recordOperatorStop, sleepWakeDetector, unjustifiedStopGate, stopGateDb, stopNotifier, liveTestGate, liveTestGateMode, liveTestRunnerCtx });    // Resolve the late-bound topic-operator getter (increment 2e): routing was
     const readIdentityProjectionPeerRows = async () => {
       const peers = _resolvePeerUrls?.() ?? [];
       const extra = (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
       return await Promise.all(peers.map(async (peer) => {
-        if (!isPeerUrlAllowedForCredentials(peer.url, extra).ok) {
+        if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: peer.kind }, extra).ok) {
           return { machineId: peer.machineId, status: 'url-rejected' };
         }
         try {
@@ -28265,7 +29074,7 @@ export async function startServer(options: StartOptions): Promise<void> {
         const peer = (_resolvePeerUrls?.() ?? []).find((row) => row.machineId === peerMachineId);
         if (!peer) return 'pending';
         const extra = (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
-        if (!isPeerUrlAllowedForCredentials(peer.url, extra).ok) return 'pending';
+        if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: peer.kind }, extra).ok) return 'pending';
         try {
           const manager = coordinator.managers.identityManager;
           const self = manager.loadIdentity();
@@ -28314,7 +29123,7 @@ export async function startServer(options: StartOptions): Promise<void> {
           const peer = (_resolvePeerUrls?.() ?? []).find((row) => row.machineId === peerMachineId);
           if (!peer) return 'pending';
           const extra = (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
-          if (!isPeerUrlAllowedForCredentials(peer.url, extra).ok) return 'pending';
+          if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: peer.kind }, extra).ok) return 'pending';
           try {
             const manager = coordinator.managers.identityManager;
             const self = manager.loadIdentity();
@@ -28579,7 +29388,7 @@ export async function startServer(options: StartOptions): Promise<void> {
         const peers = _resolvePeerUrls?.() ?? [];
         const extra = (config.multiMachine as { peerUrlAllowlist?: string[] } | undefined)?.peerUrlAllowlist;
         await Promise.all(peers.map(async (peer) => {
-          if (!isPeerUrlAllowedForCredentials(peer.url, extra).ok) return;
+          if (!isPeerUrlAllowedForCredentials({ url: peer.url, kind: peer.kind }, extra).ok) return;
           try {
             const projectionNonce = randomBytes(32).toString('hex');
             const response = await fetch(`${peer.url.replace(/\/+$/, '')}/api/identity/projection/by-machine/${encodeURIComponent(machineId)}?nonce=${projectionNonce}`, {
@@ -29478,6 +30287,9 @@ export async function startServer(options: StartOptions): Promise<void> {
         process.exit(1);
       }
       _shuttingDown = true;
+      if (localVerifyTimer) { clearInterval(localVerifyTimer); localVerifyTimer = null; }
+      try { localVerifyStatus?.stop(); } catch { /* best effort */ }
+      try { localVerifyService?.shutdown(); } catch { /* best effort: a restart re-queues lazily */ }
       if (dropSecondPassTimer) { clearTimeout(dropSecondPassTimer); dropSecondPassTimer = null; }
       // Hard deadline: the teardown below awaits many subsystems in sequence and
       // any one of them (an origin worker, a tunnel, a Threadline relay, a server
@@ -29722,6 +30534,7 @@ export async function stopServer(options: { dir?: string }): Promise<void> {
   // Send SIGTERM first for graceful shutdown, then force kill after timeout
   try {
     // Send C-c (SIGINT) to the foreground process in the session
+    // confined-write-allowed: C-c to the agent's own server pane, never a confined session
     execFileSync(tmuxPath, ['send-keys', '-t', `=${serverSessionName}:`, 'C-c'], { stdio: 'ignore' });
     console.log(`  Sent shutdown signal to ${serverSessionName}...`);
 
@@ -29769,6 +30582,23 @@ export async function stopServer(options: { dir?: string }): Promise<void> {
  *
  * Without autostart, falls back to stop + start.
  */
+/**
+ * Stop the server's tmux session (`<project>-server`) if one exists; silent no-op
+ * otherwise (no tmux, or the server runs as the service's main process).
+ * Agent sessions live in their own tmux sessions and are not touched.
+ */
+async function stopServerSessionIfPresent(options: { dir?: string }): Promise<void> {
+  const config = loadConfig(options.dir);
+  const tmuxPath = detectTmuxPath();
+  if (!tmuxPath) return;
+  try {
+    execFileSync(tmuxPath, ['has-session', '-t', `=${config.projectName}-server`], { stdio: 'ignore' });
+  } catch {
+    return; // @silent-fallback-ok: no server tmux session — nothing to stop
+  }
+  await stopServer(options);
+}
+
 export async function restartServer(options: { dir?: string }): Promise<void> {
   const config = loadConfig(options.dir);
 
@@ -29787,6 +30617,11 @@ export async function restartServer(options: { dir?: string }): Promise<void> {
 
       // Wait for process to die
       await new Promise(r => setTimeout(r, 1000));
+
+      // The lifeline runs the server in its own tmux session, which outlives the
+      // lifeline. Stop it too, or the new lifeline adopts the old server and this
+      // "restart" never loads new server code.
+      await stopServerSessionIfPresent(options);
 
       // Bootstrap it back (loads + starts)
       try {
@@ -29810,7 +30645,13 @@ export async function restartServer(options: { dir?: string }): Promise<void> {
     if (fs.existsSync(servicePath)) {
       console.log(`  Restarting via systemd (${serviceName})...`);
       try {
-        execFileSync('systemctl', ['--user', 'restart', serviceName], { stdio: 'pipe' });
+        // stop → stop the server's own tmux session → start. With KillMode=process
+        // (the unit default since 2026-10-22) a plain `restart` only restarts the
+        // lifeline and the new lifeline would adopt the old server. Stopping the
+        // lifeline first means nothing respawns the server while it is going down.
+        execFileSync('systemctl', ['--user', 'stop', serviceName], { stdio: 'pipe' });
+        await stopServerSessionIfPresent(options);
+        execFileSync('systemctl', ['--user', 'start', serviceName], { stdio: 'pipe' });
         console.log(pc.green(`  Server restarted via systemd (${serviceName})`));
       } catch (err) {
         console.log(pc.red(`  Failed to restart via systemd: ${err instanceof Error ? err.message : err}`));

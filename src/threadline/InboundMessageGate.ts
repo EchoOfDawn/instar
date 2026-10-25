@@ -11,7 +11,7 @@ import { CREDENTIAL_SHARE_OP, type AgentTrustManager, type AgentTrustLevel } fro
 import type { ThreadlineRouter } from './ThreadlineRouter.js';
 import type { ReceivedMessage } from './client/ThreadlineClient.js';
 import { PAIR_VERIFY_OP, processPairVerifyReceipt } from './PairVerifyReceipt.js';
-import { INVITE_OPS } from './PairingInviteFlow.js';
+import { ALL_PAIRING_OPS as INVITE_OPS, HANDSHAKE_OPS } from './pairingHandshake.js';
 import { mergeDefaults } from '../core/mergeDefaults.js';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -327,6 +327,14 @@ export class InboundMessageGate {
       if (payload && this.config.onInviteControl) {
         try { this.config.onInviteControl(opType, fingerprint, payload); } catch { /* engine errors never break the gate */ }
       }
+      return { action: 'block', reason: opType, fingerprint, controlPlane: true };
+    }
+
+    // 1c. The pairing handshake's own ops (spec a2a-pairing-invite-link §11.2) are control messages
+    // whatever the verified-pairing switch says: with pairing off they are dropped here, never routed
+    // to a session as ordinary text. (The four original ops keep their behaviour when it is off.)
+    if (!vp.enabled && HANDSHAKE_OPS.has(opType)) {
+      if (messageId) this.seenMessageIds.set(messageId, Date.now());
       return { action: 'block', reason: opType, fingerprint, controlPlane: true };
     }
 

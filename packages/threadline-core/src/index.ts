@@ -9,3 +9,5 @@ export * from './invite.js';
 export * from './inviteStore.js';
 export * from './trust.js';
 export * from './flow.js';
+export * from './encryptedSeen.js';
+export * from './handshake.js';

@@ -19,6 +19,11 @@ import { bootstrapThreadline } from '../../../src/threadline/ThreadlineBootstrap
 import { createTempProject } from '../../helpers/setup.js';
 import type { TempProject } from '../../helpers/setup.js';
 import type { InviteEvent } from '../../../src/threadline/PairingInviteFlow.js';
+import { useHermeticHome } from '../../setup/hermetic-home.js';
+
+// HOME → temp for every test here: bootstrapThreadline() writes the user-scope
+// ~/.claude.json, and this file must never touch the operator's real one.
+useHermeticHome();
 
 const pkg = path.resolve(__dirname, '../../../packages/threadline-mcp');
 const hasDeps = fs.existsSync(path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk')) && fs.existsSync(path.join(pkg, 'node_modules', '@sagemindai', 'threadline-core'));
@@ -102,6 +107,9 @@ describe.skipIf(!hasDeps)('threadline-mcp over stdio ↔ Instar', () => {
     elicitAnswers = [{ invite: inv.message }, { decision: 'approve' }];
     const opened = await call('threadline_pair_open');
     expect(opened.body).toMatchObject({ ok: true, result: 'approved' });
+    // A client that declares elicitation is asked through the app, never through the approval page (R2-3).
+    expect(opened.body).not.toHaveProperty('pending');
+    expect((await call('threadline_pair_status')).body).not.toHaveProperty('pendingApproval');
     expect(JSON.stringify(opened.body)).not.toContain('tlinv1:');
     expect(asked[1]).toContain('calls itself "echo"');
 

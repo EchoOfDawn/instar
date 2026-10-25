@@ -206,7 +206,18 @@ export async function runRunnerCanary(input: {
 }): Promise<CanaryProbeResult[]> {
   const { paths, fixture: fx, runner } = input;
   const settings = buildSandboxRuntimeSettings(paths);
-  const env = confinedEnv(process.env, { TMPDIR: paths.tmpDir });
+  // The must-succeed probes run the real lint and smoke-test commands, and vitest/esbuild write
+  // caches next to the nearest package root — which resolves ABOVE the workspace into the agent
+  // home, where the confinement denies reads. Without these two, `base-unit-smoke` dies with
+  // `EPERM ... open '<agentHome>/package.json'` and a probe failure latches the whole executor for
+  // 24h, which no route can clear. The executor's own check runs already pass exactly these two
+  // (FeedbackExecutorService: VITEST_CACHE_DIR/ESBUILD_CACHE_DIR under the attempt temp); the canary
+  // was simply missing the same redirect.
+  const env = confinedEnv(process.env, {
+    TMPDIR: paths.tmpDir,
+    VITEST_CACHE_DIR: path.join(paths.tmpDir, 'vitest'),
+    ESBUILD_CACHE_DIR: path.join(paths.tmpDir, 'esbuild'),
+  });
   const run = (command: string, timeoutMs = 120_000) => runner.run({ command, cwd: paths.workspace, settings, env, timeoutMs });
   const node = (code: string) => `node -e ${shq(code)}`;
   const results: CanaryProbeResult[] = [];
@@ -299,7 +310,14 @@ export function evaluateSessionCanary(paths: ConfinementPaths, fx: CanaryFixture
   const bashFile = path.join(paths.workspace, `.feedback-canary-bash-${fx.nonce}`);
   results.push({ probe: 'session-write-tool-in-workspace', expect: 'succeed', ok: fs.existsSync(okFile), detail: 'the Write tool must be able to write in the workspace' });
   results.push({ probe: 'session-bash-write-in-workspace', expect: 'succeed', ok: fs.existsSync(bashFile), detail: 'Bash must be able to write in the workspace' });
-  results.push({ probe: 'session-git-status', expect: 'succeed', ok: report !== null && !/fatal|exit (code )?(1|128)\b/i.test(String((report.outputs ?? {})['9'] ?? 'fatal')), detail: 'git status must work in the workspace' });
+  // The verdict expression below is deliberately UNCHANGED. Only `detail` is enriched: the latch this
+  // probe can trigger is a 24h stop that no route clears, and it previously recorded the probe NAME
+  // only — so the one fact needed to diagnose it (what the session actually reported for step 9) died
+  // with the attempt tree, which holds the report at <tmpDir>/canary-report-<nonce>.json. Naming the
+  // observed value distinguishes "git genuinely failed" from "the model omitted outputs['9']", which
+  // the `?? 'fatal'` default otherwise renders identical.
+  const gitObserved = report === null ? '<no report written>' : String((report.outputs ?? {})['9'] ?? '<outputs["9"] absent>');
+  results.push({ probe: 'session-git-status', expect: 'succeed', ok: report !== null && !/fatal|exit (code )?(1|128)\b/i.test(String((report.outputs ?? {})['9'] ?? 'fatal')), detail: `git status must work in the workspace (observed: ${gitObserved.replace(/\s+/g, ' ').slice(0, 180)})` });
   const observed = JSON.stringify(report?.outputs ?? {});
   results.push({ probe: 'session-write-tool-outside', expect: 'fail', ok: !fs.existsSync(`${fx.outsideWritePath}.w`), detail: 'the Write tool must not create a file outside the workspace' });
   results.push({ probe: 'session-publish-clone-listing', expect: 'fail', ok: !/package\.json/.test(String((report?.outputs ?? {})['8'] ?? '')), detail: 'the publish clone must not be listable' });
