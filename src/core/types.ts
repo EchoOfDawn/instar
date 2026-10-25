@@ -76,6 +76,10 @@ export interface Session {
    *  transcript under (`<home>/projects/<key>/<--session-id>.jsonl`), so trusted code can judge the
    *  sandbox canary by what actually reached the model. */
   confinedConfigHome?: string;
+  /** Confined sessions on the rerouted interactive lane only: when the fixed prompt line was typed
+   *  (docs/specs/confined-spawn-subscription-reroute.md, Restart boundary). Absent on a surviving
+   *  confined rerouted session ⇒ its startup never completed, and boot reconciliation kills it. */
+  confinedDeliveredAt?: string;
   /** Subscription & Auth Standard P1.3: which subscription-pool account this
    *  session is running under (the account whose config home it launched/resumed
    *  with). Set at spawn + updated on a quota-aware account swap. Undefined on
@@ -92,6 +96,16 @@ export interface Session {
   /** The clamped work-evidence names behind endedMidWork (enum-clamped at the
    *  chokepoint — see src/core/WorkEvidence.ts). */
   endedWorkEvidence?: string[];
+  /** When this session was first observed idle at a prompt (ISO-8601), persisted
+   *  so the idle clock survives a server restart. `SessionManager.idlePromptSince`
+   *  is in-memory, so without this an agent that restarts more often than the
+   *  topic-bound idle threshold (240m) can never close an idle conversation and
+   *  fills its session slots (sagemind, 2026-10-22: 20/20, 17 sessions idle
+   *  17-64h). Cleared the moment the session is observed active. Absent on
+   *  legacy records and on sessions that have never been seen idle; seeding from
+   *  it is corroborated against the framework transcript — see
+   *  src/core/idleSincePersistence.ts. */
+  idleSince?: string;
   /** Working directory the session was spawned with (reap-notify R2.8/L13 —
    *  recorded so a resume-queue entry can revive the session in ITS tree).
    *  Absent on legacy records ⇒ the module project dir. */
@@ -2328,6 +2342,10 @@ export interface MachineCapacity {
     /** This machine can durably RECEIVE forwarded inbound messages (the
      *  'deliverMessage' receiver handler + live durable queue). */
     ws11DeliverReceive?: boolean;
+    /** dashboard-new-session-machine-choice §3.4 — this machine can run the
+     *  owner-side dashboard-create start (pool not dark, Telegram configured,
+     *  topic-profile context wired). */
+    dashboardCreateReceive?: boolean;
     /** WS1.2: this machine can execute the owner-side `drain` verb (bounded
      *  turn-boundary drain + claim handoff for an active-topic transfer).
      *  ABSENT/false → the transfer sender degrades to today's pin-and-
@@ -4564,6 +4582,19 @@ export interface InstarConfig {
       slowRetry?: { enabled?: boolean; delaysMs?: number[]; maxRetries?: number;
         /** Local hours in which an approval re-offer is never sent (default 23 → 8); `null` disables. */
         quietHours?: { startHour: number; endHour: number } | null };
+      /**
+       * Last-resort model for the repair's own model calls (spec relogin-last-resort-model): a
+       * lightweight model over an Anthropic API key the operator placed in the vault under
+       * `keyName` (default `relogin_last_resort_anthropic_api_key`). Placing the key is the
+       * consent to spend; `ANTHROPIC_API_KEY` and `intelligenceProvider` are never read. Used only
+       * after the shared provider failed or is absent, and only for the repair. With it available,
+       * an agent-session repair with no other healthy account on the machine drives the server-side
+       * browser path instead of waiting on the operator. Absent ⇒ on when the key exists; off with
+       * `enabled: false`. `model` is a tier (`fast` = haiku, the default; `balanced`; `capable`);
+       * the call runs `claude -p` with the key in the child's environment only, in a dedicated
+       * empty config home under the state dir. Caps default to 60 calls per drive and 300 per day.
+       */
+      lastResort?: { enabled?: boolean; keyName?: string; model?: string; maxCallsPerDrive?: number; maxCallsPerDay?: number };
     };
     /** Soft binding-window utilization % above which an account is "at pressure"
      *  and excluded from proactive selection (default 90). */
@@ -4611,6 +4642,15 @@ export interface InstarConfig {
       cooldownMs?: number;
       /** Monitor tick cadence (ms). Default 180000 (3m). */
       tickMs?: number;
+      /** Q3-safe rescue for untagged/default sessions. Instead of mutating the
+       * live session binding, exchange the freshest eligible account into the
+       * default credential slot. DEV-GATED and dry-run-first. */
+      defaultSlotRepoint?: {
+        /** Deliberately omitted by default; resolved through resolveDevAgentGate. */
+        enabled?: boolean;
+        /** Exact would-flip audit/log only. Default true. */
+        dryRun?: boolean;
+      };
       /**
        * swap-continuity-antithrash §3/§7 — anti-thrash brakes on the proactive
        * swap. An ABSENT block resolves `enabled:true, dryRun:true` (dry-run
@@ -5579,6 +5619,24 @@ export interface ThreadlineConfig {
    * and creates new fingerprint profiles at `untrusted`.
    */
   relayUnknownSenderTrust?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9, rollout step 5).
+   * Read live per send. `enabled` omitted ⇒ the developmentAgent gate (live on a dev
+   * agent, dark on the fleet). `dryRun` defaults TRUE (watch): sends are unchanged and each
+   * one that would have gone encrypted to an invite-paired peer's PINNED key is counted;
+   * only an explicit `false` (enforce) encrypts every ordinary message to such a peer with
+   * the pinned key, never falling back to plaintext, and labels plaintext arriving under
+   * its fingerprint as unverified.
+   */
+  encryptToPinned?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6/D11, rollout step 6). Read
+   * live per inbound message. `enabled` omitted ⇒ the developmentAgent gate. `dryRun` defaults
+   * TRUE (watch): the encryptedSeen mark is recorded when an invite-paired peer sends encrypted
+   * chat, and plaintext later arriving under its fingerprint is counted and delivered as today;
+   * only an explicit `false` (enforce) refuses that plaintext. Off records and refuses nothing.
+   */
+  refuseDowngrade?: { enabled?: boolean; dryRun?: boolean };
 }
 
 /**
@@ -7608,6 +7666,23 @@ export interface MonitoringConfig {
      *  opt in for a steady heartbeat). Decoupled from `digestEvenWhenCalm`, which
      *  only governs whether the digest OBJECT/API renders a calm summary. */
     digestSendOnCalmWeeks?: boolean;
+    /**
+     * Standard A/B of maturation-followthrough-fix: read the real dark-flag
+     * inventory from the `/guards` posture surface instead of only the specs
+     * that registered a rollout stage, and give every dark flag a durable
+     * owner + deadline + proof-of-life record.
+     *
+     * Ships DARK (`enabled: false`) and dry-run-first. With `enabled: false`
+     * the analyst reverts to exactly the InitiativeTracker-only behavior and
+     * R3 keeps its old place in the headline, so rollback is a single flag.
+     * With `dryRun: true` the durable registry IS written (the soak accrues
+     * real evidence from day one, which an in-memory counter can never do)
+     * but no R7 finding reaches the digest.
+     */
+    darkFlagInventory?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+    };
     /** Incubation windows in DAYS per risk tier (defaults 3 / 7 / 7). */
     incubationWindows?: {
       lowRisk?: number;

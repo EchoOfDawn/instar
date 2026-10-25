@@ -11,6 +11,8 @@
  *  - which changed paths CODEOWNERS assigns to someone other than the approver.
  */
 
+import { approvedAtHead as sharedApprovedAtHead } from '../../../scripts/local-verify-floor.mjs';
+
 export interface RepoInfo { ownerLogin: string; ownerType: 'User' | 'Organization' | string; allowAutoMerge: boolean }
 export interface PrReview { login: string; state: string; commitId: string; submittedAt: string }
 
@@ -62,12 +64,10 @@ export function approverIndependence(approver: string, facts: AgentIdentityFacts
   return { independent: reasons.length === 0, reasons: [...new Set(reasons)] };
 }
 
-/** The approver's MOST RECENT review must be APPROVED and on exactly `headSha`. */
+/** The approver's MOST RECENT review must be APPROVED and on exactly `headSha`.
+ * One implementation, shared with safe-merge's local floor (scripts/local-verify-floor.mjs). */
 export function approvedAtHead(reviews: PrReview[], approver: string, headSha: string): { approved: boolean; latestState: string | null } {
-  const mine = reviews.filter((r) => r.login.toLowerCase() === approver.toLowerCase() && r.state !== 'COMMENTED' && r.state !== 'PENDING');
-  if (mine.length === 0) return { approved: false, latestState: null };
-  const latest = [...mine].sort((x, y) => Date.parse(x.submittedAt) - Date.parse(y.submittedAt)).at(-1)!;
-  return { approved: latest.state === 'APPROVED' && latest.commitId === headSha, latestState: latest.state };
+  return sharedApprovedAtHead(reviews, approver, headSha);
 }
 
 /** True when the approver has ever approved exactly `sha` (used to clear a merged-elsewhere item after the fact). */
@@ -120,6 +120,25 @@ export function codeownersOutsideApprover(codeowners: string | null, paths: stri
     let owners: string[] | null = null;
     for (const rule of rules) if (rule.re.test(p)) owners = rule.owners;
     if (owners && owners.length > 0 && !owners.includes(me)) out.push(p);
+  }
+  return out;
+}
+
+/** The changed paths CODEOWNERS assigns to ANY owner (the independent review never admits these; their owner's GitHub review is required). */
+export function codeownersOwned(codeowners: string | null, paths: string[]): string[] {
+  if (!codeowners) return [];
+  const rules: Array<{ re: RegExp; owners: string[] }> = [];
+  for (const raw of codeowners.split('\n')) {
+    const lineText = raw.replace(/#.*$/, '').trim();
+    if (!lineText) continue;
+    const [pattern, ...owners] = lineText.split(/\s+/);
+    rules.push({ re: codeownersPattern(pattern), owners });
+  }
+  const out: string[] = [];
+  for (const p of paths) {
+    let owners: string[] | null = null;
+    for (const rule of rules) if (rule.re.test(p)) owners = rule.owners;
+    if (owners && owners.length > 0) out.push(p);
   }
   return out;
 }

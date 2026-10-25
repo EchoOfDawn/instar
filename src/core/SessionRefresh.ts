@@ -436,11 +436,36 @@ export class SessionRefresh {
    * unique, and restarting the wrong session is worse than a clear refusal.
    */
   private displayNameHint(sessionName: string): string {
-    const matches = this.deps.state.listSessions({ status: 'running' })
-      .filter(s => s.name === sessionName && s.tmuxSession && s.tmuxSession !== sessionName)
-      .map(s => s.tmuxSession);
-    if (matches.length === 0) return '';
-    return ` "${sessionName}" looks like a display name — pass the tmux session name instead (${matches.map(m => `"${m}"`).join(', ')}; see tmuxSession in GET /sessions).`;
+    // One verdict per tmux name: a name with ANY non-terminal record is live;
+    // a name whose records are all terminal is named only when the topic still
+    // maps to it, so the hinted name actually works (the dead-bound respawn
+    // path). A dead name whose topic moved on is left out — hinting it would
+    // just trade one refusal for a session_not_found.
+    //
+    // The terminal arm is the 2026-10-22 Mama PC lesson: a dead topic session
+    // refreshed by its display name came back `not_telegram_bound` with no
+    // hint (only running sessions were matched), and the "checked in-memory +
+    // disk registry" wording was read as a LOST BINDING. The binding was fine;
+    // the name was wrong.
+    const liveByTmux = new Map<string, boolean>();
+    for (const s of this.deps.state.listSessions()) {
+      if (s.name !== sessionName || !s.tmuxSession || s.tmuxSession === sessionName) continue;
+      const terminal = s.status === 'completed' || s.status === 'failed' || s.status === 'killed';
+      liveByTmux.set(s.tmuxSession, (liveByTmux.get(s.tmuxSession) ?? false) || !terminal);
+    }
+    const live: string[] = [];
+    const deadBound: string[] = [];
+    for (const [tmux, isLive] of liveByTmux) {
+      if (isLive) live.push(tmux);
+      else if (this.deadBoundTopic(tmux) !== null) deadBound.push(tmux);
+    }
+    if (live.length === 0 && deadBound.length === 0) return '';
+    const q = (names: string[]) => names.map(m => `"${m}"`).join(', ');
+    if (deadBound.length === 0) {
+      return ` "${sessionName}" looks like a display name — pass the tmux session name instead (${q(live)}; see tmuxSession in GET /sessions).`;
+    }
+    const liveClause = live.length > 0 ? `running: ${q(live)}; ` : '';
+    return ` "${sessionName}" looks like a display name — pass the tmux session name instead (${liveClause}not running but still bound to its topic, so a refresh of it respawns from the saved conversation: ${q(deadBound)}; see tmuxSession in GET /sessions?include=all).`;
   }
 
   /** Detect phase shared by refreshSession() and precheckRefusal(). */
@@ -632,7 +657,29 @@ export class SessionRefresh {
       // Idempotent + fail-safe: a failure here is logged and the respawn
       // proceeds (worst case is the pre-fix behavior, not a dead refresh).
       if (accountSwap?.configHome) {
-        const ready = ensureInteractiveReady(accountSwap.configHome);
+        // Without the agent directory the folder-trust acknowledgement is not
+        // seeded, and the swapped-in home can read as ready while still killing
+        // the respawned session at the trust dialog.
+        //
+        // OPTIONAL CALL, deliberately. The declared type says SessionManager, so
+        // `tsc` accepts a direct call — but several callers (and every existing
+        // unit test of this path) inject a narrow stub that implements only the
+        // methods the refresh path used before today. A direct call threw
+        // `agentProjectDir is not a function` and took the whole refresh down
+        // with it, which is strictly worse than the bug being fixed. Absence
+        // degrades to the pre-fix behaviour and SAYS so, rather than silently
+        // skipping a safety seed.
+        const projectDir = this.deps.sessionManager.agentProjectDir?.();
+        if (!projectDir) {
+          console.warn(
+            `[SessionRefresh] account-swap onboarding-readiness: agent directory unavailable from this `
+            + `session manager — folder trust NOT seeded for ${accountSwap.configHome}; a respawn there `
+            + `may still die at the folder-trust dialog (sessionName=${sessionName}).`,
+          );
+        }
+        const ready = ensureInteractiveReady(accountSwap.configHome, {
+          ...(projectDir ? { projectDir } : {}),
+        });
         console.log(
           `[SessionRefresh] account-swap onboarding-readiness: ${accountSwap.configHome} ` +
           `${ready.patched ? `patched (${ready.reason})` : ready.reason} (sessionName=${sessionName})`,

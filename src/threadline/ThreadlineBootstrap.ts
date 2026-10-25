@@ -31,7 +31,11 @@ import { attachRelayObservability, type RelayConnectionEvent } from './relayConn
 import { AgentTrustManager } from './AgentTrustManager.js';
 import { EventEmitter } from 'node:events';
 import { PairingInviteStore } from './PairingInviteStore.js';
-import { PairingInviteFlow, INVITE_OPS, type InviteEvent } from './PairingInviteFlow.js';
+import { PairingInviteFlow, type InviteEvent } from './PairingInviteFlow.js';
+import { PairingHandshake, ALL_PAIRING_OPS, type HandshakeTimings, type PairingNotice } from './pairingHandshake.js';
+import { sign as edSign, verify as edVerify } from '@sagemindai/threadline-core';
+import nodeCrypto from 'node:crypto';
+import { MarkedPairingInviteFlow, PairingPendingAcceptMarkers } from './PairingPendingAcceptMarkers.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
 import { IdentityManager, IdentityNotProvisionedError } from './client/IdentityManager.js';
@@ -45,6 +49,22 @@ import {
   relayUnknownSenderTrustCounters,
   type RelayUnknownSenderTrustMode,
 } from './relayUnknownSenderTrust.js';
+import {
+  createEncryptToPinnedResolver,
+  createEncryptToPinnedClientOptions,
+  encryptToPinnedCounters,
+  ENCRYPT_TO_PINNED_DEFAULT,
+  labelUnverifiedPinnedPlaintext,
+  type EncryptToPinnedMode,
+} from './encryptToPinned.js';
+import {
+  noteEncryptedChat,
+  refuseDowngradeCounters,
+  reportDowngradeRefusal,
+  REFUSE_DOWNGRADE_DEFAULT,
+  shouldRefuseDowngradedPlaintext,
+  type RefuseDowngradeMode,
+} from './refuseDowngrade.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -119,6 +139,23 @@ export interface ThreadlineBootstrapConfig {
    * omitted the check is off: every unknown sender is handled as before.
    */
   getRelayUnknownSenderTrustMode?: () => RelayUnknownSenderTrustMode;
+  /**
+   * Live reader for encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9,
+   * `threadline.encryptToPinned`). Supplied by server.ts. When omitted it is the shipped
+   * default, enforce: ordinary chat to an invite-paired peer is always encrypted to its pin.
+   */
+  getEncryptToPinnedMode?: () => EncryptToPinnedMode;
+  /**
+   * Live reader for refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6/D11,
+   * rollout step 6, `threadline.refuseDowngrade`). Supplied by server.ts. When omitted it is
+   * the shipped default, watch: marks are recorded and would-refuse plaintext is counted.
+   */
+  getRefuseDowngradeMode?: () => RefuseDowngradeMode;
+  /**
+   * Test hook: shorter pairing-handshake timers (docs/specs/a2a-pairing-invite-link.md §11.7). Never
+   * set in production; the defaults are the spec's.
+   */
+  pairingHandshakeTimings?: Partial<HandshakeTimings>;
 }
 
 export interface ThreadlineBootstrapResult {
@@ -138,7 +175,22 @@ export interface ThreadlineBootstrapResult {
    * Invite pairing (docs/specs/a2a-pairing-invite-link.md): the engine, its store, and the
    * operator-facing events (prompts and alarms) for Telegram and the dashboard to surface.
    */
-  pairingInvites?: { flow: PairingInviteFlow; store: PairingInviteStore; events: EventEmitter };
+  pairingInvites?: {
+    flow: PairingInviteFlow;
+    /**
+     * The pairing handshake (spec §11): operator acts and inbound invite control go through it, so
+     * both sides are told how a pairing ended. Its notices are emitted on `events` as 'notice'.
+     */
+    handshake: PairingHandshake;
+    store: PairingInviteStore;
+    /** 'event': the engine's InviteEvent (prompts, alarms). 'notice': a PairingNotice (spec §11.7). */
+    events: EventEmitter;
+    /**
+     * Secret-free markers of invites waiting for this operator, so a restart that drops one (the
+     * engine keeps them in memory only) leaves a notice instead of nothing (spec §8).
+     */
+    markers?: PairingPendingAcceptMarkers;
+  };
   /**
    * Most recent relay connection-LOSS event, or null if the relay has never
    * dropped. Exists so a status surface can report WHY the relay is down rather
@@ -427,6 +479,25 @@ export async function bootstrapThreadline(
       return { enabled: false, dryRun: true }; // @silent-fallback-ok — an unreadable mode is today's behaviour
     }
   };
+  // Encrypt-to-pinned (spec threadline-standalone-pairing D9): the live mode. With no reader it
+  // is the shipped default (enforce, Justin 2026-10-20); so is a reader that throws (never off).
+  const encryptToPinnedMode = (): EncryptToPinnedMode => {
+    try {
+      return config.getEncryptToPinnedMode?.() ?? { ...ENCRYPT_TO_PINNED_DEFAULT };
+    } catch {
+      return { ...ENCRYPT_TO_PINNED_DEFAULT }; // @silent-fallback-ok — an unreadable mode is the shipped default (enforce), never off
+    }
+  };
+
+  // Refuse-downgrade (spec threadline-standalone-pairing D6, step 6): the live mode. With no
+  // reader it is the shipped default (watch); so is a reader that throws (never off).
+  const refuseDowngradeMode = (): RefuseDowngradeMode => {
+    try {
+      return config.getRefuseDowngradeMode?.() ?? { ...REFUSE_DOWNGRADE_DEFAULT };
+    } catch {
+      return { ...REFUSE_DOWNGRADE_DEFAULT }; // @silent-fallback-ok — an unreadable mode is the shipped default (watch), never off
+    }
+  };
 
   // Always create trust manager when relay is enabled — needed for processing
   // inbox entries even when the daemon handles the relay connection.
@@ -470,35 +541,109 @@ export async function bootstrapThreadline(
       if (p.pairingState !== 'pending-verification' && p.pairingState !== 'mutual-verified' && p.pairingState !== 'identity-verified' && p.pairingState !== 'invite-accepted') return null;
       return Buffer.from(p.peerIdentityPub, 'hex');
     });
+    // Ordinary chat to a peer paired BY INVITE goes encrypted to the pinned key, always
+    // (spec threadline-standalone-pairing D9, rollout step 5), behind the live switch
+    // `threadline.encryptToPinned` (off | watch | enforce). Only mutual-verified: an acceptor
+    // still waiting for the inviter's Finish holds a key the inviter cannot use yet, and a
+    // paused pin is back to unconfirmed. An `identity-verified` pairing inherited from a
+    // replicated record that says 'invite' counts too (rollout step 5b: same pinned key on
+    // every machine that can hold the relay). Only `pairingMethod: 'invite'`: both sides of one run
+    // 1.3.1352+, which decrypts to a pinned key without a cached key; an SAS-paired peer may
+    // not, and an inherited pairing whose record carried no method ('inherited'), so both keep the previous rule
+    // (encrypt when the relay gave us its keys).
+    relayClient.setEncryptToResolver(createEncryptToPinnedResolver({
+      trustManager: pinnedTrust,
+      mode: encryptToPinnedMode,
+      counters: encryptToPinnedCounters,
+    }), createEncryptToPinnedClientOptions({ mode: encryptToPinnedMode, counters: encryptToPinnedCounters }));
 
     // Invite pairing engine (docs/specs/a2a-pairing-invite-link.md). Identity is read fresh on
     // every use so a rotated key is never signed with stale material.
-    {
+    // The store comes from threadline-core: a corrupt file is moved aside and reported, and an
+    // unreadable one (permissions, I/O) makes the constructor throw rather than start empty and
+    // later overwrite it. That throw turns off invite pairing only, never the rest of Threadline.
+    try {
       const client = relayClient;
       const invStore = new PairingInviteStore(config.stateDir);
       const invEvents = new EventEmitter();
-      const flow = new PairingInviteFlow({
+      // Invites pasted or forwarded here wait in the engine's memory (their secret never touches
+      // disk). The markers record only that one was waiting, so after a restart the operator is
+      // told to paste or forward it again instead of finding it silently gone.
+      const markers = new PairingPendingAcceptMarkers(config.stateDir);
+      try {
+        const notices = markers.convertAfterRestart();
+        if (notices.length) console.log(`[pairing-invite] ${notices.length} invite(s) waiting for approval were cleared by a restart; the operator will be told`);
+      } catch (err) {
+        console.warn(`[pairing-invite] could not read pending-accept markers: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const ownIdentity = () => {
+        const id = routingIdentityManager.get();
+        return id ? { fp: String(id.fingerprint).toLowerCase(), publicKeyHex: id.publicKey.toString('hex'), privateKey: id.privateKey } : null;
+      };
+      // The pairing handshake (spec §11) sits between the engine and the transport: it resends the
+      // accept until answered, answers accepts with signed receipts or refusals, runs the hello, and
+      // turns every outcome into an operator notice. The relay's verdict on every invite control
+      // message is logged (§11.8).
+      const handshake = new PairingHandshake({
         store: invStore,
         trust: trustManager!,
         identity: () => {
-          const id = routingIdentityManager.get();
-          return id ? { fp: String(id.fingerprint).toLowerCase(), publicKeyHex: id.publicKey.toString('hex'), privateKey: id.privateKey } : null;
+          const id = ownIdentity();
+          return id ? { fp: id.fp, publicKeyHex: id.publicKeyHex } : null;
         },
+        signHex: (m) => {
+          const id = ownIdentity();
+          if (!id) throw new Error('this machine does not hold the Threadline identity');
+          return edSign(id.privateKey, Buffer.from(m)).toString('hex');
+        },
+        verifyHex: (keyHex, m, sigHex) => {
+          try { return edVerify(Buffer.from(keyHex, 'hex'), Buffer.from(m), Buffer.from(sigHex, 'hex')); } catch { return false; }
+        },
+        randomHex: (n) => nodeCrypto.randomBytes(n).toString('hex'),
+        sendPlaintext: (to, op, payload) => client.sendInviteControlPlaintext(to, op, payload),
+        sendToKey: (to, key, op, payload) => client.sendInviteControlToKey(to, key, op, payload),
+        awaitDelivery: async (messageId) => {
+          const v = await client.awaitRelayAck(messageId, 15_000);
+          return v ? { status: v.status, ...(v.reason ? { reason: v.reason } : v.reasonCode ? { reason: v.reasonCode } : {}) } : null;
+        },
+        notice: (n: PairingNotice) => {
+          console.log(`[pairing-invite] notice ${n.kind} ${JSON.stringify(n)}`);
+          invEvents.emit('notice', n);
+        },
+        forward: (e) => {
+          console.log(`[pairing-invite] ${e.kind} ${JSON.stringify(e)}`);
+          invEvents.emit('event', e);
+        },
+        log: (line) => console.log(line),
+        timings: config.pairingHandshakeTimings,
+      });
+      const flow = new MarkedPairingInviteFlow({
+        store: invStore,
+        trust: trustManager!,
+        identity: ownIdentity,
         relayKeyFor: async (fp) => {
           const known = client.getKnownAgents().find((a) => a.agentId === fp);
           if (known?.publicKey) return Buffer.from(known.publicKey).toString('hex');
           const fetched = await client.fetchPeerIdentityKey(fp).catch(() => null);
           return fetched ? fetched.toString('hex') : null;
         },
-        sendPlaintext: (to, op, payload) => { client.sendInviteControlPlaintext(to, op, payload); },
-        sendToKey: (to, key, op, payload) => { client.sendInviteControlToKey(to, key, op, payload); },
-        notify: (e: InviteEvent) => {
-          console.log(`[pairing-invite] ${e.kind} ${JSON.stringify(e)}`);
-          invEvents.emit('event', e);
-        },
+        sendPlaintext: handshake.flowSendPlaintext,
+        sendToKey: handshake.flowSendToKey,
+        notify: (e: InviteEvent) => handshake.flowNotify(e as unknown as { kind: string; iid?: string }),
         ownName: () => ({ owner: config.ownerName ?? '', agent: config.agentName }),
+      }, markers);
+      handshake.attach(flow);
+      pairingInvites = { flow, handshake, store: invStore, events: invEvents, markers };
+    } catch (err) {
+      // Reported, not just logged: "invite pairing is off" shows in /health and the degradation
+      // digest until the store file is readable again.
+      DegradationReporter.getInstance().report({
+        feature: 'Threadline.pairingInvites',
+        primary: 'pair with another agent by invite (pairing-invites.json)',
+        fallback: 'invite pairing is off on this agent; the rest of Threadline keeps running and the file is left untouched',
+        reason: err instanceof Error ? err.message : String(err),
+        impact: 'invites cannot be sent, accepted or finished until threadline/pairing-invites.json can be read; it is never replaced with an empty file',
       });
-      pairingInvites = { flow, store: invStore, events: invEvents };
     }
 
     // Create inbound message gate (imports ThreadlineRouter lazily if needed)
@@ -512,7 +657,10 @@ export async function bootstrapThreadline(
       // Live verified-pairing config reader (spec §3.10) — supplied by server.ts.
       getVerifiedPairingConfig: config.getVerifiedPairingConfig,
       onInviteControl: (op, fromFp, payload) => {
-        void pairingInvites?.flow.handleControl(op, fromFp, payload).then((r) => {
+        // Through the handshake (spec §11): it answers accepts, verifies receipts, refusals and
+        // hellos, and reports outcomes to the operator. A refusal here is logged with its reason;
+        // the handshake decides whether the sender is told (§11.5).
+        void pairingInvites?.handshake.handleControl(op, fromFp, payload).then((r) => {
           if (!r.ok) console.warn(`[pairing-invite] ${op} from ${fromFp.slice(0, 12)} refused: ${(r as { reason: string }).reason}`);
         });
       },
@@ -526,6 +674,9 @@ export async function bootstrapThreadline(
     // Route inbound relay messages through the gate
     relayClient.on('message', async (msg: ReceivedMessage) => {
       if (!inboundGate) return;
+      // Encrypted ordinary chat from an invite peer, verified against its pinned key, records
+      // the encryptedSeen mark (step 6). Off: nothing. Never blocks delivery.
+      noteEncryptedChat({ trustManager, mode: refuseDowngradeMode, counters: refuseDowngradeCounters }, msg);
       const decision = await inboundGate.evaluate(msg);
       if (decision.action === 'pass' && decision.message) {
         // Gate passed — emit for ThreadlineRouter to handle
@@ -579,8 +730,29 @@ export async function bootstrapThreadline(
       // (docs/specs/a2a-pairing-invite-link.md §4.3). It is a CONTROL message for the gate, never
       // conversation text, so it must not reach the unknown-sender router (which would treat it
       // as an ordinary message and could spawn a session).
-      if (msgType && INVITE_OPS.has(msgType)) {
+      if (msgType && ALL_PAIRING_OPS.has(msgType)) {
         void inboundGate.evaluate(received);
+        return;
+      }
+
+      // No downgrade after encryption (spec D6, step 6): an invite peer that has sent us
+      // encrypted chat does not get plaintext delivered in its name. Enforce refuses here,
+      // before anything is recorded or routed; watch only counts.
+      if (shouldRefuseDowngradedPlaintext({ trustManager, mode: refuseDowngradeMode, counters: refuseDowngradeCounters }, received.from, msgType)) {
+        // Loud, never silent (Echo, 2026-10-20): named reason + remedy in the log, a per-peer
+        // record on /health, one degradation report and one encrypted notice back to the
+        // sender per peer per hour.
+        reportDowngradeRefusal({
+          trustManager,
+          report: ({ reason, impact }) => DegradationReporter.getInstance().report({
+            feature: 'Threadline.refuseDowngrade',
+            primary: 'deliver messages from agents you paired with',
+            fallback: 'the unencrypted message was not delivered; encrypted messages from that agent still are',
+            reason,
+            impact,
+          }),
+          sendNotice: (fp, pinnedHex, text) => { relayClient!.sendNoticeToPinned(fp, pinnedHex, text); },
+        }, received.from);
         return;
       }
 
@@ -589,7 +761,15 @@ export async function bootstrapThreadline(
           trustManager: trustManager!,
           mode: relayUnknownSenderTrustMode,
           counters: relayUnknownSenderTrustCounters,
-          emit: (decision) => { relayClient!.emit('gate-passed', decision); },
+          // Plaintext under an invite-paired peer's fingerprint is labelled unverified
+          // (never refused): the relay is the only evidence of who wrote it (spec D6/D9).
+          emit: (decision) => {
+            relayClient!.emit('gate-passed', labelUnverifiedPinnedPlaintext(
+              { trustManager, mode: encryptToPinnedMode, counters: encryptToPinnedCounters },
+              decision,
+              msgType,
+            ));
+          },
         },
         received,
         msgType,
@@ -769,6 +949,7 @@ export async function bootstrapThreadline(
     },
     shutdown: async () => {
       stopHeartbeat();
+      pairingInvites?.handshake.dispose();
       if (relayOwnerTimer) {
         clearInterval(relayOwnerTimer);
         relayOwnerTimer = null;
@@ -796,18 +977,19 @@ export async function bootstrapThreadline(
  * Register the Threadline MCP server into every framework config present.
  *
  * Claude Code: ~/.claude.json (local scope) + .mcp.json (project scope).
- * Codex CLI: `[mcp_servers."threadline"]` in ~/.codex/config.toml — added
- *   for the cross-framework portability audit (Gap 2). Before this, a
- *   Codex agent that joined the Threadline network had the relay running
- *   but no MCP tools advertised to its runtime. The Codex TOML format and
- *   path were empirically verified from a live ~/.codex/ (Codex CLI
- *   0.78.0); registration reuses the existing, tested
- *   OpenAiCodexMcpToolRegistry so the two writers cannot drift.
+ * Codex CLI: deliberately NOT written here. `~/.codex/config.toml` is ONE
+ *   file shared by every Codex on the machine, so a boot-time write of
+ *   `[mcp_servers."threadline"]` was last-writer-wins across agents AND
+ *   across tests (2026-10-20: an e2e run rewrote the operator's real
+ *   config.toml to point at a worktree + a /var/folders temp state dir).
+ *   Instar-launched Codex sessions never needed the shared entry — the
+ *   launch builders pin THIS agent's entry per spawn via
+ *   `-c mcp_servers.threadline.*` (frameworkSessionLaunch.ts). A
+ *   hand-started Codex that wants Threadline tools is connected on request
+ *   with `instar codex connect <agent>` (src/commands/codex.ts), the only
+ *   writer of the shared entry.
  *
  * The MCP server is a stdio process the framework launches as a subprocess.
- * Codex registration is gated on ~/.codex/ existing (Codex installed on
- * this machine) so a Claude-only host is never given a Codex config it
- * does not use.
  */
 async function registerThreadlineMcp(projectDir: string, agentName: string, stateDir: string): Promise<void> {
   const absDir = path.resolve(projectDir);
@@ -871,31 +1053,5 @@ async function registerThreadlineMcp(projectDir: string, agentName: string, stat
     fs.renameSync(tmpPath, mcpJsonPath);
   } catch {
     // Non-fatal
-  }
-
-  // ── 3. Also register in Codex's ~/.codex/config.toml (portability Gap 2) ──
-  // Gated on ~/.codex/ existing so a Claude-only host never gets a Codex
-  // config it does not use. Reuses the existing OpenAiCodexMcpToolRegistry
-  // (idempotent remove-then-append of the [mcp_servers."threadline"] table)
-  // so the TOML writer is never duplicated. Non-fatal, matching the Claude
-  // registration blocks above.
-  try {
-    const codexHome = process.env['CODEX_HOME'] || path.join(os.homedir(), '.codex');
-    if (fs.existsSync(codexHome)) {
-      const { createMcpToolRegistry } = await import(
-        '../providers/adapters/openai-codex/integration/mcpToolRegistry.js'
-      );
-      await createMcpToolRegistry().register(
-        {
-          kind: 'stdio',
-          name: 'threadline',
-          command: mcpEntry.command,
-          args: mcpEntry.args,
-        },
-        { scope: 'user' },
-      );
-    }
-  } catch {
-    // Non-fatal — Claude registration above is unaffected.
   }
 }
