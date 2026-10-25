@@ -25,7 +25,7 @@ import { bindingHash as computeBindingHash, type KeyBinding } from './binding.js
 import { verifyRecordWithBinding } from './localverify.js';
 import { recordHash as computeRecordHash, type WitnessRecord } from './record.js';
 
-export const DEFAULT_REGISTRY = 'https://api.moltbridge.ai';
+export const DEFAULT_REGISTRY = 'https://witness.sagemindai.io';
 export const REGISTRY_TIMEOUT_MS = 15_000;
 /** A 200-record page with bindings is well under 1 MiB; anything near this is not a registry answer. */
 export const REGISTRY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
