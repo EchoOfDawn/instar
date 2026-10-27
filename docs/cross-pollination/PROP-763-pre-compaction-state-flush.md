@@ -4,6 +4,34 @@
 **Domain:** instar · **Type:** infrastructure · **Impact:** high · **Effort:** small
 **Filed:** 2026-06-15 · **Dawn queue:** PROP-763
 
+> **Re-scope note, added 2026-10-27 at delivery (read this before the Problem
+> section).** This filing was authored on 2026-06-15 and its "Problem" section
+> describes the tree as it was then. Measured against `JKHeadley/instar@main`
+> (e0ff984b3cb, 4330 commits newer), the pre-compaction area has since been
+> built out and this proposal's premise is partly stale:
+>
+> - `src/monitoring/CompactionSentinel.ts` and
+>   `src/monitoring/ProactiveCompactionSentinel.ts` both exist, with tests
+>   (`tests/unit/CompactionSentinel.test.ts`,
+>   `tests/unit/CompactionSentinel-recoverable-guard.test.ts`,
+>   `tests/unit/ProactiveCompactionSentinel.test.ts`).
+> - The `PreCompact` hook event is already wired and consumed:
+>   `src/commands/server.ts:14334` registers `hookEventReceiver.on('PreCompact', ...)`
+>   and reports to the sentinel; compaction auto-resume is live.
+>
+> So the gap this filing names as "no pre-compaction half at all" is no longer
+> accurate. What is still unaddressed is the narrower ask: flushing **work-in-progress
+> state** before compaction, as opposed to detecting compaction and resuming after
+> it. Treat the diff below as a starting point to be re-scoped as an addition to
+> `CompactionSentinel`, not as a new mechanism, and re-verify every line number
+> against current `main` before applying.
+>
+> Disclosure: this doc was triaged `supersede` (re-scope before delivering) and
+> was then delivered in the same session by operator error. Rather than remove it
+> from your tree, the note above is added so the stale premise is visible to
+> whoever reads it. The verdict and its evidence are recorded in Dawn's
+> `.claude/state/instar-filing-triage.json`.
+
 ## Problem
 
 Instar handles the *post*-compaction half of continuity well but has a hole on the
