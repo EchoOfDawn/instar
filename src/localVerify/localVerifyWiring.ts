@@ -405,3 +405,18 @@ export async function buildStatusReconciler(opts: StatusReconcilerWiringOpts): P
   }, seams, floorGate, opts.service);
   return { reconciler, floorGate, reason: null };
 }
+
+/**
+ * The live switches the server reads at each decision (absent ⇒ on):
+ * `monitoring.localVerify.mainRedHold` (CMT-1033), `monitoring.localVerify.failFast` and
+ * `monitoring.localVerify.laneShards` (processes per slow lane; absent ⇒ the policy defaults).
+ */
+export function wireLocalVerifySwitches(
+  svc: Pick<LocalVerifyService, 'setMainRedHoldEnabled' | 'setFailFastEnabled' | 'setLaneShards'>,
+  liveConfig: { get<T>(key: string, fallback: T): T },
+): void {
+  svc.setMainRedHoldEnabled(() => liveConfig.get<boolean>('monitoring.localVerify.mainRedHold', true) !== false);
+  svc.setFailFastEnabled(() => liveConfig.get<boolean>('monitoring.localVerify.failFast', true) !== false);
+  // Processes per slow lane, e.g. { "integration": 1, "e2e": 2 } to return to the pre-2026-10-27 split.
+  svc.setLaneShards(() => liveConfig.get<unknown>('monitoring.localVerify.laneShards', null));
+}

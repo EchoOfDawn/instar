@@ -281,6 +281,18 @@ Before deferring work because the machine "looks loaded," RUN \`.instar/scripts/
 export const LOCAL_VERIFY_MAIN_RED_HOLD_CLAUDEMD_LINE = '- Local Verify main-red hold: while `main` fails a known check, only a repair candidate (a PR whose diff touches a failing file, or whose title or body names it) or a `main` verify takes the slot; every other PR keeps its place and waits for green instead of running a doomed verify. `GET /local-verify` → `mainRedHold` (failing files, `repairPrs`, `heldPrs`, a plain `detail`; held entries carry `held`); a `POST /local-verify` answer for a held PR carries `hold`. Once `main` is red, ONE deduped attention item for the episode (`local-verify:main-red-hold`) names the failing check and every PR already fixing it, refreshes when that list changes and closes on green — before writing a fix for a red `main`, read `repairPrs`; if yours is the fix, name the failing file in its title or body. Off switch: `monitoring.localVerify.mainRedHold: false` (read live).';
 
 /**
+ * Local Verify fail-fast — the awareness line appended to an existing CLAUDE.md's Local Verify
+ * section (`migrateClaudeMd`, content-sniffed on the config key).
+ */
+export const LOCAL_VERIFY_FAIL_FAST_CLAUDEMD_LINE = '- Local Verify fail-fast: in a PR verify, once one lane (unit, integration or e2e) ends with a failure its isolation re-run did not clear, the lanes still running are stopped (the verdict is already failure) and reported as `lane-stopped-early:<lane>`, so a doomed run frees the slot minutes sooner. A `main` verify always runs every lane. A test file that was itself re-run-passed on the last green `main` (flaky on `main`) now gets the same one isolation re-run as any other file, unless the PR changed it or a file it imports. Off switch: `monitoring.localVerify.failFast: false` (read at each start). When the user asks "why did my PR\'s run stop early / show only one lane\'s failures?" → this; fix the reported failure and re-request the verify.';
+
+/**
+ * Local Verify balanced shards — the awareness line appended to an existing CLAUDE.md's Local
+ * Verify section (`migrateClaudeMd`, content-sniffed on the config key).
+ */
+export const LOCAL_VERIFY_LANE_SHARDS_CLAUDEMD_LINE = '- Local Verify balanced shards: the integration lane runs as 2 processes and the e2e lane as 3, each given files planned from the per-file times of earlier runs on this machine (`<verifyRoot>/file-durations.json`, ignored above 2 MB) so the processes finish together; with too little history the lanes use vitest `--shard`. The history decides only which process runs a file, never whether it runs. Live setting `monitoring.localVerify.laneShards` (e.g. `{"integration": 1, "e2e": 2}` restores the old split; 1..4 each; read at each start). When the user asks "why is each verify faster / why are there more test processes?" → this; if runs get slower or flaky under load, lower the counts.';
+
+/**
  * Local Verify merge-throughput label — the awareness line appended to an existing CLAUDE.md's
  * Local Verify section (`migrateClaudeMd`, content-sniffed on the label name).
  */
@@ -9380,6 +9392,18 @@ The server runs the full test suite on the exact code a pull request would merge
       content += '\n' + LOCAL_VERIFY_MERGE_THROUGHPUT_CLAUDEMD_LINE + '\n';
       patched = true;
       result.upgraded.push('CLAUDE.md: added Local Verify merge-throughput label awareness');
+    }
+    // local-verify fail-fast: a PR verify stops its other lanes once one lane has a real failure.
+    if (content.includes('/local-verify') && !content.includes('monitoring.localVerify.failFast')) {
+      content += '\n' + LOCAL_VERIFY_FAIL_FAST_CLAUDEMD_LINE + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added Local Verify fail-fast awareness');
+    }
+    // local-verify balanced shards: more processes for the slow lanes, planned from history.
+    if (content.includes('/local-verify') && !content.includes('monitoring.localVerify.laneShards')) {
+      content += '\n' + LOCAL_VERIFY_LANE_SHARDS_CLAUDEMD_LINE + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added Local Verify balanced-shards awareness');
     }
     if (content.includes('/local-verify') && !content.includes('/local-verify/status')) {
       content += '\n- Local Verify merge-status loop: \`GET /local-verify/status\` — floor state (effective / awaiting-edit-a / awaiting-edit-b), main health (healthy / main-suspect / main-red), last pass, stuck heads; dry-run unless \`monitoring.localVerify.postStatuses\` is true.\n';

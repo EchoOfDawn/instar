@@ -53,7 +53,7 @@ import { isMergeEligible } from '../../scripts/local-verify-floor.mjs';
 import { LOCAL_VERIFY_DEADLINES, LOCAL_VERIFY_LIMITS, computePolicyHash } from './policy.js';
 import { decideMainRedHold, holdReasonText, mainFailureFromRunDetail, prMatchText, repairVerdict, type MainFailureDetail, type MainRedHoldDecision, type RepairCandidate } from './mainRedHold.js';
 import type { RestartHold } from '../core/UpdateGate.js';
-import type { FailureDetail, VerifyRunInput, VerifyRunResult } from './orchestrator.js';
+import { MAX_LANE_SHARDS, type FailureDetail, type VerifyRunInput, type VerifyRunResult } from './orchestrator.js';
 
 /** Repeat-flake escalation (one tracked item per file, re-raised when the flake keeps recurring). */
 export const FLAKY_REPEAT = Object.freeze({ count: 3, windowMs: 7 * 24 * 60 * 60_000, keep: 20 });
@@ -607,6 +607,10 @@ export class LocalVerifyService {
   /** Main-red hold (CMT-1033): the last failed `main` verify's failing files, the live switch, and the once-per-episode bookkeeping. */
   private mainFailure: MainFailureDetail | null = null;
   private mainRedHoldEnabled: (() => boolean) | null = null;
+  /** Fail-fast for PR verifies (`monitoring.localVerify.failFast`; absent ⇒ on). */
+  private failFastEnabled: (() => boolean) | null = null;
+  /** Processes per slow lane (`monitoring.localVerify.laneShards`; absent ⇒ the policy defaults). */
+  private laneShardsSetting: (() => unknown) | null = null;
   /** pr → the red head it was audited as held for (one `main-red-held` line per PR per episode). */
   private readonly heldAudited = new Map<number, string>();
   /** What the ONE hold item last said: the red head and the sorted repair-PR list (re-raised only when either changes). */
@@ -650,6 +654,28 @@ export class LocalVerifyService {
 
   private mergeLineOn(): boolean {
     try { return this.mergeLineEnabled ? this.mergeLineEnabled() !== false : true; } catch { return true; } // @silent-fallback-ok: an unreadable switch reads as on (today's default)
+  }
+
+  /** The live setting for processes per slow lane (read at each start; invalid values are ignored). */
+  setLaneShards(fn: (() => unknown) | null): void { this.laneShardsSetting = fn; }
+
+  private laneShards(): { integration?: number; e2e?: number } | null {
+    let v: unknown;
+    try { v = this.laneShardsSetting ? this.laneShardsSetting() : null; } catch { return null; } // @silent-fallback-ok: an unreadable setting means the policy defaults
+    if (!v || typeof v !== 'object') return null;
+    const out: { integration?: number; e2e?: number } = {};
+    for (const k of ['integration', 'e2e'] as const) {
+      const n = (v as Record<string, unknown>)[k];
+      if (typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= MAX_LANE_SHARDS) out[k] = n;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
+  /** The live switch for PR-verify fail-fast (`monitoring.localVerify.failFast`; absent ⇒ on). Read at each start. */
+  setFailFastEnabled(fn: (() => boolean) | null): void { this.failFastEnabled = fn; }
+
+  private failFastOn(): boolean {
+    try { return this.failFastEnabled ? this.failFastEnabled() !== false : true; } catch { return false; } // @silent-fallback-ok: an unreadable switch reads as off (every lane runs, today's behaviour)
   }
 
   /** The live kill switch for the main-red hold (`monitoring.localVerify.mainRedHold`; absent ⇒ on). */
@@ -1458,6 +1484,9 @@ export class LocalVerifyService {
       protectedList: this.cfg.protectedList, extraHarnessGlobs: this.cfg.extraHarnessGlobs, baseEnv: this.cfg.baseEnv,
       // PR verifies: an isolation re-run needs this machine's last green main record.
       ...(entry.kind === 'main' ? {} : { isolation: this.isolationInput() }),
+      // PR verifies: stop the other lanes once one lane has a failure its re-run did not clear.
+      ...(entry.kind !== 'main' && this.failFastOn() ? { failFast: true } : {}),
+      ...(() => { const ls = this.laneShards(); return ls ? { laneShards: ls } : {}; })(),
       ...(entry.kind === 'main' ? { kind: 'main' as const } : {}),
     };
     fs.writeFileSync(inputPath, JSON.stringify(input), { mode: 0o600 });
