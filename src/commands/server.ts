@@ -138,7 +138,7 @@ import { RelationshipManager } from '../core/RelationshipManager.js';
 import { ClaudeCliIntelligenceProvider } from '../core/ClaudeCliIntelligenceProvider.js';
 import { wrapIntelligenceWithCircuitBreaker, getFeatureMetricsRecorder } from '../core/CircuitBreakingIntelligenceProvider.js';
 import { configureLlmCircuitBreaker, llmCircuitAvailable } from '../core/LlmCircuitBreaker.js';
-import { computeSelfQuotaState } from '../core/selfQuotaState.js';
+import { computeSelfQuotaState, computeSignedInUsable } from '../core/selfQuotaState.js';
 import { SessionStartFailureTracker } from '../core/startFailureTracker.js';
 import { isClaudeForbidden } from '../core/claudeForbiddenGuard.js';
 import { SUPPORTED_FRAMEWORKS } from '../core/TopicFrameworksStore.js';
@@ -22980,9 +22980,17 @@ export async function startServer(options: StartOptions): Promise<void> {
               // said blocked:false → placement misrouted a session onto it; it died on arrival.)
               // Spec: docs/specs/placement-llm-circuit-aware-quota.md.
               // Third cause: this machine cannot start a session at all.
+              // Fourth cause: no signed-in account for the framework new conversations here
+              // run on (CMT-1051). Unknown (no pool / pool not ready) never blocks.
+              let signedInUsable: boolean | undefined;
+              try {
+                signedInUsable = subscriptionPool.getAvailability().state === 'ready'
+                  ? computeSignedInUsable(subscriptionPool.list(), _defaultFramework)
+                  : undefined;
+              } catch { signedInUsable = undefined; /* @silent-fallback-ok — an unreadable pool is unknown, which never blocks placement */ }
               return computeSelfQuotaState(
                 quotaTracker?.getState(), llmCircuitAvailable(), Date.now(),
-                startFailureTracker.state(),
+                startFailureTracker.state(), { usable: signedInUsable },
               );
             } catch { return undefined; /* unknown ≠ blocked */ }
           };

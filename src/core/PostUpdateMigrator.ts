@@ -10104,6 +10104,18 @@ Beyond the one-awake-machine model: with the pool enabled I run conversations ac
       result.upgraded.push('CLAUDE.md: added quota-aware placement line');
     }
 
+    // Signed-out machine placement awareness (CMT-1051, 2026-10-26): placement now skips a
+    // machine with no signed-in account for the framework new conversations run on. Byte-
+    // identical to the generateClaudeMd bullet. Idempotent via the unique
+    // 'Signed-out machines are skipped' marker.
+    if (content.includes('Multi-Machine Session Pool (active-active') && !content.includes('Signed-out machines are skipped')) {
+      const signedOutLine = `
+- **Signed-out machines are skipped (automatic):** the same heartbeat also says whether the machine has any signed-in account for the framework new conversations run on (from its subscription pool). A machine where every such account needs sign-in reports \`quotaState.reason: no-signed-in-account\`, and placement sends new conversations elsewhere instead of to a session that would sit at "Not logged in". A hard pin still wins (flagged \`pinned-machine-not-signed-in\`). Unknown (no pool, or no account for that framework) never blocks. When the user asks "why did my new topic go silent / land on a machine that can't log in?" → read that machine's \`quotaState\` in \`GET /pool\`.`;
+      content += '\n' + signedOutLine + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added signed-out machine placement line');
+    }
+
     // Remote session close (REMOTE-SESSION-CLOSE-SPEC §2.4, 2026-06-12): agents
     // that ALREADY carry the pool section predate the relayed close — the one
     // agent-facing /sessions/* verb (§2.0 names "the operator's authenticated
