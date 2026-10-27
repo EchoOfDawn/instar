@@ -10459,6 +10459,9 @@ export async function startServer(options: StartOptions): Promise<void> {
     const sharedPressureTier = (): 'normal' | 'moderate' | 'critical' => samplePressureShared({
       cpuModerateLoadPerCore: reaperPressureCfg?.cpuModerateLoadPerCore ?? 1.0,
       cpuCriticalLoadPerCore: reaperPressureCfg?.cpuCriticalLoadPerCore ?? 1.5,
+      cpuSignal: reaperPressureCfg?.cpuSignal,
+      cpuModerateBusyPct: reaperPressureCfg?.cpuModerateBusyPct,
+      cpuCriticalBusyPct: reaperPressureCfg?.cpuCriticalBusyPct,
     }).tier;
     sessionManager.setPressureTierProvider(sharedPressureTier);
 
@@ -17509,6 +17512,9 @@ export async function startServer(options: StartOptions): Promise<void> {
             pressure: () => _sampleHostPressure({
               cpuModerateLoadPerCore: rcfg?.cpuModerateLoadPerCore ?? 1.0,
               cpuCriticalLoadPerCore: rcfg?.cpuCriticalLoadPerCore ?? 1.5,
+              cpuSignal: rcfg?.cpuSignal,
+              cpuModerateBusyPct: rcfg?.cpuModerateBusyPct,
+              cpuCriticalBusyPct: rcfg?.cpuCriticalBusyPct,
             }),
             // Author ONLY on the lease holder (multi-machine N× burn fix); single-machine ⇒ always holder.
             holdsLease: () => (leaseCoordinatorRef ? leaseCoordinatorRef.holdsLease() : true),
@@ -21550,6 +21556,9 @@ export async function startServer(options: StartOptions): Promise<void> {
           return sampleHostPressure({
             cpuModerateLoadPerCore: rcfg?.cpuModerateLoadPerCore ?? 1.0,
             cpuCriticalLoadPerCore: rcfg?.cpuCriticalLoadPerCore ?? 1.5,
+            cpuSignal: rcfg?.cpuSignal,
+            cpuModerateBusyPct: rcfg?.cpuModerateBusyPct,
+            cpuCriticalBusyPct: rcfg?.cpuCriticalBusyPct,
           });
         },
         terminate: (id, reason, opts) =>
