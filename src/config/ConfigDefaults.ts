@@ -16,6 +16,17 @@
 
 import { DEFAULT_TIER_ESCALATION_CONFIG } from '../core/ModelTierEscalation.js';
 
+/** The first script wave is a runtime default too, including before migration writes config. */
+export const SCRIPT_RUNNER_FIRST_WAVE_DISABLED_SLUGS = [
+  'benchmark-divergence-analysis', 'commitment-checkin-reminder',
+  'correction-class-review-backstop',
+  'doorway-scan', 'feedback-factory-action-list', 'feedback-factory-execute',
+  'feedback-factory-process', 'feedback-factory-triage', 'health-check',
+  'jev-completion-audit', 'mentor-onboarding', 'release-readiness-check',
+  'review-canary-battery', 'routing-price-refresh',
+  'routing-price-web-verify', 'stall-matrix-live-check',
+] as const;
+
 /** Fields shared across ALL agent types and contexts (init + migration) */
 const SHARED_DEFAULTS: Record<string, unknown> = {
   // Model-Tier Escalation (FABLE-MODEL-ESCALATION-SPEC §9/§10). Ships DARK
@@ -2343,6 +2354,32 @@ const SHARED_DEFAULTS: Record<string, unknown> = {
       maxConcurrent: 2,
       maxStartsPerDay: 6,
       maxOpenPrs: 4,
+    },
+  },
+  // Job cost reduction (docs/specs/job-cost-reduction.md §8 item 2). All read
+  // LIVE. `jobs.scriptRunners.enabled` is DELIBERATELY OMITTED: it rides the
+  // development-agent gate (script runners live on dev agents; on the fleet
+  // every converted job runs its body as a session exactly as today — F6).
+  // `jobs.scriptTriage.jev.enabled` is likewise OMITTED (dev-gated Jev egress,
+  // F12). applyDefaults is add-missing per key, so an operator's value is never
+  // overwritten and a later default change reaches agents that never set it.
+  jobs: {
+    scriptRunners: {
+      // §11 first wave: only deterministic llm-decision-grading runs as a
+      // script initially. Correction-class backfill can invoke an LLM. The
+      // supervisor is installed but code-gated inactive until its model call
+      // has benchmark and decision-quality audit coverage. Later waves
+      // need an explicit idempotent migration; add-missing defaults alone
+      // cannot remove entries already written to an agent's config.
+      disabledSlugs: [...SCRIPT_RUNNER_FIRST_WAVE_DISABLED_SLUGS],
+    },
+    scriptTriage: {
+      enabled: true,
+      sessionCooldownHours: 6,
+      maxSessionsPerDay: 6,
+      maxSessionsPerSlugPerDay: 3,
+      backupIntervalHours: 6,
+      jev: { model: 'jev-1.13.0', timeoutMs: 1500, maxChecksPerDay: 1500 },
     },
   },
 };
