@@ -981,7 +981,17 @@ export class FeedbackExecutorService {
     if (result.outcome === 'spec-drafted') {
       const expected = `docs/specs/feedback-${safeSlug(row.initiativeId)}.md`;
       const shape = row.needsSpec ? checkSpecDraft(changeSet, expected) : { ok: false as const, reason: 'spec drafted for an item that did not need one' };
-      if (!shape.ok) { this.endAttempt(row, epoch, 'failed', `spec-shape: ${shape.reason}`); await this.afterFailure(this.opts.store.get(row.attemptId)!, epoch, 'failed'); return; }
+      if (!shape.ok) {
+        // The workspace is removed after failure. Keep the bounded, sanitized path list so a
+        // generated file or checkout mismatch can be diagnosed without retaining file contents.
+        this.opts.audit.append('execute:spec-shape-rejected', {
+          attemptId: row.attemptId,
+          changes: changeSet.entries.map(({ path, kind }) => ({ path, kind })),
+        });
+        this.endAttempt(row, epoch, 'failed', `spec-shape: ${shape.reason}`);
+        await this.afterFailure(this.opts.store.get(row.attemptId)!, epoch, 'failed');
+        return;
+      }
       await this.gateAndPublish(row, epoch, changeSet, result, 'spec', slug, approver);
       return;
     }
@@ -1828,4 +1838,3 @@ export class FeedbackExecutorService {
     }
   }
 }
-
