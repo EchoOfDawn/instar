@@ -8540,6 +8540,13 @@ Rule: I do not state that work landed inside another agent's state unless I have
         patched = true;
         result.upgraded.push('CLAUDE.md: added last-resort sign-in model awareness');
       }
+      // Repair blockers (why a needs-sign-in account has no repair) for existing agents.
+      const lastResortEnd = "a Secret Drop submission alone does not create the vault key.";
+      if (content.includes(lastResortEnd) && !content.includes('Why a sign-in repair did not start')) {
+        content = content.replace(lastResortEnd, lastResortEnd + '\n' + "- **Why a sign-in repair did not start** \u2014 `GET /subscription-relogin` now carries `blockers`: one row per account on this machine that needs sign-in but has no repair, with the reason. `no-open-incident` means nothing has confirmed the sign-in failure on this machine (often its saved login cannot be read), and a repair needs that confirmation; `profile-unresolved` means this machine has no browser profile signed in to that account (create one with `POST /playwright-profiles` and sign it in with /subscription-signin); any other reason is the repair's admission refusal. `?scope=pool` merges every machine's rows, and the dashboard shows the reason in plain words under the cell's Sign in button (a machine where repair is not running at all says so). Read-only: it never starts a repair. **When to use** (PROACTIVE): the user asks \"why is this still Needs sign-in?\" / \"why didn't auto-login fix it?\" \u2192 read `blockers` before guessing.");
+        patched = true;
+        result.upgraded.push('CLAUDE.md: added sign-in repair blockers awareness');
+      }
     }
 
     // Fleet one-click assisted re-login awareness for existing agents that
