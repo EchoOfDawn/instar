@@ -134,6 +134,8 @@ export interface VerifyRunInput {
    * on a PR verify ⇒ no re-run. `main` verifies ignore it (the plain rule).
    */
   isolation?: { allowed: boolean; notCleanOnGreenMain: readonly string[] };
+  /** A peer verify (spec local-verify-capacity.md Part D): copied onto the record as `attempt`. */
+  attempt?: { id: string; coordinatorMachineId: string; leaseEpoch: number | null };
   /**
    * PR verifies only: once a lane ends with a failure the isolation re-run did not clear, stop
    * the other lanes (the verdict is already `failure`). Absent/false ⇒ every lane runs to the end.
@@ -619,6 +621,7 @@ export async function runVerify(input: VerifyRunInput, seams: OrchestratorSeams)
   };
   if (errorStep) record.errorStep = errorStep;
   if (input.kind === 'main') record.kind = 'main';
+  if (input.attempt && input.kind !== 'main') record.attempt = { id: input.attempt.id, coordinatorMachineId: input.attempt.coordinatorMachineId, leaseEpoch: input.attempt.leaseEpoch };
   if (flakyRetried.length > 0) record.flakyRetried = flakyRetried.slice(0, FLAKY_RETRIED_MAX);
   const kept = await cleanup(outcome !== 'success');
   const v = validateRecord(record);

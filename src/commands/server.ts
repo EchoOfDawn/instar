@@ -22794,14 +22794,31 @@ export async function startServer(options: StartOptions): Promise<void> {
         });
         if (built.service) {
           localVerifyService = built.service;
+          // Both the coordinator and a peer read the same live lane switches.
+          // A peer can run PR verifies without a source checkout.
+          wiring.wireLocalVerifySwitches(localVerifyService, liveConfig);
           try {
             await localVerifyService.boot();
             const svc = localVerifyService;
+            // Peer verifiers (spec local-verify-capacity.md Part D): settings read live; the
+            // client uses the agent's own token; the lease decides coordinator vs peer role.
+            wiring.wireLocalVerifyPeers(svc, {
+              liveConfig,
+              authToken: String(config.authToken ?? ''),
+              agentId: config.projectName,
+              lease: coordinator.enabled
+                ? {
+                    holdsLease: () => coordinator.holdsLease(),
+                    leaseEpoch: () => coordinator.getSyncStatus().leaseEpoch ?? null,
+                    holderMachineId: () => coordinator.getSyncStatus().leaseHolder ?? null,
+                  }
+                : null,
+            });
             // An automatic update restart waits for a running verify (a manual apply does not).
             wiring.registerLocalVerifyRestartHold(autoUpdater, svc);
             localVerifyTimer = setInterval(() => { void svc.tick().catch(() => { /* a failed tick retries next interval */ }); }, 30_000);
             localVerifyTimer.unref();
-            console.log(pc.green('  local-verify enabled (server-run test verification for merges)'));
+            console.log(pc.green(svc.isPeerOnly() ? '  local-verify peer-only (runs verifies a coordinator hands this machine; never merges)' : '  local-verify enabled (server-run test verification for merges)'));
           } catch (e) {
             console.log(pc.red(`  local-verify NOT started — boot failed: ${(e as Error)?.message ?? e}`));
             localVerifyService = null;
@@ -22824,7 +22841,7 @@ export async function startServer(options: StartOptions): Promise<void> {
             machineId: lvMachineId,
             expectedGhLogin: gpCfg.expectedGhLogin,
             operatorGhLogin: lvCfg?.operatorGhLogin?.trim() || null,
-            service: localVerifyService,
+            service: localVerifyService && !localVerifyService.isPeerOnly() ? localVerifyService : null,
             localVerifyEnabled: () => liveConfig.get<boolean>('monitoring.localVerify.enabled', false) === true,
             postStatuses: () => liveConfig.get<boolean>('monitoring.localVerify.postStatuses', false) === true,
             configFloor: () => (liveConfig.get<string>('monitoring.greenPrAutoMerge.floor', 'actions') === 'local' ? 'local' : 'actions'),
@@ -22857,13 +22874,9 @@ export async function startServer(options: StartOptions): Promise<void> {
       // (local-verify-merge-authority §2/§3). The effective floor follows GitHub's
       // real settings (the reconciler's floor gate); without a reconciler it is
       // unmeasurable (null ⇒ actions). Main health is the service's machine state.
-      if (localVerifyService) {
+      if (localVerifyService && !localVerifyService.isPeerOnly()) {
         const svc = localVerifyService;
         const rec = localVerifyStatus;
-        // Main-red hold (CMT-1033): while `main` fails a known check, only a repair candidate
-        // takes the verify slot. Kill switch: monitoring.localVerify.mainRedHold (read live).
-        // Fail-fast (PR verifies): stop the other lanes once one has a real failure. monitoring.localVerify.failFast (read at each start).
-        (await import('../localVerify/localVerifyWiring.js')).wireLocalVerifySwitches(svc, liveConfig);
         greenPrAutoMerger?.attachLocalVerify({
           effectiveFloor: () => (rec ? rec.effectiveFloor() : null),
           mainHealth: () => svc.mainHealth().state,

@@ -1703,6 +1703,25 @@
       }
     },
     {
+      "category": "local-verify-peer-attempts",
+      "description": "Machine-local peer verifier hand-off state: one current attempt, the last 20 results, and cancelled attempt ids retained for seven days. It lets a restarted peer reject delayed hand-offs and lets the coordinator retrieve a completed result.",
+      "scope": "machine-local",
+      "freshness": "live",
+      "conflictShape": "single-writer",
+      "transport": "none",
+      "paths": [
+        "state/local-verify/peer-attempts.json"
+      ],
+      "grandfathered": false,
+      "retention": {
+        "class": "time-window",
+        "access": "whole-sync",
+        "maxResults": 20,
+        "tombstoneMaxAgeMs": 604800000,
+        "note": "The current attempt is replaced on completion or restart, results keep their last 20 entries, and cancelled attempt ids expire after seven days. The snapshot is rewritten in place."
+      }
+    },
+    {
       "category": "local-verify-journal",
       "description": "local-verify completion journal: one line per verify record (repo, pr, head, base, lanes, outcome, flags, verifierVersion, policyHash), written ONLY by LocalVerifyService's completion path; the in-memory record index is rebuilt from it at boot. Plus the per-PR first-seen-closed times used for the 14-day retention. Machine-local: another machine's lease acquisition starts with an empty index and re-verifies (spec local-verify-merge-authority §2 step 6).",
       "scope": "machine-local",
