@@ -134,7 +134,7 @@ describe('PostUpdateMigrator — reaper pressure, Form B (template-initialized a
   });
 
   it('the template bullet is replaced WHOLE — no stale load-threshold sentence survives', () => {
-    // The round-2 re-check: a prefix match would leave "Tune the CPU thresholds … 
+    // The round-2 re-check: a prefix match would leave "Tune the CPU thresholds …
     // cpuModerateLoadPerCore" behind, so the agent would read the new text and then be told
     // the load knobs are the tuning controls.
     fs.writeFileSync(claudeMdPath, templateInitialized());
