@@ -287,7 +287,9 @@ export class PlacementExecutor {
             escalationReason: pinned.quotaState?.blocked === true
               ? (pinned.quotaState.reason === 'session-start-failing'
                 ? 'pinned-machine-cannot-start-sessions'
-                : 'pinned-machine-quota-blocked')
+                : pinned.quotaState.reason === 'no-signed-in-account'
+                  ? 'pinned-machine-not-signed-in'
+                  : 'pinned-machine-quota-blocked')
               : undefined,
           };
         }
