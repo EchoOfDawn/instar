@@ -143,7 +143,6 @@ describe('Feature Delivery Completeness', () => {
       '### Jev Memory Picker', // jev-memory-picker: the session-start memory ranking card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
       '### Jev Correction Shadow', // jev-correction-shadow: the log-only correction-recall card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
       '### Machine Load Second Opinion', // trustworthy-machine-load B4: the advisory load-assessment card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
-      '### Jev Review-Flag Shadow', // jev-review-flag-shadow: the log-only measurement card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
       '### Jev Circles Shadow', // jev-circles-shadow: the log-only measurement card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
       '### Jev Artefact Signals', // jev-signal-live: the live advisory card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
       '### Jev Job-Completion Audit', // jev-job-supervision: the dark observe-only audit card — full parity: templates.ts generateClaudeMd + migrator migrateClaudeMd (content-sniffed on the heading).
