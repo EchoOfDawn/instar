@@ -131,7 +131,7 @@ describe('QuotaManager → SessionMigrator notification wiring', () => {
     expect(msg).toBeDefined();
     expect(msg).toContain('92%');
     expect(msg).toContain('1 session');
-    expect(msg).toContain('Scheduler paused');
+    expect(msg).toContain('Scheduler pauses until quota recovers or five hours pass');
     expect(msg).toContain('five hours');
     const pause = quotaManager.getMigrationStatus().enforcementPause;
     expect(pause?.result).toBe('enforced_pause');
