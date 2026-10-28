@@ -328,6 +328,10 @@ export class ScriptCanaryRunner {
         catch { /* @silent-fallback-ok — tmpdir cleanup is best-effort */ }
       }
     }
+    if (!this.auditAssertion({ runId, slug: job.slug, variant: variant.name,
+      passed: problems.length === 0, problems })) {
+      problems.push('canary assertion could not be recorded');
+    }
     const passed = problems.length === 0;
     this.d.history.recordCompletion({
       runId,
@@ -372,7 +376,28 @@ export class ScriptCanaryRunner {
         ts: new Date(this.now()).toISOString(), kind: 'script-canary', machineId: this.d.machineId, ...row,
       }) + '\n');
     } catch (err) {
+      // @silent-fallback-ok — this legacy audit is best-effort; the independent assertion journal below is required.
       console.warn('[ScriptCanaryRunner] audit write failed:', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** A separate fsynced assertion census, outside production supervision. */
+  private auditAssertion(row: { runId: string; slug: string; variant: string; passed: boolean; problems: string[] }): boolean {
+    const file = path.join(this.d.stateDir, 'ledger', 'script-canary-assertions.jsonl');
+    let fd: number | null = null;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fd = fs.openSync(file, 'a', 0o600);
+      fs.writeSync(fd, JSON.stringify({ ts: new Date(this.now()).toISOString(),
+        machineId: this.d.machineId, ...row }) + '\n');
+      fs.fsyncSync(fd);
+      return true;
+    } catch (error) {
+      // @silent-fallback-ok — the canary fails and records this problem in run history; no passing assertion is inferred.
+      console.error('[ScriptCanaryRunner] assertion write failed:', error);
+      return false;
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
     }
   }
 

@@ -14,17 +14,9 @@ related:
   - docs/specs/benchmark-divergence-detector.md
   - docs/LLM-SUPERVISED-EXECUTION.md
   - docs/specs/jev-job-supervision.md
-review-convergence: "2026-10-27T02:37:40.367Z"
-review-iterations: 6
-review-completed-at: "2026-10-27T02:37:40.367Z"
-review-report: "docs/specs/reports/job-cost-reduction-convergence.md"
-cross-model-review: "codex-cli:gpt-6-astra"
-approved: true
-approved-by: "justin (operator decision, Telegram topic 130742, 2026-10-26 19:04 PDT)"
-approval-basis: >
-  Justin set the supervision design this revision implements ("leverage Jev ... with haiku or
-  Luna replacing Jev only when unavailable ... then a single high-level daily review") and the build was directed to
-  proceed after re-convergence. Recorded transparently by Echo, not silently self-granted.
+prior-review-convergence: "2026-10-27T02:37:40.367Z"
+prior-review-report: "docs/specs/reports/job-cost-reduction-convergence.md"
+revision-note: "Jev-first result coverage corrected 2026-10-27; prior approval does not cover this revision"
 single-run-completable: true
 frontloaded-decisions: 19
 cheap-to-change-tags: 1
@@ -79,19 +71,17 @@ leaves it out of the savings estimate rather than guessing.
 Goals (operator direction):
 
 - **G1.** These jobs become far more efficient. A job whose work is a fixed
-  command runs **with no session at all**, and **with no model call on a bare
-  healthy run**. A model is called only to classify a non-trivial result (Jev,
-  §5.6.2), to word a push (§5.4), or on the outage backup and daily
-  reviews; a session starts only when triage says one is needed.
+  command runs **with no session at all**. A verified, certified healthy
+  result can avoid a model call; other results follow the supervision rule in
+  `job-result-supervision-v2.md`. A session starts only when the fixed floor
+  or judgment check says one is needed.
 - **G2.** Work that genuinely needs a model runs on the **cheapest capable
   model**, chosen from **Instar benchmark evidence** (e.g. Codex GPT-6 Luna),
   with Claude as the fallback.
-- **G3.** Use **Jev (TypeSafe)** wherever the judgment is a classification.
-  A confident Jev answer decides; uncertainty starts a bounded investigator.
-  Haiku or Luna replaces Jev only during an outage. In v1 that judgment is the
-  per-run question "does this result need a real session?" (§5.6.2), with a
-  slower Haiku-or-Luna replacement only while Jev is unavailable and one daily
-  review (operator decision and clarification, topic 130742, 2026-10-26 19:04–19:06).
+- **G3.** Use **Jev (TypeSafe)** for results that need judgment. A confident
+  Jev answer decides; uncertainty starts a bounded investigator. Haiku or
+  Luna replaces Jev only when unavailable, under the per-result contract in
+  `job-result-supervision-v2.md`. One daily review checks overall coverage.
 - **G4.** **Single-provider floor.** An agent with only one provider, no Jev key
   and no benchmark mirror stays fully functional. Jev, Codex and benchmark
   routing are optimizations, never dependencies. The single-provider path is the
@@ -612,6 +602,17 @@ they are deterministic text. A triage session costs what a job session costs
 today, at most 6 a day per machine.
 
 ### 5.6 Supervision: per-run Jev triage, an outage replacement, one daily review
+
+**Approved direction, pending converged detail (Justin, 2026-10-27 19:41 PDT):**
+The after-run supervision design is replaced by
+[`job-result-supervision-v2.md`](job-result-supervision-v2.md). Every result gets
+a recorded decision. Exact, proven routine shapes can be closed by fixed
+rules; results needing judgment go to Jev, with Haiku or Luna replacing it
+only when unavailable. Critical alerts and must-fail canaries remain. The
+older five-job table, bare-OK exclusions, fingerprint reuse, six-hour outage
+sample, cost estimates, tests, and frontloaded decisions below are historical
+design detail, not instructions to implement or a forecast for v2. The live
+Jev path remains off behind the audit gate until v2 converges and is proven.
 
 `docs/LLM-SUPERVISED-EXECUTION.md` puts health checks at Tier 1, to "detect
 false-positive healthy reports". Today a Haiku session on every run pays for that
