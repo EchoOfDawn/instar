@@ -50,6 +50,8 @@ No new static heuristic arbitrates competing live signals. The maximum duration 
 
 ## 6b. Operator-surface quality
 
+The migration checks for the shared quota guidance heading; the feature-delivery parity test tracks that heading as an agent-facing capability rather than exempting the new text as legacy content.
+
 No dashboard or operator form is modified. The existing status API gains additive fields; no operator action is added.
 
 ## 7. Multi-machine posture

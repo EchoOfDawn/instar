@@ -20,6 +20,7 @@ The brake also has a five-hour maximum. If usage readings stop arriving, a timer
 
 The deadline notice says a healthy reading was missing, which also covers the case where readings keep arriving but still report high usage.
 The same status guidance reaches new and existing agents, including Codex and Gemini sessions.
+The same section heading is checked for both new and updated agents, so the agent-guidance consistency test stays active.
 
 ## Safeguards
 

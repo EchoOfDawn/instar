@@ -4,7 +4,7 @@
   "sessionId": "71dde707-5cc5-4874-82e9-90badb3df899",
   "timestamp": "2026-10-28T15:16:45.198Z",
   "artifactPath": "upgrades/side-effects/feedback-quota-enforcement-pause.md",
-  "artifactSha256": "f5be64de1380f11f97c73333344e52060d6a64a8c380329391c717d428352294",
+  "artifactSha256": "810b3bb362fd64050a364199d0c119ed7458dba62169dd537b0affe895b081bb",
   "coveredFiles": [
     "src/core/PostUpdateMigrator.ts",
     "src/monitoring/QuotaManager.ts",
