@@ -618,6 +618,29 @@ describe('verification and publication', () => {
     expect(h.execStore.attemptsFor(id)[0].reason).toMatch(/^spec-shape/);
   });
 
+  it('records changed paths when extra files cause a spec draft rejection', async () => {
+    h = await createExecHarness();
+    const id = await h.workItem('c1', { needsSpec: true });
+    h.sessions.behavior.fn = (ws) => {
+      const draft = path.join(ws, 'docs/specs/feedback-feedback-c1.md');
+      fs.mkdirSync(path.dirname(draft), { recursive: true });
+      fs.writeFileSync(draft, '# Draft\n');
+      fs.writeFileSync(path.join(ws, 'src/extra.ts'), 'export const extra = 1;\n');
+      fs.writeFileSync(path.join(ws, RESULT_FILE), JSON.stringify({ outcome: 'spec-drafted' }));
+    };
+    await h.exec.tick();
+    finishSessions(h);
+    await h.exec.tick();
+    expect(h.execStore.attemptsFor(id)[0].reason).toBe('spec-shape: expected exactly one new file, found 2 changes');
+    const rows = fs.readFileSync(h.audit.path(), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.find((row) => row.event === 'execute:spec-shape-rejected')).toMatchObject({
+      changes: [
+        { path: 'docs/specs/feedback-feedback-c1.md', kind: 'added' },
+        { path: 'src/extra.ts', kind: 'added' },
+      ],
+    });
+  });
+
   it('not-reproducible twice → hold not-reproducible and a weak wrong grade on the work decision', async () => {
     h = await createExecHarness();
     const id = await h.workItem('c1');
