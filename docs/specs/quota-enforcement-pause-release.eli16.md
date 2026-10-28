@@ -19,6 +19,7 @@ On every usage reading, if this brake is the thing holding the tasks, and usage 
 The brake also has a five-hour maximum. If usage readings stop arriving, a timer releases the scheduler-wide brake and sends a note explaining why. Script checks can run again. AI jobs remain gated until a new, healthy usage reading arrives; the status page says when they are waiting. The migration status page shows the brake's reason, start, and deadline while it is active. Repeated high readings do not move that deadline later.
 
 The deadline notice says a healthy reading was missing, which also covers the case where readings keep arriving but still report high usage.
+The same status guidance reaches new and existing agents, including Codex and Gemini sessions.
 
 ## Safeguards
 

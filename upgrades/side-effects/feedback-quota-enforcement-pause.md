@@ -46,7 +46,7 @@ No new static heuristic arbitrates competing live signals. The maximum duration 
 
 ## 6. External surfaces
 
-`/quota/migration` gains additive `enforcementPause` and `awaitingFreshQuota` fields. Telegram quota notices now state the maximum duration and explain the restricted deadline release. Generated `CLAUDE.md` and its update migration gain one guidance paragraph. No new operator action is required; status can be read from the authenticated API. There is no new external URL or durable database state.
+`/quota/migration` gains additive `enforcementPause` and `awaitingFreshQuota` fields. Telegram quota notices now state the maximum duration and explain the restricted deadline release. Generated `CLAUDE.md`, its update migration, and the Codex/Gemini shadow gain the same guidance paragraph. No new operator action is required; status can be read from the authenticated API. There is no new external URL or durable database state.
 
 ## 6b. Operator-surface quality
 

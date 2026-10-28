@@ -13073,6 +13073,7 @@ An agent created in a temporary folder (\`/tmp\`, \`/private/tmp\`, \`/var/folde
     const markers = [
       '### Feature switches apply their setting (read `effective` before saying a feature is on)',
       '### Telegram message origin',
+      '### Quota-enforcement scheduler pause',
       // peer-credential-guard-tailscale-coherence: a pool read's failure reasons
       // are server-side and framework-neutral — a Codex/Gemini agent runs the
       // same fan-out and must not report `url-rejected` and the new
