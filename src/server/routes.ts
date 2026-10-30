@@ -16,6 +16,7 @@ import { withUnknownProducerOrigin } from '../messaging/telegram-origin/OriginDe
  */
 
 import { Router } from 'express';
+import { isLoopbackPeer } from '../core/desktopTransport.js';
 import { mountTelegramOriginRoutes, sendOriginHoldResponse } from './telegramOriginRoutes.js';
 import { TelegramOriginHoldError, OriginForwardSettledLocallyError } from '../messaging/telegram-origin/types.js';
 import { deterministicAutomationAuthor } from '../messaging/telegram-origin/OriginAutomationAuthor.js';
@@ -1653,6 +1654,7 @@ export interface RouteContext {
    *  POST /blockers/:id/advance, POST /blockers/:id/settle. Signal-only — it never
    *  blocks a message; the true-blocker settle routes through the B17 authority. */
   blockerLedger?: import('../monitoring/BlockerLedger.js').BlockerLedger | null;
+  directDesktopAccess?: import('../core/DirectDesktopAccess.js').DirectDesktopAccess | null;
   /** Self-Unblock checklist run store ("Self-Unblock Before Escalating", §5/§7).
    *  Null/absent when monitoring.blockerLedger.selfUnblockChecklist.enabled is false
    *  (default, ships dark) → GET /blockers/self-unblock-runs 503s (after auth). The
@@ -12948,8 +12950,134 @@ export function createRoutes(ctx: RouteContext): Router {
     try {
       res.json(ctx.growthMilestoneAnalyst.buildDigest());
     } catch (err) {
+      // @silent-fallback-ok — HTTP 500 is returned; nearby desktop intent is a separate helper.
       res.status(500).json({ error: (err as Error).message });
     }
+  });
+
+  // ── Native operator remote desktop (explicit dev-agent opt-in) ─────────────
+  const desktopOperatorSession = (req: ExpressRequest): string =>
+    typeof req.headers['x-instar-operator-session'] === 'string' ? req.headers['x-instar-operator-session'] : '';
+  const desktopTransport = (req: ExpressRequest, res: ExpressResponse): boolean => {
+    if (req.secure || isLoopbackPeer(req.socket.remoteAddress)) return true;
+    res.status(403).json({ error: 'Remote desktop requires the HTTPS tunnel or local access' });
+    return false;
+  };
+  const desktopIntent = (req: ExpressRequest, res: ExpressResponse): boolean => {
+    if (req.headers['x-instar-request'] === '1') return true;
+    res.status(403).json({ error: 'X-Instar-Request: 1 required' });
+    return false;
+  };
+  const desktopReadiness = async (): Promise<{ ready: boolean; unavailableReason?: string }> => {
+    try {
+      const probe = await ctx.directDesktopAccess!.probe();
+      if (probe.ready) return { ready: true };
+      if (!probe.sessionActive && probe.screenPermission && probe.inputPermission && probe.displayCount > 0) {
+        return { ready: false, unavailableReason: 'This Mac’s desktop is locked or inactive. This version cannot unlock macOS. Unlock it, then choose Check again.' };
+      }
+    } catch {
+      // @silent-fallback-ok — probe uncertainty denies desktop access and returns an explicit unavailable reason.
+    }
+    return { ready: false, unavailableReason: 'Remote desktop is not ready on this machine.' };
+  };
+  router.get('/desktop/availability', async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    const target = ctx.directDesktopAccess.targetInfo();
+    res.json({ ...target, ...await desktopReadiness() });
+  });
+  router.get('/desktop/targets', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res)) return;
+    if (!ctx.verifyDashboardOperatorSession?.(desktopOperatorSession(req))) {
+      res.status(403).json({ error: 'Dashboard operator session required' }); return;
+    }
+    const target = ctx.directDesktopAccess.targetInfo();
+    const topics = Object.entries(ctx.topicOperatorStore?.all() ?? {})
+      .filter(([id, binding]) => /^\d+$/.test(id) && binding.platform === 'telegram')
+      .map(([id]) => {
+        const name = ctx.telegram?.getTopicName(Number(id))?.trim();
+        return { topicId: Number(id), label: name || `Telegram topic ${id}` };
+      });
+    res.json({ machines: [{ ...target, ...await desktopReadiness() }], topics });
+  });
+  router.post('/desktop/requests', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res)) return;
+    if (!desktopIntent(req, res)) return;
+    const session = desktopOperatorSession(req);
+    if (!ctx.verifyDashboardOperatorSession?.(session)) {
+      res.status(403).json({ error: 'Dashboard operator session required' }); return;
+    }
+    const topicId = Number(req.body?.topicId);
+    const telegramStepUp = ctx.directDesktopAccess.requiresTelegramStepUp();
+    const operator = telegramStepUp ? ctx.topicOperatorStore?.getOperator(topicId) : null;
+    if (telegramStepUp && (!operator || operator.platform !== 'telegram')) {
+      res.status(403).json({ error: 'Verified Telegram operator required' }); return;
+    }
+    try {
+      const result = await ctx.directDesktopAccess.begin({
+        machineId: req.body?.machineId, topicId: telegramStepUp ? topicId : 0,
+        operatorUid: telegramStepUp ? operator!.uid : 'dashboard-pin',
+        operatorSessionToken: session, browserPublicKey: req.body?.browserPublicKey,
+        browserEcdhPublicKey: req.body?.browserEcdhPublicKey,
+        browserNonce: req.body?.browserNonce, videoCodec: req.body?.videoCodec,
+        scopeConfirmed: req.body?.scopeConfirmed,
+      });
+      res.status(201).json(result);
+    } catch (error) { res.status(403).json({ error: (error as Error).message }); }
+  });
+  router.get('/desktop/requests/:id', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res)) return;
+    try { res.json(ctx.directDesktopAccess.status(req.params.id, desktopOperatorSession(req))); }
+    catch { res.status(403).json({ error: 'Desktop request unavailable' }); }
+  });
+  router.post('/desktop/requests/:id/resume', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res) || !desktopIntent(req, res)) return;
+    try {
+      res.json(await ctx.directDesktopAccess.resume(req.params.id, desktopOperatorSession(req), {
+        browserPublicKey: req.body?.browserPublicKey,
+        browserEcdhPublicKey: req.body?.browserEcdhPublicKey,
+        browserNonce: req.body?.browserNonce,
+        videoCodec: req.body?.videoCodec,
+        previousVideoCodec: req.body?.previousVideoCodec,
+      }, req.body?.attemptId, req.body?.previousConnectionNonce, req.body?.previousSignature));
+    } catch { res.status(403).json({ error: 'Desktop resume unavailable' }); }
+  });
+  router.get('/desktop/requests/:id/cursor', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res)) return;
+    if (!ctx.verifyDashboardOperatorSession?.(desktopOperatorSession(req))) {
+      res.status(403).json({ error: 'Dashboard operator session required' }); return;
+    }
+    try { res.json(await ctx.directDesktopAccess.cursor(req.params.id, desktopOperatorSession(req))); }
+    catch { res.status(403).json({ error: 'Desktop cursor unavailable' }); }
+  });
+  router.post('/desktop/requests/:id/ticket', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res)) return;
+    if (!desktopIntent(req, res)) return;
+    try {
+      const ticket = ctx.directDesktopAccess.ticket(req.params.id, desktopOperatorSession(req),
+        req.body?.connectionNonce, req.body?.signature);
+      res.json({ ticket, ...ctx.directDesktopAccess.targetInfo() });
+    } catch { res.status(403).json({ error: 'Desktop ticket unavailable' }); }
+  });
+  router.post('/desktop/requests/:id/revoke', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ctx.directDesktopAccess) { res.status(503).json({ error: 'Remote desktop is off on this agent' }); return; }
+    if (!desktopTransport(req, res)) return;
+    if (!desktopIntent(req, res)) return;
+    try { ctx.directDesktopAccess.revoke(req.params.id, desktopOperatorSession(req)); res.json({ revoked: true }); }
+    catch { res.status(403).json({ error: 'Desktop revocation unavailable' }); }
   });
 
   // ── Blocker Ledger (Autonomy Principles Enforcement, Piece 1) ────────────────
@@ -26385,6 +26513,22 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
         }
       } catch { /* the invite is still consumed: it must never fall through to a session */ }
       res.json({ ok: true, pairingInvite: true });
+      return;
+    }
+
+    // Desktop approval codes are credentials. Consume them before the sentinel,
+    // inbound log, topic memory, and session injection. A malformed code is
+    // consumed too, so a typo cannot leak into durable conversation history.
+    if (typeof text === 'string' && /^\/desktop(?:\s|$)/i.test(text.trim())) {
+      const approval = ctx.telegram?.consumeDesktopApproval({
+        text, topicId: Number(topicId), senderUid: String(fromUserId ?? ''),
+        trusted: !senderUntrusted, forwarded: req.body.forwarded === true,
+      });
+      if (ctx.telegram) await ctx.telegram.sendToTopic(Number(topicId), approval?.approved
+        ? 'Remote desktop approved. Return to the dashboard to connect.'
+        : 'Remote desktop approval was not accepted. Check the request or ask for a new code.',
+      { provenance: 'automation' }).catch(() => {});
+      res.json({ ok: true, desktopApproval: approval?.approved === true });
       return;
     }
 

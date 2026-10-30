@@ -88,6 +88,8 @@ import {
   STANDING_SESSIONS_MARKER,
   CONSOLE_BULLET,
   CONSOLE_MARKER,
+  remoteDesktopBullet,
+  REMOTE_DESKTOP_MARKER,
   THREADLINE_PAIR_TOOL_BULLET,
   THREADLINE_PAIR_TOOL_MARKER,
 } from '../scaffold/templates.js';
@@ -7392,6 +7394,27 @@ setTimeout(() => process.exit(0), 2000);
         : content + '\n' + CONSOLE_BULLET + '\n';
       patched = true;
       result.upgraded.push('CLAUDE.md: added the new console (beside the dashboard) awareness');
+    }
+
+    if (!content.includes(REMOTE_DESKTOP_MARKER)) {
+      // Preserve the console bullet directly below Features on existing agents.
+      const anchor = '- **Sharing the dashboard**';
+      const at = content.indexOf(anchor);
+      const eol = at >= 0 ? content.indexOf('\n', at) : -1;
+      content = eol >= 0
+        ? content.slice(0, eol + 1) + remoteDesktopBullet(port) + '\n' + content.slice(eol + 1)
+        : content + '\n' + remoteDesktopBullet(port) + '\n';
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added native remote desktop availability and operator flow');
+    } else {
+      const lines = content.split('\n');
+      const index = lines.findIndex(line => line.includes(REMOTE_DESKTOP_MARKER));
+      if (index >= 0 && lines[index] !== remoteDesktopBullet(port)) {
+        lines[index] = remoteDesktopBullet(port);
+        content = lines.join('\n');
+        patched = true;
+        result.upgraded.push('CLAUDE.md: updated native remote desktop PIN flow');
+      }
     }
 
     if (!content.includes('### Telegram message origin')) {

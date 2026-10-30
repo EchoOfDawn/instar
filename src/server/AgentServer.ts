@@ -180,6 +180,12 @@ import { WorkQueueRegistry } from '../core/WorkQueue.js';
 import type { WorktreeManager } from '../core/WorktreeManager.js';
 import { corsMiddleware, authMiddleware, requestTimeout, buildRequestTimeoutOverrides, errorHandler, dashboardSecurityHeaders, dashboardCacheControl, DASHBOARD_STATIC_OPTIONS, duplicateResponseGuard } from './middleware.js';
 import { WebSocketManager } from './WebSocketManager.js';
+import { DesktopStreamManager } from './DesktopStreamManager.js';
+import { DirectDesktopAccess } from '../core/DirectDesktopAccess.js';
+import { isLoopbackPeer } from '../core/desktopTransport.js';
+import { MacDesktopHost } from '../core/MacDesktopHost.js';
+import { FileRemoteStepUpLockouts } from '../core/RemoteStepUpLockouts.js';
+import { DesktopAccessAudit } from '../core/DesktopAccessAudit.js';
 import { assertSqliteAvailable, PendingRelayStore } from '../messaging/pending-relay-store.js';
 import { getOrCreateBootId } from './boot-id.js';
 import { DeliveryFailureSentinel } from '../monitoring/delivery-failure-sentinel.js';
@@ -375,6 +381,20 @@ export class AgentServer {
   private wsManager: WebSocketManager | null = null;
   private config: InstarConfig;
   private readonly dashboardOperatorSessions = new DashboardOperatorSessionStore();
+  private dashboardPinVersion: string | null = null;
+
+  private syncDashboardPinVersion(): void {
+    const version = createHash('sha256').update(this.config.dashboardPin ?? '').digest('hex');
+    if (this.dashboardPinVersion !== null && this.dashboardPinVersion !== version) {
+      this.dashboardOperatorSessions.clear();
+    }
+    this.dashboardPinVersion = version;
+  }
+
+  private verifyDashboardOperatorSession(token: string | undefined): boolean {
+    this.syncDashboardPinVersion();
+    return this.dashboardOperatorSessions.verify(token);
+  }
   /** multi-transport-mesh-comms (Layer 0.5) — see the bind site in start(). */
   private meshBindActive: boolean;
   private startTime: Date;
@@ -384,6 +404,8 @@ export class AgentServer {
   private streamTicketStore?: import('./StreamTicketStore.js').StreamTicketStore;
   private poolStreamAllowRemoteInput = false;
   private poolStreamConnector?: import('./WebSocketManager.js').PoolStreamConnector;
+  private desktopStreamManager: DesktopStreamManager | null = null;
+  private directDesktopAccess: DirectDesktopAccess | null = null;
   private poolLink?: import('./routes.js').RouteContext['poolLink'];
   private poolPollCache?: import('./PoolPollCache.js').PoolPollCache | null;
   private meshSelfId?: string;
@@ -398,6 +420,7 @@ export class AgentServer {
   private routeContext: {
     telegramOrigin?: import('../messaging/telegram-origin/TelegramOriginRuntime.js').TelegramOriginRuntime | null;
     wsManager: import('./WebSocketManager.js').WebSocketManager | null;
+    directDesktopAccess?: DirectDesktopAccess | null;
     workQueue?: WorkQueueRegistry | null;
     pendingRelayLookup?: (deliveryId: string) => boolean;
     subscriptionLoginLedger?: import('../core/SubscriptionLoginLedger.js').SubscriptionLoginLedger | null;
@@ -1278,6 +1301,16 @@ export class AgentServer {
     // Dashboard security headers — set before static serving so they apply to all dashboard responses
     this.app.use(dashboardSecurityHeaders);
 
+    // PIN-only desktop access requires a durable guess budget. Construct it
+    // before any dashboard unlock can mint an operator session.
+    try {
+      this.pinAttemptStore = new PinAttemptStore({ stateDir: options.config.stateDir });
+    } catch (err) {
+      // @silent-fallback-ok — the warning is visible and desktop admission stays dark without a durable PIN budget.
+      console.warn('[instar] PIN attempt store unavailable; remote desktop stays dark:', err);
+      this.pinAttemptStore = null;
+    }
+
     // Dashboard static files — served BEFORE auth middleware so the page loads
     // without a token. Auth happens via WebSocket/API calls from the page itself.
     const dashboardDir = this.resolveDashboardDir();
@@ -1295,6 +1328,30 @@ export class AgentServer {
         lastModified: true,
       });
     });
+    this.app.get('/dashboard/desktop.html', (_req, res) => {
+      dashboardCacheControl(res);
+      const label = this.directDesktopAccess?.targetInfo().label ?? 'this machine';
+      const escaped = label.replace(/[&<>"']/g, character => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[character] ?? character);
+      const html = fs.readFileSync(path.join(dashboardDir, 'desktop.html'), 'utf8')
+        .replace('__INSTAR_DESKTOP_TARGET_NAME__', escaped)
+        .replaceAll('__INSTAR_DESKTOP_ASSET_VERSION__',
+          createHash('sha256')
+            .update(fs.readFileSync(path.join(dashboardDir, 'desktop.js')))
+            .update(fs.readFileSync(path.join(dashboardDir, 'desktop.css')))
+            .digest('hex').slice(0, 16));
+      res.setHeader('Cache-Control', 'no-store');
+      res.type('html').send(html);
+    });
+    this.app.get('/dashboard/desktop.js', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.sendFile(path.join(dashboardDir, 'desktop.js'), { cacheControl: false });
+    });
+    this.app.get('/dashboard/desktop.css', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.sendFile(path.join(dashboardDir, 'desktop.css'), { cacheControl: false });
+    });
     this.app.use('/dashboard', express.static(dashboardDir, DASHBOARD_STATIC_OPTIONS));
 
     // PIN-based dashboard unlock — exchanges a short PIN for the auth token.
@@ -1306,9 +1363,16 @@ export class AgentServer {
     const pinAttempts = new Map<string, { count: number; resetAt: number }>();
     const MAX_ATTEMPTS = 5;
     const WINDOW_MS = 5 * 60 * 1000; // 5-minute window
+    const GLOBAL_MAX_ATTEMPTS = 20;
+    const GLOBAL_PIN_KEY = '__dashboard_unlock_global__';
+    let globalPinAttempts = { count: 0, resetAt: 0 };
     const configRef = this.config;
 
     this.app.post('/dashboard/unlock', (req: Request, res: Response) => {
+      if (this.directDesktopAccess && !req.secure && !isLoopbackPeer(req.socket.remoteAddress)) {
+        res.status(403).json({ error: 'Open this dashboard through its HTTPS tunnel or from the machine itself.' });
+        return;
+      }
       if (!configRef.dashboardPin || !configRef.authToken) {
         res.status(503).json({ error: 'PIN authentication not yet available. Try again shortly.' });
         return;
@@ -1318,12 +1382,18 @@ export class AgentServer {
 
       // Rate limit by IP
       const now = Date.now();
+      if (now > globalPinAttempts.resetAt) globalPinAttempts = { count: 0, resetAt: now + WINDOW_MS };
+      if (globalPinAttempts.count >= GLOBAL_MAX_ATTEMPTS
+        || this.pinAttemptStore?.blocked(GLOBAL_PIN_KEY, GLOBAL_MAX_ATTEMPTS)) {
+        res.status(429).json({ error: 'Too many PIN attempts. Try again later.' });
+        return;
+      }
       let entry = pinAttempts.get(ip);
       if (entry && now > entry.resetAt) {
         pinAttempts.delete(ip);
         entry = undefined;
       }
-      if (entry && entry.count >= MAX_ATTEMPTS) {
+      if ((entry && entry.count >= MAX_ATTEMPTS) || this.pinAttemptStore?.blocked(ip)) {
         res.status(429).json({ error: 'Too many attempts. Try again later.' });
         return;
       }
@@ -1343,7 +1413,9 @@ export class AgentServer {
           pinAttempts.set(ip, entry);
         }
         entry.count++;
-        const remaining = MAX_ATTEMPTS - entry.count;
+        globalPinAttempts.count++;
+        const remaining = this.pinAttemptStore?.recordFailure(ip) ?? (MAX_ATTEMPTS - entry.count);
+        this.pinAttemptStore?.recordFailure(GLOBAL_PIN_KEY, GLOBAL_MAX_ATTEMPTS);
         res.status(403).json({
           error: 'Incorrect PIN',
           attemptsRemaining: remaining,
@@ -1351,9 +1423,14 @@ export class AgentServer {
         return;
       }
 
+      pinAttempts.delete(ip);
+      this.pinAttemptStore?.recordSuccess(ip);
+      globalPinAttempts = { count: 0, resetAt: now + WINDOW_MS };
+      this.pinAttemptStore?.recordSuccess(GLOBAL_PIN_KEY);
       // The ordinary API token is also available to agents, so it cannot prove
       // that a human unlocked the dashboard. Issue a separate short-lived proof
       // for explicitly operator-gated actions.
+      this.syncDashboardPinVersion();
       const operatorSession = this.dashboardOperatorSessions.issue();
       res.json({
         token: configRef.authToken,
@@ -1735,21 +1812,10 @@ export class AgentServer {
               stateDir: options.config.stateDir,
             });
           } catch (err) {
+            // @silent-fallback-ok — this read-only price view reports its startup failure and stays unavailable.
             console.warn('[instar] routing-price-authority init failed (non-fatal):', err);
             this.routingPriceAuthority = null;
           }
-        }
-
-        // Durable per-IP PIN-attempt lockout (S2-1) — hardens EVERY PIN route
-        // (mandates, money surfaces, external-hog arm) so a restart no longer
-        // resets brute-force lockout. Independent of the money layer.
-        try {
-          this.pinAttemptStore = new PinAttemptStore({ stateDir: options.config.stateDir });
-        } catch (err) {
-          // @silent-fallback-ok: loud warn + degrade to the pre-existing in-memory
-          // lockout (defence-in-depth layer, never the auth decision itself).
-          console.warn('[instar] pin-attempt store init failed (non-fatal — in-memory lockout only):', err);
-          this.pinAttemptStore = null;
         }
 
         // ── Layer 1c provider-report store + reconciliation sweep (FD-21 —
@@ -2438,6 +2504,56 @@ export class AgentServer {
       // @silent-fallback-ok — reported via console.warn; an operator-store init failure must never block server boot.
       console.warn('[instar] topic-operator-store init failed (non-fatal):', err);
       this.topicOperatorStore = null;
+    }
+
+    // The first native desktop target is a local development Mac. The gate is
+    // explicit even on development agents; incomplete hosts cannot advertise
+    // access. Other platforms require their own host adapters and live proof.
+    if (options.config.remoteDesktop?.enabled === true && options.config.developmentAgent === true
+      && process.platform === 'darwin' && this.meshSelfId && this.pinAttemptStore) {
+      const label = options.listPoolMachines?.().find(peer => peer.machineId === this.meshSelfId)?.nickname;
+      if (label) {
+        try {
+          const machineIdentity = new MachineIdentityManager(options.config.stateDir);
+          const identity = machineIdentity.loadIdentity();
+          if (identity.machineId !== this.meshSelfId) throw new Error('machine identity mismatch');
+          const privateKey = machineIdentity.loadSigningKey();
+          const publicKeyPem = machineIdentity.getSigningPublicKeyPem(this.meshSelfId);
+          const proof = Buffer.from('instar-desktop-key-check-v1');
+          if (!publicKeyPem || !verifyMachinePayload(proof, signMachinePayload(proof, privateKey), publicKeyPem)) {
+            throw new Error('machine signing key mismatch');
+          }
+          const host = new MacDesktopHost();
+          this.directDesktopAccess = new DirectDesktopAccess(
+          this.meshSelfId, label, host, new FileRemoteStepUpLockouts(options.config.stateDir),
+          { publicKey: Buffer.from(identity.signingPublicKey, 'base64'),
+            sign: payload => Buffer.from(signMachinePayload(payload, privateKey), 'base64') },
+          (topicId, uid) => this.topicOperatorStore?.getOperator(topicId)?.uid === uid,
+          token => this.verifyDashboardOperatorSession(token),
+          async (topicId, text) => {
+            const uid = this.topicOperatorStore?.getOperator(topicId)?.uid;
+            if (!uid || String(this.telegramAdapter!.getOwnerUserId() ?? '') !== uid) {
+              throw new Error('verified owner Telegram DM unavailable');
+            }
+            // sendToTopic persists outbound text in the ordinary message log.
+            // The challenge code is therefore sent only through the unlogged
+            // owner DM path; the authenticated reply is consumed before logging.
+            const sent = await this.telegramAdapter!.sendToOwnerDM(text);
+            if (!sent) throw new Error('verified owner Telegram DM unavailable');
+          },
+          grantId => this.desktopStreamManager?.closeGrant(grantId),
+          Date.now,
+          new DesktopAccessAudit(options.config.stateDir),
+          'pin',
+        );
+        this.desktopStreamManager = new DesktopStreamManager(request => this.directDesktopAccess!.admit(request));
+        } catch (error) {
+          // @silent-fallback-ok — warn and leave desktop admission dark when target identity cannot be proven.
+          console.warn('[instar] remote desktop target identity unavailable; access stays dark:', error instanceof Error ? error.message : String(error));
+          this.directDesktopAccess = null;
+          this.desktopStreamManager = null;
+        }
+      }
     }
 
     // Coordination Mandate enforcement (docs/specs/coordination-mandate.md §4).
@@ -4648,7 +4764,7 @@ export class AgentServer {
       subscriptionPool: options.subscriptionPool ?? null,
       subscriptionLoginLedger: options.subscriptionLoginLedger ?? null,
       subscriptionRelogin: options.subscriptionRelogin ?? null,
-      verifyDashboardOperatorSession: (token: string | undefined) => this.dashboardOperatorSessions.verify(token),
+      verifyDashboardOperatorSession: (token: string | undefined) => this.verifyDashboardOperatorSession(token),
       subscriptionIdentityOracle: options.subscriptionIdentityOracle,
       subscriptionEmailBinding: options.subscriptionEmailBinding,
       subscriptionEmailBarrier: options.subscriptionEmailBarrier,
@@ -4832,6 +4948,7 @@ export class AgentServer {
       correctionClassReview: this.correctionClassReview,
       completionClaimVerifier: this.completionClaimVerifier,
       blockerLedger: this.blockerLedger,
+      directDesktopAccess: this.directDesktopAccess,
       selfUnblockRunStore: this.selfUnblockRunStore,
       selfUnblockChecklist: this.selfUnblockChecklist,
       growthMilestoneAnalyst: this.growthMilestoneAnalyst,
@@ -6748,6 +6865,7 @@ export class AgentServer {
           instarDir: this.config.stateDir,
           hookEventReceiver: this.hookEventReceiver,
           streamTicketStore: this.streamTicketStore,
+          desktopStreamManager: this.desktopStreamManager ?? undefined,
           poolStreamAllowRemoteInput: this.poolStreamAllowRemoteInput,
           poolStreamConnector: this.poolStreamConnector,
           selfMachineId: this.meshSelfId,
@@ -7189,6 +7307,9 @@ export class AgentServer {
    * Closes keep-alive connections after a timeout to prevent hanging.
    */
   async stop(): Promise<void> {
+    this.directDesktopAccess?.killSwitch();
+    if (this.directDesktopAccess) this.telegramAdapter?.setDesktopApprovalHandler?.(null);
+    this.desktopStreamManager?.closeAll();
     try { this.routeContext?.subscriptionRelogin?.close?.(); }
     catch (error) { console.warn('[subscription-relogin] clean stop failed:', error); }
     try { this.agentIdentityRuntime?.coherence.stop(); } catch { /* best-effort teardown */ }
