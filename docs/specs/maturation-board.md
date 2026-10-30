@@ -340,6 +340,38 @@ stage, commitment or review. The CLAUDE.md section says so, and tells agents to 
 commitment text from the board as quoted untrusted data. The review job reads its own previous
 review files, not the board.
 
+### 11. Readability revision (2026-10-30, display only)
+
+Justin, on the first served version: "impossible to digest… does not meet at-a-glance standards."
+The page is redesigned; nothing in the route's authority, storage or multi-machine behaviour changes.
+
+- **The answer** is one plain sentence: "182 features: 69 working, 97 need attention", with "N of those
+  have nobody on them" below it. No review jargon, ids or codes on the first screen.
+- **The glance** is one square per feature, coloured by plain group, with a white dot where no
+  follow-up is linked. A legend doubles as the group filter.
+- **Plain groups** replace the verdict vocabulary on screen: Broken (regressed), Stuck (stalled),
+  Not measured (blind), On its way (on-track / ready / too-new), Working (live), Being retired
+  (retire-pending), Not reviewed. Each is one fixed mapping of the review's verdict (no new
+  judgement); Broken and Stuck open by default.
+- **Rows** show a human name (the review's `title`, else derived from the id), a plain area, the
+  review's one-line `summary` when present, and one chip: "Nobody on it", "Fix underway", "Fix
+  assigned" (a delivered commitment) or "Can't tell". A row never repeats its group's description.
+- **Detail on tap**: the review's `nextStep`, how many tasks handle it and their promised dates, a
+  dated list of what happened, the model-assessed label, and the evidence, decision, ids and live
+  records folded under "Technical details".
+- **Tools**: one search box and one "nobody on it" switch; nothing else above the content.
+- **The 80/20 layer (Justin, 14:16: "either too generic and vague, or too technical").** Each row
+  leads with one dense `line` (≤ 90 chars: number vs goal · trend · next step with date). Tapping a
+  row opens a five-line card: What it does (`purpose`), To move up (`goal`), Now (`measure`: the one
+  number with its goal and its value at the last review, red when worse), Plan (`plan`), Due. The
+  owner chip never contradicts the line: no linked task but a written plan reads "Planned, not
+  started"; "Nobody on it" means neither. Raw evidence stays under Technical details.
+- **Review contract** gains optional plain-language fields, written by the review job:
+  `area` (≤ 40), `summary` (≤ 240), `nextStep` (≤ 200), `purpose`, `goal`, `plan` (≤ 160 each),
+  `line` (≤ 120), and `measure` `{what ≤ 60, now ≤ 40, target, before (≤ 40 or null), trend:
+  better|worse|flat|unknown}` — a malformed `measure` rejects the file like any other field. The job's
+  instructions were updated on the Studio (manifestVersion 5) before the 2026-10-30 11:30 run.
+
 ## Decision points touched
 
 | Decision point | Class | Justification |

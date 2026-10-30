@@ -39,3 +39,21 @@ about how features are promoted changes.
 Older reviews were written only as markdown, so the board reads their tables loosely and counts
 any row it cannot read rather than guessing. Review files live on the machine that ran the review,
 so the page always asks every machine and merges, which costs a few seconds when a machine is slow.
+
+## Revision: made for a glance (30 Oct)
+
+The first version showed everything at once and Justin found it impossible to digest. The page now
+opens with one sentence ("182 features: 69 working, 97 need attention"), a coloured square for each
+feature, and plain groups such as Broken, Stuck and Working. Each feature shows a human name and one
+short label saying whether anyone is on it. The detailed evidence is still there, one tap away. The
+review job now also writes a one-line plain description and a next step for every feature, so each
+row can say what is going on in everyday words.
+
+## Revision: the useful middle (30 Oct, afternoon)
+
+Justin's next note: the text was either too vague ("Was working, now isn't") or too technical (raw
+counts and ids). Each feature now leads with one dense line, like "41% of checks failing (goal:
+under 5%) · up from 14% · fix due Nov 4". Tapping it shows five short lines: what it does, what has
+to be true for it to move up, where it stands now compared with its goal and with the last review,
+the plan, and the due date. The raw evidence is still there, folded away. A feature with a written
+plan but no task yet now says so, instead of "nobody on it".
