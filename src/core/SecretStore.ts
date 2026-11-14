@@ -203,13 +203,17 @@ export class MasterKeyManager {
    * Read-only — alternates NEVER generate. Backs the dual-key read fallback
    * (a v1 store written before the sources diverged stays readable, loudly).
    */
-  getCandidateKeys(): Array<{ key: Buffer; source: 'keychain' | 'file' }> {
+  getCandidateKeys(opts: { generate?: boolean } = {}): Array<{ key: Buffer; source: 'keychain' | 'file' }> {
+    // generate:false — the READ path for an EXISTING store. A missing key there
+    // must fail the read, never mint a fresh key (which would also overwrite
+    // the per-agent keychain entry and orphan the vault for good).
+    const generate = opts.generate !== false;
     const out: Array<{ key: Buffer; source: 'keychain' | 'file' }> = [];
     const push = (key: Buffer | null, source: 'keychain' | 'file'): void => {
       if (key && !out.some((c) => c.key.equals(key))) out.push({ key, source });
     };
     if (this.forceFile) {
-      push(this.getFileKey(), 'file');
+      push(generate ? this.getFileKey() : this.readExistingFileKey(), 'file');
       // Alternate: an existing keychain key (never generated) — covers a store
       // written under keychain resolution before forceFileKey was flipped on.
       push(this.tryRead(perAgentKeychainAccount(this.stateDir)), 'keychain');
@@ -220,13 +224,19 @@ export class MasterKeyManager {
     push(this.tryRead(KEYCHAIN_ACCOUNT_LEGACY), 'keychain');
     // Existing file key as an alternate (do NOT generate one here — getFileKey
     // generates; alternates must be read-only).
+    push(this.readExistingFileKey(), 'file');
+    if (out.length === 0 && generate) push(this.getMasterKey(), this.forceFile ? 'file' : 'keychain');
+    return out;
+  }
+
+  /** The existing file key, or null. Never generates. */
+  private readExistingFileKey(): Buffer | null {
     try {
       if (fs.existsSync(this.keyFilePath)) {
-        push(Buffer.from(fs.readFileSync(this.keyFilePath, 'utf-8').trim(), 'hex'), 'file');
+        return Buffer.from(fs.readFileSync(this.keyFilePath, 'utf-8').trim(), 'hex');
       }
     } catch { /* @silent-fallback-ok — unreadable alternate is simply absent */ }
-    if (out.length === 0) push(this.getMasterKey(), this.forceFile ? 'file' : 'keychain');
-    return out;
+    return null;
   }
 
   /** Flush an existing fallback key. A successful OS-keychain persistence/read
@@ -409,7 +419,9 @@ export class SecretStore {
     }
 
     const raw = fs.readFileSync(this.encryptedPath);
-    const candidates = this.keyManager.getCandidateKeys();
+    // Read-only key resolution: an existing store is never a reason to create,
+    // replace or rotate key material. No key → the read fails (below), loudly.
+    const candidates = this.keyManager.getCandidateKeys({ generate: false });
 
     // ── v2 format: 'ISv2' | keyId(8) | iv | tag | ct — the keyId names the key ──
     if (raw.length > STORE_MAGIC_V2.length + KEY_ID_LENGTH && raw.subarray(0, STORE_MAGIC_V2.length).equals(STORE_MAGIC_V2)) {
