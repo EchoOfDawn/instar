@@ -397,6 +397,32 @@ export class OccVersionMismatchError extends Error {
 }
 
 /**
+ * Thrown by mutators when the write could not be made durable. The stored
+ * record (and the in-process cache) still hold the previous state, so the
+ * caller may retry.
+ */
+export class InitiativePersistenceError extends Error {
+  readonly underlying: unknown;
+  constructor(message: string, underlying?: unknown) {
+    super(message);
+    this.name = 'InitiativePersistenceError';
+    this.underlying = underlying;
+  }
+}
+
+/** Key-order-independent JSON form, used to compare a stored record with the intended one. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_k, v) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(v).sort()) out[key] = (v as Record<string, unknown>)[key];
+      return out;
+    }
+    return v;
+  });
+}
+
+/**
  * Thrown by `update()` when the caller attempted to change `kind`. The
  * `kind` field is set at creation time and never changes thereafter.
  */
@@ -514,6 +540,25 @@ export class InitiativeTracker {
   // so the next read recomputes). Until then this is a no-op. The hook
   // fires after every successful mutating call.
   private digestCacheInvalidator: () => void = () => {};
+
+  // Serializes TaskFlow-backed mutators so a version check and the
+  // multi-step write it guards run as one unit relative to other mutations
+  // on this tracker. The legacy JSON path has no awaits, so each call is
+  // already atomic and runs unchanged (synchronously) without the lock.
+  private mutationTail: Promise<unknown> = Promise.resolve();
+  private pendingMutations = 0;
+
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.isTaskFlowEnabled() && this.pendingMutations === 0) return fn();
+    // Idle: start now so the synchronous prefix still runs in the caller's tick.
+    const run = this.pendingMutations === 0 ? fn() : this.mutationTail.then(fn, fn);
+    this.pendingMutations++;
+    this.mutationTail = run.then(
+      () => { this.pendingMutations--; },
+      () => { this.pendingMutations--; }
+    );
+    return run;
+  }
 
   constructor(stateDir: string) {
     this.filePath = path.join(stateDir, 'initiatives.json');
@@ -700,8 +745,22 @@ export class InitiativeTracker {
    * cancelled), updating `stateJson` along the way so reads see the latest
    * shape. Returns the Initiative as projected from TaskFlow after
    * transitions settle.
+   *
+   * Success means the stored record equals `init`. When a step fails and
+   * the stored record is not `init`, the cache is reset to the stored
+   * record and an `InitiativePersistenceError` is thrown. When a later
+   * status transition fails after the record itself was stored, the write
+   * is durable and is reported as success; the next persist walks the flow
+   * on from wherever it stopped.
+   *
+   * `expectedStoredVersion`, when given, is checked against the stored
+   * record read immediately before the first write. Every write then
+   * carries that read's revision, so a concurrent writer is rejected.
    */
-  private async persistThroughTaskFlow(init: Initiative): Promise<Initiative> {
+  private async persistThroughTaskFlow(
+    init: Initiative,
+    expectedStoredVersion?: number
+  ): Promise<Initiative> {
     const registry = this.taskFlowRegistry;
     const principal = this.taskFlowPrincipal();
     if (!registry || !principal || principal.scope !== 'controller') return init;
@@ -716,20 +775,42 @@ export class InitiativeTracker {
       ownerKey,
       idemKey
     );
+    const createdNow = !existing;
     if (!existing) {
-      const r = await registry.createFlow({
-        controllerId: INITIATIVE_TASKFLOW_CONTROLLER_ID,
-        controllerInstanceId: principal.controllerInstanceId,
-        ownerKey,
-        idempotencyKey: idemKey,
-        goal: init.title.slice(0, 1024),
-        currentStep: desired.step,
-        stateJson,
-      });
-      existing = r.flow;
+      try {
+        const r = await registry.createFlow({
+          controllerId: INITIATIVE_TASKFLOW_CONTROLLER_ID,
+          controllerInstanceId: principal.controllerInstanceId,
+          ownerKey,
+          idempotencyKey: idemKey,
+          goal: init.title.slice(0, 1024),
+          currentStep: desired.step,
+          stateJson,
+        });
+        existing = r.flow;
+      } catch (err) {
+        this.logTaskFlowError('persist', init.id, err);
+        this.syncCacheFromStore(init.id);
+        throw new InitiativePersistenceError(
+          `Initiative "${init.id}" was not persisted: ${err instanceof Error ? err.message : String(err)}`,
+          err
+        );
+      }
     }
     let cur = registry.getFlow(existing.flowId, { bypassCache: true }) ?? existing;
 
+    if (expectedStoredVersion !== undefined && !createdNow) {
+      const storedVersion = this.initiativeFromFlow(cur)?.version ?? 1;
+      if (storedVersion !== expectedStoredVersion) {
+        this.syncCacheFromStore(init.id);
+        throw new OccVersionMismatchError(
+          `Initiative "${init.id}" version mismatch: expected ${expectedStoredVersion}, current ${storedVersion}`,
+          storedVersion
+        );
+      }
+    }
+
+    let walkError: unknown = null;
     try {
       // Already terminal? Accept and stop — terminal flows are immutable
       // per TaskFlow contract. The Initiative's local terminal state stays
@@ -829,13 +910,35 @@ export class InitiativeTracker {
         }
       }
     } catch (err) {
+      walkError = err;
       this.logTaskFlowError('persist', init.id, err);
     }
 
     const fresh = registry.getFlow(cur.flowId, { bypassCache: true }) ?? cur;
-    const persisted = this.initiativeFromFlow(fresh) ?? init;
-    this.initiatives.set(persisted.id, persisted);
-    return persisted;
+    const stored = this.isTombstoned(fresh) ? null : this.initiativeFromFlow(fresh);
+    if (!stored || canonicalJson(stored) !== canonicalJson(init)) {
+      this.syncCacheFromStore(init.id);
+      const why = walkError
+        ? walkError instanceof Error ? walkError.message : String(walkError)
+        : `flow ${fresh.flowId} in status "${fresh.status}" did not accept the write`;
+      throw new InitiativePersistenceError(
+        `Initiative "${init.id}" was not persisted: ${why}`,
+        walkError ?? undefined
+      );
+    }
+    this.initiatives.set(stored.id, stored);
+    return stored;
+  }
+
+  /** Reset the cache entry for `id` to whatever TaskFlow durably holds. */
+  private syncCacheFromStore(id: string): void {
+    const registry = this.taskFlowRegistry;
+    if (!registry) return;
+    const fid = this.findFlowIdForInitiative(id);
+    const flow = fid ? registry.getFlow(fid, { bypassCache: true }) : null;
+    const stored = flow && !this.isTombstoned(flow) ? this.initiativeFromFlow(flow) : null;
+    if (stored) this.initiatives.set(id, stored);
+    else this.initiatives.delete(id);
   }
 
   /**
@@ -854,26 +957,24 @@ export class InitiativeTracker {
     const principal = this.taskFlowPrincipal();
     if (!registry || !principal || principal.scope !== 'controller') return flow;
     if (flow.status !== 'running') return flow;
-    try {
-      const w = await registry.setFlowWaiting({
-        flowId: flow.flowId,
-        expectedRevision: flow.revision,
-        principal,
-        waitJson: { kind: 'human-review', question: '__statePatch__' },
-        statePatch: stateJson,
-      });
-      const r = await registry.resumeFlow({
-        flowId: w.flow.flowId,
-        expectedRevision: w.flow.revision,
-        principal,
-        waitInstanceId: w.flow.waitInstanceId!,
-        statePatch: stateJson,
-      });
-      return r.flow;
-    } catch (err) {
-      this.logTaskFlowError('patchStateJson', flow.flowId, err);
-      return flow;
-    }
+    // Errors propagate: callers decide whether the write became durable.
+    // setFlowWaiting installs the state; if resumeFlow then fails the flow
+    // is left `waiting` with the new state, and the next persist resumes it.
+    const w = await registry.setFlowWaiting({
+      flowId: flow.flowId,
+      expectedRevision: flow.revision,
+      principal,
+      waitJson: { kind: 'human-review', question: '__statePatch__' },
+      statePatch: stateJson,
+    });
+    const r = await registry.resumeFlow({
+      flowId: w.flow.flowId,
+      expectedRevision: w.flow.revision,
+      principal,
+      waitInstanceId: w.flow.waitInstanceId!,
+      statePatch: stateJson,
+    });
+    return r.flow;
   }
 
   private findFlowIdForInitiative(id: string): string | null {
@@ -1020,7 +1121,11 @@ export class InitiativeTracker {
     if (!validGenericMeasurement(initiative.measurement, initiative.id)) throw new Error('Measurement requires a valid target-scoped contract with outcome, quality safeguard and baseline');
   }
 
-  async create(input: InitiativeCreateInput): Promise<Initiative> {
+  create(input: InitiativeCreateInput): Promise<Initiative> {
+    return this.exclusive(() => this.createLocked(input));
+  }
+
+  private async createLocked(input: InitiativeCreateInput): Promise<Initiative> {
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.id)) {
       throw new Error('Initiative id must be lowercase kebab-case, 1–63 chars');
     }
@@ -1105,14 +1210,18 @@ export class InitiativeTracker {
     if (this.isTaskFlowEnabled()) {
       result = await this.persistThroughTaskFlow(initiative);
     } else {
-      this.saveToDisk();
+      this.saveLegacyOrRevert(initiative.id, undefined);
       result = initiative;
     }
     this.digestCacheInvalidator();
     return result;
   }
 
-  async update(id: string, input: InitiativeUpdateInput): Promise<Initiative> {
+  update(id: string, input: InitiativeUpdateInput): Promise<Initiative> {
+    return this.exclusive(() => this.updateLocked(id, input));
+  }
+
+  private async updateLocked(id: string, input: InitiativeUpdateInput): Promise<Initiative> {
     const existing = this.get(id);
     if (!existing) throw new Error(`Initiative "${id}" not found`);
 
@@ -1234,9 +1343,15 @@ export class InitiativeTracker {
     this.initiatives.set(id, next);
     let result: Initiative;
     if (this.isTaskFlowEnabled()) {
-      result = await this.persistThroughTaskFlow(next);
+      // With ifMatch, the stored version is re-checked against the record
+      // read right before the first write, and that write carries the
+      // read's revision, so a concurrent writer cannot pass the same ifMatch.
+      result = await this.persistThroughTaskFlow(
+        next,
+        input.ifMatch !== undefined ? currentVersion : undefined
+      );
     } else {
-      this.saveToDisk();
+      this.saveLegacyOrRevert(id, existing);
       result = next;
     }
     this.digestCacheInvalidator();
@@ -1270,7 +1385,15 @@ export class InitiativeTracker {
     }
   }
 
-  async setPhaseStatus(
+  setPhaseStatus(
+    id: string,
+    phaseId: string,
+    status: InitiativePhaseStatus
+  ): Promise<Initiative> {
+    return this.exclusive(() => this.setPhaseStatusLocked(id, phaseId, status));
+  }
+
+  private async setPhaseStatusLocked(
     id: string,
     phaseId: string,
     status: InitiativePhaseStatus
@@ -1300,14 +1423,29 @@ export class InitiativeTracker {
     if (this.isTaskFlowEnabled()) {
       result = await this.persistThroughTaskFlow(next);
     } else {
-      this.saveToDisk();
+      this.saveLegacyOrRevert(id, existing);
       result = next;
     }
     this.digestCacheInvalidator();
     return result;
   }
 
-  async remove(id: string): Promise<boolean> {
+  /** Legacy JSON save; on failure the cache entry goes back to `previous` and the error is rethrown. */
+  private saveLegacyOrRevert(id: string, previous: Initiative | undefined): void {
+    try {
+      this.saveToDisk();
+    } catch (err) {
+      if (previous) this.initiatives.set(id, previous);
+      else this.initiatives.delete(id);
+      throw err;
+    }
+  }
+
+  remove(id: string): Promise<boolean> {
+    return this.exclusive(() => this.removeLocked(id));
+  }
+
+  private async removeLocked(id: string): Promise<boolean> {
     if (this.isTaskFlowEnabled()) {
       const fid = this.findFlowIdForInitiative(id);
       if (!fid) {
@@ -1391,7 +1529,11 @@ export class InitiativeTracker {
    *
    * Returns counts so callers can log/observe what happened.
    */
-  async backfillKindAndSchema(): Promise<{ backfilled: number; scanned: number }> {
+  backfillKindAndSchema(): Promise<{ backfilled: number; scanned: number }> {
+    return this.exclusive(() => this.backfillKindAndSchemaLocked());
+  }
+
+  private async backfillKindAndSchemaLocked(): Promise<{ backfilled: number; scanned: number }> {
     if (!this.isTaskFlowEnabled()) {
       // Legacy path is backfilled during load. A no-op here is correct
       // because the in-memory cache already reflects the backfill.
@@ -1417,8 +1559,14 @@ export class InitiativeTracker {
         schemaVersion: init.schemaVersion ?? 1,
       };
       this.initiatives.set(init.id, patched);
-      await this.persistThroughTaskFlow(patched);
-      backfilled++;
+      try {
+        await this.persistThroughTaskFlow(patched);
+        backfilled++;
+      } catch (err) {
+        // Count only records that were durably backfilled; the rest stay
+        // unpatched (cache already reset) and are retried on the next run.
+        this.logTaskFlowError('backfill', init.id, err);
+      }
     }
     return { backfilled, scanned: records.length };
   }
